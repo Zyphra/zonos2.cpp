@@ -70,20 +70,53 @@ CUDA-graph replay (needed for the real-time decode) is enabled automatically for
 
 ## Models (one-time conversion)
 
-Inference is Python-free, but you convert the original checkpoints to GGUF once. The
-converters live in `models/` and need the reference environment (PyTorch + the vendored
-`gguf` in `models/_pydeps/`). Use the ZONOS2 venv:
+Inference is Python-free, but you convert the original checkpoints to GGUF once. Two
+Python environments are involved, and they are **not** the same:
+
+- **Conversion** (the `convert-*.py` below) needs only `torch` + `numpy` (plus
+  `safetensors` + `torchaudio` for the speaker encoder). `gguf` is **vendored** in
+  `models/_pydeps/`, so don't `pip install gguf`. A throwaway venv is enough:
+  ```bash
+  python3 -m venv .venv && . .venv/bin/activate
+  pip install torch numpy safetensors torchaudio
+  ```
+- **Validation** (`models/dump-*-golden.py`, see below) additionally imports the real
+  `zonos2` package, so it needs the full [ZONOS2 reference repo](https://huggingface.co/Zyphra/ZONOS2)
+  installed in its own venv. On the dev node that's `/data/home/sofian/ZONOS2/.venv`.
+
+### Obtaining the source checkpoints
+
+The converters take a local path to each checkpoint. Fetch them once (sizes are the
+download, not the GGUF output):
 
 ```bash
-PY=/data/home/sofian/ZONOS2/.venv/bin/python
+# 1) ZONOS2 backbone (model.pth + params.json). Accept the license / `huggingface-cli login`
+#    first if the repo is gated. Prints the local snapshot dir the converter wants.
+pip install -U "huggingface_hub[cli]"
+ZB=$(huggingface-cli download Zyphra/ZONOS2)
 
-# 1) Backbone — F16 (15 GB, lossless) or Q8_0 (7.7 GB).
-ZB=~/.cache/huggingface/hub/models--Zyphra--ZONOS2/snapshots/0cc1f131a87b41141f556a5aef8a7b775c1c3ea1
+# 2) Speaker encoder — HF repo is misnamed "Qwen3-Voice-Embedding" but ships the ECAPA-TDNN.
+ZS=$(huggingface-cli download marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B)
+
+# 3) DAC 44 kHz vocoder weights → ~/.cache/descript/dac/weights_44khz_8kbps_0.0.1.pth
+pip install descript-audio-codec
+python3 -m dac download --model_type 44khz
+```
+
+> The hardcoded `~/.cache/huggingface/hub/models--.../snapshots/<hash>` paths in older
+> command examples are just what `huggingface-cli download` populates — use the `$ZB` /
+> `$ZS` it prints instead of pinning a snapshot hash.
+
+### Converting to GGUF
+
+```bash
+PY=/data/home/sofian/ZONOS2/.venv/bin/python   # or your conversion venv's python
+
+# 1) Backbone — F16 (15 GB, lossless) or Q8_0 (7.7 GB). $ZB from "Obtaining" above.
 $PY models/convert-zonos2-to-gguf.py $ZB --outtype f16  -o out/zonos2-f16.gguf
 $PY models/convert-zonos2-to-gguf.py $ZB --outtype q8_0 -o out/zonos2-q8_0.gguf
 
-# 2) Speaker encoder — ECAPA-TDNN, 24 MB (the HF repo is misnamed "Qwen3-Voice-Embedding").
-ZS=~/.cache/huggingface/hub/models--marksverdhei--Qwen3-Voice-Embedding-12Hz-1.7B/snapshots/7577f61c42737fc8064bba773e2a18602df92803
+# 2) Speaker encoder — ECAPA-TDNN, 24 MB. $ZS from "Obtaining" above.
 $PY models/convert-spk-encoder-to-gguf.py $ZS -o out/spk-encoder.gguf
 
 # 3) DAC 44 kHz vocoder decoder — 254 MB (all f32).

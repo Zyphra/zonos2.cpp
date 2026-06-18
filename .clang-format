@@ -1,0 +1,20 @@
+# Baseline matching the existing hand-written style in src/.
+# ColumnLimit: 0 disables line reflow so existing compact lines are preserved;
+# clang-format -i then only fixes indentation, spacing, and alignment.
+Language: Cpp
+Standard: c++17
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 0
+PointerAlignment: Middle
+ReferenceAlignment: Middle
+BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortCaseLabelsOnASingleLine: true
+SortIncludes: false
+SpaceAfterCStyleCast: true
