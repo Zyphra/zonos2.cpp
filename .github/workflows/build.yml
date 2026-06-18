@@ -135,7 +135,10 @@ jobs:
       - name: Install Vulkan SDK (LunarG)
         shell: pwsh
         run: |
-          $ver = "1.3.290.0"
+          # 1.4.313.2 bundles the SPIRV-Headers CMake config that ggml-vulkan
+          # requires via find_package(SPIRV-Headers CONFIG) -- the older 1.3.290
+          # SDK did not ship it, breaking configure.
+          $ver = "1.4.313.2"
           curl.exe -L -o VulkanSDK.exe "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
           .\VulkanSDK.exe --accept-licenses --default-answer --confirm-command install
           echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
