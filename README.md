@@ -52,6 +52,18 @@ out/                      generated GGUFs + golden/validation data (git-ignored)
 
 ## Build
 
+### Prebuilt binaries
+
+Tagged releases ship self-contained binaries (statically linked against `libggml`)
+on the [Releases](../../releases) page, built by CI for: Linux x64 (CPU and Vulkan),
+macOS arm64 (Metal), and Windows x64 (Vulkan). Each archive holds `zonos2-cli`,
+`spk-encoder-cli`, and `dac-cli` — no shared-library install needed. The model GGUFs
+are *not* bundled; convert or download them separately (see [Models](#models-one-time-conversion)).
+Vulkan builds need a Vulkan-capable GPU driver at runtime. For CUDA (sm_90/H100),
+build from source as below.
+
+### From source
+
 ```bash
 git clone --recurse-submodules <repo> zonos2.cpp && cd zonos2.cpp
 # (already cloned? git submodule update --init)
