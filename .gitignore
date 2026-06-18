@@ -1,0 +1,14 @@
+# build artifacts
+/build/
+/build-*/
+# generated model + validation data (large; regenerable)
+/out/
+*.gguf
+*.npy
+*.npz
+*.wav
+# python
+__pycache__/
+*.pyc
+.venv/
+_pydeps/
