@@ -1,5 +1,6 @@
 #include "zonos2.h"
 
+#include "compat.h"
 #include "gguf.h"
 
 #include <cinttypes>
@@ -102,7 +103,7 @@ bool zonos2_model_load(zonos2_model & m, const char * path, bool use_gpu) {
         const size_t off = data_off + gguf_get_tensor_offset(gguf, tid);
         const size_t nb  = ggml_nbytes(t);
         tmp.resize(nb);
-        if (fseeko(f, (off_t) off, SEEK_SET) != 0 || fread(tmp.data(), 1, nb, f) != nb) {
+        if (fseeko(f, off, SEEK_SET) != 0 || fread(tmp.data(), 1, nb, f) != nb) {
             fprintf(stderr, "zonos2: read failed for '%s'\n", name); ok = false; break;
         }
         ggml_backend_tensor_set(t, tmp.data(), 0, nb);

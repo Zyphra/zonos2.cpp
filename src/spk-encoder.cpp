@@ -5,6 +5,7 @@
 //
 //   spk-encoder-cli <spk.gguf> --mel <mel.npy> <out_emb.npy>
 //   spk-encoder-cli <spk.gguf> --wav <wav24k.npy> <out_emb.npy>
+#include "compat.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -88,7 +89,7 @@ static bool spk_load(spk_model & m, const char * path) {
         const size_t off = data_off + gguf_get_tensor_offset(gguf, tid);
         const size_t nb = ggml_nbytes(t);
         tmp.resize(nb);
-        fseeko(f, (off_t) off, SEEK_SET);
+        fseeko(f, off, SEEK_SET);
         if (fread(tmp.data(), 1, nb, f) != nb) { fprintf(stderr, "spk: read fail %s\n", name); fclose(f); return false; }
         ggml_backend_tensor_set(t, tmp.data(), 0, nb);
         m.t[name] = t;

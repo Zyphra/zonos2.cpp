@@ -1,0 +1,178 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# Allow the release job to create a GitHub Release on version tags.
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- Linux CPU
+  linux-cpu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-cpu
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin=$(find build \( -name zonos2-cli -o -name zonos2-cli.exe \) -type f | head -1)
+          out=$("$bin" 2>&1 || true)
+          echo "$out" | grep -q "usage:" || { echo "smoke failed:"; echo "$out"; exit 1; }
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          mkdir -p dist
+          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' \) -type f -exec cp {} dist/ \;
+          tar -C dist -czf zonos2-linux-x64-cpu.tar.gz .
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: zonos2-linux-x64-cpu
+          path: zonos2-linux-x64-cpu.tar.gz
+
+  # ------------------------------------------------------------- Linux Vulkan
+  linux-vulkan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Vulkan SDK (LunarG)
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-vulkan
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin=$(find build \( -name zonos2-cli -o -name zonos2-cli.exe \) -type f | head -1)
+          out=$("$bin" 2>&1 || true)
+          echo "$out" | grep -q "usage:" || { echo "smoke failed:"; echo "$out"; exit 1; }
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          mkdir -p dist
+          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' \) -type f -exec cp {} dist/ \;
+          tar -C dist -czf zonos2-linux-x64-vulkan.tar.gz .
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: zonos2-linux-x64-vulkan
+          path: zonos2-linux-x64-vulkan.tar.gz
+
+  # ------------------------------------------------------------- macOS Metal
+  # macos-14 is Apple Silicon (arm64); Metal is enabled by default in ggml.
+  macos-metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: macos-metal
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin=$(find build \( -name zonos2-cli -o -name zonos2-cli.exe \) -type f | head -1)
+          out=$("$bin" 2>&1 || true)
+          echo "$out" | grep -q "usage:" || { echo "smoke failed:"; echo "$out"; exit 1; }
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          mkdir -p dist
+          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' \) -type f -exec cp {} dist/ \;
+          tar -C dist -czf zonos2-macos-arm64-metal.tar.gz .
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: zonos2-macos-arm64-metal
+          path: zonos2-macos-arm64-metal.tar.gz
+
+  # ----------------------------------------------------------- Windows Vulkan
+  # MSVC build; relies on the _WIN32 file-IO shim in src/compat.h.
+  windows-vulkan:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Vulkan SDK (LunarG)
+        shell: pwsh
+        run: |
+          $ver = "1.3.290.0"
+          curl.exe -L -o VulkanSDK.exe "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
+          .\VulkanSDK.exe --accept-licenses --default-answer --confirm-command install
+          echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
+      - name: Configure
+        run: cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+      - name: Build
+        run: cmake --build build --config Release -j
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin=$(find build -name zonos2-cli.exe -type f | head -1)
+          out=$("$bin" 2>&1 || true)
+          echo "$out" | grep -q "usage:" || { echo "smoke failed:"; echo "$out"; exit 1; }
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          mkdir -p dist
+          find build \( -name 'zonos2-cli.exe' -o -name 'spk-encoder-cli.exe' -o -name 'dac-cli.exe' \) -type f -exec cp {} dist/ \;
+          tar -C dist -czf zonos2-windows-x64-vulkan.tar.gz .
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: zonos2-windows-x64-vulkan
+          path: zonos2-windows-x64-vulkan.tar.gz
+
+  # ------------------------------------------------- Release (version tags only)
+  release:
+    needs: [linux-cpu, linux-vulkan, macos-metal, windows-vulkan]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

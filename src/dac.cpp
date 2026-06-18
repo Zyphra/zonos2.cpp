@@ -4,6 +4,7 @@
 //   -> quantizer.from_codes (9 folded lookup tables) -> decoder -> tanh.
 #include "dac.h"
 
+#include "compat.h"
 #include "ggml-alloc.h"
 #include "gguf.h"
 
@@ -62,7 +63,7 @@ bool dac_load(dac_model & m, const char * path, bool use_gpu) {
         const size_t off = data_off + gguf_get_tensor_offset(gguf, tid);
         const size_t nb = ggml_nbytes(t);
         tmp.resize(nb);
-        fseeko(f, (off_t) off, SEEK_SET);
+        fseeko(f, off, SEEK_SET);
         if (fread(tmp.data(), 1, nb, f) != nb) { fprintf(stderr, "dac: read fail %s\n", name); fclose(f); return false; }
         ggml_backend_tensor_set(t, tmp.data(), 0, nb);
         m.t[name] = t;
