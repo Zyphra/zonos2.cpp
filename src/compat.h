@@ -4,6 +4,11 @@
 // GGUFs (a plain fseek would truncate on Win32, where long is 32-bit).
 #pragma once
 
+// MSVC only exposes M_PI and the other math constants from <cmath>/<math.h> when
+// this is defined before they are included; harmless elsewhere. compat.h is the
+// first include in each TU, so the math headers pick it up.
+#define _USE_MATH_DEFINES
+
 #ifdef _WIN32
 #include <stdio.h>
 #define fseeko(stream, offset, whence) _fseeki64((stream), (long long) (offset), (whence))
