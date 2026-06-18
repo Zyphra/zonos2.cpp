@@ -24,7 +24,7 @@ jobs:
           key: linux-cpu
       - name: Configure
         run: >
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -65,7 +65,7 @@ jobs:
           key: linux-vulkan
       - name: Configure
         run: >
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -101,7 +101,7 @@ jobs:
           key: macos-metal
       - name: Configure
         run: >
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j"$(sysctl -n hw.ncpu)"
@@ -146,7 +146,7 @@ jobs:
           echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
           echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
       - name: Configure
-        run: cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+        run: cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
       - name: Build
         run: cmake --build build --config Release -j
       - name: Smoke test
