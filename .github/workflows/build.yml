@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' \) -type f -exec cp {} dist/ \;
+          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' -o -name 'quantize-cli*' \) -type f -exec cp {} dist/ \;
           tar -C dist -czf zonos2-linux-x64-cpu.tar.gz .
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
@@ -80,7 +80,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' \) -type f -exec cp {} dist/ \;
+          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' -o -name 'quantize-cli*' \) -type f -exec cp {} dist/ \;
           tar -C dist -czf zonos2-linux-x64-vulkan.tar.gz .
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' \) -type f -exec cp {} dist/ \;
+          find build \( -name 'zonos2-cli*' -o -name 'spk-encoder-cli*' -o -name 'dac-cli*' -o -name 'quantize-cli*' \) -type f -exec cp {} dist/ \;
           tar -C dist -czf zonos2-macos-arm64-metal.tar.gz .
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
@@ -160,7 +160,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find build \( -name 'zonos2-cli.exe' -o -name 'spk-encoder-cli.exe' -o -name 'dac-cli.exe' \) -type f -exec cp {} dist/ \;
+          find build \( -name 'zonos2-cli.exe' -o -name 'spk-encoder-cli.exe' -o -name 'dac-cli.exe' -o -name 'quantize-cli.exe' \) -type f -exec cp {} dist/ \;
           tar -C dist -czf zonos2-windows-x64-vulkan.tar.gz .
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
