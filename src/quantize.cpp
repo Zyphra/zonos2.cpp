@@ -11,11 +11,13 @@
 // Quantization is ggml_quantize_chunk, so K-quants (Q4_K, Q5_K, Q6_K, ...) work
 // here even though the pure-Python converter cannot emit them.
 //
-// Usage:  quantize-cli <in-f16.gguf> <out.gguf> <type> [--experts-only]
+// Usage:  quantize-cli <in-f16.gguf> <out.gguf> <type> [--experts-only] [--down-tier-up]
 //   type: q8_0 q4_0 q4_1 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k iq4_nl iq4_xs
 //   --experts-only: low-bit <type> on the MoE expert stacks only; spine stays q8_0. Per the
 //     KLD analysis the spine (attention/dense-FFN/router) flips routing under sub-q8 bits,
 //     while the experts (the bulk of the weights) tolerate it -- best size/quality tradeoff.
+//   --down-tier-up: put the expert down projection one K-tier above gate/up (q2_k down→q3_k
+//     cut KLD ~19x for +0.24 GB). Off by default so plain --experts-only is uniform-bit.
 #include "ggml.h"
 #include "gguf.h"
 
@@ -66,15 +68,36 @@ static bool is_expert(const std::string & n) {
     return n.find("_exps") != std::string::npos;
 }
 
+// The expert down projection is the most quant-sensitive of the three stacks, so in
+// --experts-only mode it takes one K-quant tier above gate/up (mirrors llama.cpp's _M mixes).
+// No-op for non-K bulk types.
+static ggml_type next_ktier(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q2_K: return GGML_TYPE_Q3_K;
+        case GGML_TYPE_Q3_K: return GGML_TYPE_Q4_K;
+        case GGML_TYPE_Q4_K: return GGML_TYPE_Q5_K;
+        case GGML_TYPE_Q5_K: return GGML_TYPE_Q6_K;
+        default:             return t;
+    }
+}
+
 // experts_only: apply the (low-bit) bulk quant ONLY to the expert stacks; keep the whole
 // spine (attention, dense FFN, routers, head, embeddings) at q8_0 so router inputs stay
 // clean and top-k expert selection does not flip. Sensitive set stays F16 as usual.
-static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_only) {
+// down_tier_up (opt-in): the expert down projection — the most quant-sensitive of the three
+// stacks — takes one K-quant tier above gate/up. Rescues 2-bit experts (q2_k down→q3_k cut
+// KLD ~19x for +0.24 GB); marginal above q4_k. Left off by default so plain --experts-only
+// stays a uniform-bit recipe.
+static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_only, bool down_tier_up) {
     if (ggml_n_dims(t) == 1)        return t->type;                  // 1-D: keep (F32)
     const std::string n = ggml_get_name(t);
     if (experts_only && !is_expert(n)) {
         if (is_high_precision(n)) return GGML_TYPE_F16;
         return (t->ne[0] % 32 == 0) ? GGML_TYPE_Q8_0 : GGML_TYPE_F16; // spine stays q8_0
+    }
+    if (down_tier_up && is_expert(n) && n.find("ffn_down_exps") != std::string::npos) {
+        const ggml_type up = next_ktier(bulk);               // down projection one K-tier up
+        if (up != bulk && t->ne[0] % ggml_blck_size(up) == 0) return up;
     }
     if (is_high_precision(n)) return higher_tier(bulk, t->ne[0]);
     if (t->ne[0] % ggml_blck_size(bulk) != 0) return GGML_TYPE_F16;  // not block-aligned
@@ -82,15 +105,17 @@ static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_
 }
 
 int main(int argc, char ** argv) {
-    bool experts_only = false;
+    bool experts_only = false, down_tier_up = false;
     std::vector<const char *> pos;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--experts-only")) experts_only = true;
+        if      (!strcmp(argv[i], "--experts-only")) experts_only = true;
+        else if (!strcmp(argv[i], "--down-tier-up")) down_tier_up = true;
         else pos.push_back(argv[i]);
     }
     if (pos.size() != 3) {
-        fprintf(stderr, "usage: %s <in-f16.gguf> <out.gguf> <type> [--experts-only]\n"
+        fprintf(stderr, "usage: %s <in-f16.gguf> <out.gguf> <type> [--experts-only] [--down-tier-up]\n"
                         "  --experts-only: apply <type> only to MoE expert stacks; spine stays q8_0\n"
+                        "  --down-tier-up: put the expert down projection one K-tier up (rescues q2_k)\n"
                         "  type:", argv[0]);
         for (const auto & q : QTYPES) fprintf(stderr, " %s", q.name);
         fprintf(stderr, "\n");
@@ -120,7 +145,7 @@ int main(int argc, char ** argv) {
     size_t need = 0;
     for (int64_t i = 0; i < n_tensors; i++) {
         ggml_tensor * t = ggml_get_tensor(ctx_in, gguf_get_tensor_name(gin, i));
-        const ggml_type tt = pick_qtype(t, bulk, experts_only);
+        const ggml_type tt = pick_qtype(t, bulk, experts_only, down_tier_up);
         need += ggml_row_size(tt, t->ne[0]) * (ggml_nelements(t) / t->ne[0]);
     }
     need += (size_t) (n_tensors + 1) * ggml_tensor_overhead() + (1u << 20);
@@ -136,7 +161,7 @@ int main(int argc, char ** argv) {
     int n_quant = 0, n_kept = 0;
     for (int64_t i = 0; i < n_tensors; i++) {
         ggml_tensor * t = ggml_get_tensor(ctx_in, gguf_get_tensor_name(gin, i));
-        const ggml_type tt = pick_qtype(t, bulk, experts_only);
+        const ggml_type tt = pick_qtype(t, bulk, experts_only, down_tier_up);
         const int64_t   ne0 = t->ne[0], n = ggml_nelements(t), nrows = n / ne0;
 
         ggml_tensor * d = ggml_new_tensor(ctx_out, tt, ggml_n_dims(t), t->ne);
@@ -161,7 +186,7 @@ int main(int argc, char ** argv) {
     if (!gguf_write_to_file(gout, out_path, false)) { fprintf(stderr, "quantize: write failed\n"); return 1; }
 
     fprintf(stderr, "quantize: %s -> %s [%s%s]: %d tensors (%d quantized, %d kept), %.2f GB -> %.2f GB\n",
-            in_path, out_path, type_s, experts_only ? ", experts-only" : "",
+            in_path, out_path, type_s, experts_only ? (down_tier_up ? ", experts-only, down-tier-up" : ", experts-only") : "",
             (int) n_tensors, n_quant, n_kept, in_bytes / 1e9, out_bytes / 1e9);
 
     gguf_free(gout); ggml_free(ctx_out); gguf_free(gin); ggml_free(ctx_in);
