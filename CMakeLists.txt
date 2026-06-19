@@ -64,8 +64,8 @@ add_executable(zonos2-cli src/main.cpp src/dac.cpp)
 target_include_directories(zonos2-cli PRIVATE src ggml/include)
 target_link_libraries(zonos2-cli PRIVATE zonos2 ggml)
 
-# --- speaker encoder (ECAPA-TDNN) CLI ---
-add_executable(spk-encoder-cli src/spk-encoder.cpp)
+# --- speaker encoder (ECAPA-TDNN): library (shared with the server) + CLI ---
+add_executable(spk-encoder-cli src/spk-encoder-cli.cpp src/spk-encoder.cpp)
 target_include_directories(spk-encoder-cli PRIVATE src ggml/include)
 target_link_libraries(spk-encoder-cli PRIVATE ggml)
 
@@ -83,3 +83,13 @@ target_link_libraries(quantize-cli PRIVATE ggml)
 add_executable(zonos2-perplexity src/perplexity.cpp)
 target_include_directories(zonos2-perplexity PRIVATE src ggml/include)
 target_link_libraries(zonos2-perplexity PRIVATE zonos2 ggml)
+
+# --- HTTP TTS server (mirrors ../ZONOS2 FastAPI: /tts/generate streaming, /v1/audio/speech,
+#     speaker cloning, web UI). Header-only cpp-httplib + nlohmann/json under vendor/. ---
+add_executable(zonos2-server src/server.cpp src/dac.cpp src/spk-encoder.cpp)
+target_include_directories(zonos2-server PRIVATE src vendor ggml/include)
+find_package(Threads REQUIRED)
+target_link_libraries(zonos2-server PRIVATE zonos2 ggml Threads::Threads)
+if (WIN32)
+    target_link_libraries(zonos2-server PRIVATE ws2_32)
+endif()

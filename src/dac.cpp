@@ -8,10 +8,12 @@
 #include "ggml-alloc.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 ggml_tensor * dac_model::get(const std::string & n) const {
     auto it = t.find(n);
@@ -140,40 +142,51 @@ static ggml_tensor * dec_block(ggml_context * ctx, const dac_model & m, ggml_ten
     return y;
 }
 
-bool dac_decode(const dac_model & m, const int32_t * codes, int H, int W, int eos,
-                std::vector<float> & audio) {
-    if (W != m.n_codebooks) { fprintf(stderr, "dac: codes have %d codebooks, expected %d\n", W, m.n_codebooks); return false; }
-    const int E = (eos >= 0) ? (eos < H ? eos : H) : H;   // rows after shear_up + truncate
-    if (E <= 0) { fprintf(stderr, "dac: no frames to decode (eos=%d, H=%d)\n", eos, H); return false; }
+// Total upsampling factor (samples emitted per latent frame) = product of decoder rates.
+static int dac_samples_per_frame(const dac_model & m) {
+    int spf = 1;
+    for (int r : m.decoder_rates) spf *= r;
+    return spf;
+}
 
-    // shear_up (col j shifted up by j; pad 1025) -> clamp<=1023 -> per-codebook I32 indices
+// shear_up + clamp for latent frames [t0,t1): idx[j][local] = codes[(t0+local)+j][j]
+// (pad 1025 -> clamp 1023 when (t0+local)+j >= H). codes is row-major [H, W].
+static void dac_build_idx(const dac_model & m, const int32_t * codes, int H, int W,
+                          int t0, int t1, std::vector<std::vector<int32_t>> & idx) {
+    const int L = t1 - t0;
     const int PAD = m.audio_pad_id;
-    std::vector<std::vector<int32_t>> idx(m.n_codebooks, std::vector<int32_t>(E));
+    idx.assign(m.n_codebooks, std::vector<int32_t>(L));
     for (int j = 0; j < m.n_codebooks; ++j)
-        for (int t = 0; t < E; ++t) {
+        for (int local = 0; local < L; ++local) {
+            const int t = t0 + local;
             int v = (t + j < H) ? codes[(size_t) (t + j) * W + j] : PAD;   // shear_up
             if (v > 1023) v = 1023;                                        // clamp (incl. pad -> 1023)
             if (v < 0) v = 0;
-            idx[j][t] = v;
+            idx[j][local] = v;
         }
+}
 
+// Run the decoder over pre-sheared, clamped per-codebook indices (each length L);
+// returns L * dac_samples_per_frame(m) mono f32 samples.
+static bool dac_run_decoder(const dac_model & m, const std::vector<std::vector<int32_t>> & idx,
+                            int L, std::vector<float> & audio) {
     ggml_context * ctx = ggml_init({ (size_t) 64 * 1024 * 1024, nullptr, /*no_alloc=*/ true });
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
 
-    // from_codes: sum_i get_rows(table_i, codes_i) + total bias -> [latent, E] -> [E, latent]
+    // from_codes: sum_i get_rows(table_i, codes_i) + total bias -> [latent, L] -> [L, latent]
     std::vector<ggml_tensor *> code_in(m.n_codebooks);
     ggml_tensor * z = nullptr;
     for (int i = 0; i < m.n_codebooks; ++i) {
-        code_in[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, E);
+        code_in[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
         ggml_set_input(code_in[i]);
-        ggml_tensor * zi = ggml_get_rows(ctx, m.get("quant." + std::to_string(i) + ".table"), code_in[i]);  // [latent,E]
+        ggml_tensor * zi = ggml_get_rows(ctx, m.get("quant." + std::to_string(i) + ".table"), code_in[i]);  // [latent,L]
         z = z ? ggml_add(ctx, z, zi) : zi;
     }
     z = ggml_add(ctx, z, m.get("quant.bias"));               // + [latent] broadcast over time
-    z = ggml_cont(ctx, ggml_transpose(ctx, z));              // [E, latent]
+    z = ggml_cont(ctx, ggml_transpose(ctx, z));              // [L, latent]
 
     // decoder
-    ggml_tensor * h = conv1d(ctx, m.get("dec.conv_in.weight"), m.get("dec.conv_in.bias"), z, 1, 3, 1);  // [E,1536]
+    ggml_tensor * h = conv1d(ctx, m.get("dec.conv_in.weight"), m.get("dec.conv_in.bias"), z, 1, 3, 1);  // [L,1536]
     for (int b = 0; b < (int) m.decoder_rates.size(); ++b)
         h = dec_block(ctx, m, h, b, m.decoder_rates[b]);
     h = snake_named(ctx, m, h, "dec.snake_out");
@@ -186,7 +199,7 @@ bool dac_decode(const dac_model & m, const int32_t * codes, int H, int W, int eo
     ggml_gallocr_t galloc = ggml_gallocr_new(m.buft);
     if (!ggml_gallocr_alloc_graph(galloc, gf)) { fprintf(stderr, "dac: alloc failed\n"); ggml_gallocr_free(galloc); ggml_free(ctx); return false; }
     for (int i = 0; i < m.n_codebooks; ++i)
-        ggml_backend_tensor_set(code_in[i], idx[i].data(), 0, (size_t) E * sizeof(int32_t));
+        ggml_backend_tensor_set(code_in[i], idx[i].data(), 0, (size_t) L * sizeof(int32_t));
 
     if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "dac: compute failed\n"); ggml_gallocr_free(galloc); ggml_free(ctx); return false;
@@ -197,7 +210,20 @@ bool dac_decode(const dac_model & m, const int32_t * codes, int H, int W, int eo
     ggml_backend_tensor_get(out, audio.data(), 0, ns * sizeof(float));
     ggml_gallocr_free(galloc);
     ggml_free(ctx);
+    return true;
+}
 
+bool dac_decode(const dac_model & m, const int32_t * codes, int H, int W, int eos,
+                std::vector<float> & audio) {
+    if (W != m.n_codebooks) { fprintf(stderr, "dac: codes have %d codebooks, expected %d\n", W, m.n_codebooks); return false; }
+    const int E = (eos >= 0) ? (eos < H ? eos : H) : H;   // rows after shear_up + truncate
+    if (E <= 0) { fprintf(stderr, "dac: no frames to decode (eos=%d, H=%d)\n", eos, H); return false; }
+
+    std::vector<std::vector<int32_t>> idx;
+    dac_build_idx(m, codes, H, W, 0, E, idx);
+    if (!dac_run_decoder(m, idx, E, audio)) return false;
+
+    const int64_t ns = (int64_t) audio.size();
     double rms = 0, peak = 0;
     for (float v : audio) { rms += (double) v * v; peak = std::max(peak, (double) fabsf(v)); }
     fprintf(stderr, "dac: H=%d eos=%d -> %lld samples = %.2fs, rms=%.4f peak=%.4f\n",
@@ -205,22 +231,52 @@ bool dac_decode(const dac_model & m, const int32_t * codes, int H, int W, int eo
     return true;
 }
 
-bool dac_write_wav(const char * path, const std::vector<float> & audio, int sample_rate) {
-    FILE * wf = fopen(path, "wb");
-    if (!wf) { fprintf(stderr, "dac: cannot write %s\n", path); return false; }
+bool dac_decode_window(const dac_model & m, const int32_t * codes, int H,
+                       int f_lo, int f_hi, int Lc, int Rc, std::vector<float> & audio) {
+    audio.clear();
+    if (f_hi <= f_lo) return true;
+    const int W = m.n_codebooks;
+    const int spf = dac_samples_per_frame(m);
+    const int a = std::max(0, f_lo - Lc);   // latent start (left context, clamped at 0)
+    const int b = f_hi + Rc;                // latent end (right context); frames >= H are pad
+
+    std::vector<std::vector<int32_t>> idx;
+    dac_build_idx(m, codes, H, W, a, b, idx);
+    std::vector<float> full;
+    if (!dac_run_decoder(m, idx, b - a, full)) return false;
+
+    const size_t s0 = (size_t) (f_lo - a) * spf;
+    const size_t s1 = (size_t) (f_hi - a) * spf;
+    if (s1 > full.size()) { fprintf(stderr, "dac: window crop out of range\n"); return false; }
+    audio.assign(full.begin() + s0, full.begin() + s1);
+    return true;
+}
+
+std::vector<uint8_t> dac_wav_bytes(const std::vector<float> & audio, int sample_rate) {
     const int64_t ns = (int64_t) audio.size();
-    const uint32_t sr = sample_rate, byte_rate = sr * 2, data_bytes = (uint32_t) (ns * 2);
+    const uint32_t sr = (uint32_t) sample_rate, byte_rate = sr * 2, data_bytes = (uint32_t) (ns * 2);
     const uint32_t riff = 36 + data_bytes;
-    auto w32 = [&](uint32_t v) { fwrite(&v, 4, 1, wf); };
-    auto w16 = [&](uint16_t v) { fwrite(&v, 2, 1, wf); };
-    fwrite("RIFF", 1, 4, wf); w32(riff); fwrite("WAVE", 1, 4, wf);
-    fwrite("fmt ", 1, 4, wf); w32(16); w16(1); w16(1); w32(sr); w32(byte_rate); w16(2); w16(16);
-    fwrite("data", 1, 4, wf); w32(data_bytes);
+    std::vector<uint8_t> out;
+    out.reserve(44 + (size_t) ns * 2);
+    auto bytes = [&](const void * p, size_t n) { const uint8_t * b = (const uint8_t *) p; out.insert(out.end(), b, b + n); };
+    auto w32 = [&](uint32_t v) { bytes(&v, 4); };
+    auto w16 = [&](uint16_t v) { bytes(&v, 2); };
+    bytes("RIFF", 4); w32(riff); bytes("WAVE", 4);
+    bytes("fmt ", 4); w32(16); w16(1); w16(1); w32(sr); w32(byte_rate); w16(2); w16(16);
+    bytes("data", 4); w32(data_bytes);
     for (int64_t i = 0; i < ns; ++i) {
         float v = audio[i]; if (v > 1.0f) v = 1.0f; if (v < -1.0f) v = -1.0f;
         int16_t s = (int16_t) lrintf(v * 32767.0f);
-        fwrite(&s, 2, 1, wf);
+        w16((uint16_t) s);
     }
+    return out;
+}
+
+bool dac_write_wav(const char * path, const std::vector<float> & audio, int sample_rate) {
+    FILE * wf = fopen(path, "wb");
+    if (!wf) { fprintf(stderr, "dac: cannot write %s\n", path); return false; }
+    const std::vector<uint8_t> buf = dac_wav_bytes(audio, sample_rate);
+    fwrite(buf.data(), 1, buf.size(), wf);
     fclose(wf);
     fprintf(stderr, "dac: wrote %s\n", path);
     return true;

@@ -5,6 +5,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -34,5 +35,18 @@ void dac_free(dac_model & m);
 bool dac_decode(const dac_model & m, const int32_t * codes, int H, int W, int eos,
                 std::vector<float> & audio);
 
-// Write a 16-bit PCM mono WAV.
+// Streaming-friendly windowed decode. Decode output frames [f_lo, f_hi) from the raw
+// codes [H, n_codebooks], building the latent over the extended range
+// [f_lo-Lc, f_hi+Rc) so conv boundaries get enough context, then cropping `audio` to the
+// central samples for [f_lo, f_hi). With Lc/Rc >= the decoder's receptive field, the
+// returned samples are bit-identical to the corresponding slice of a single dac_decode().
+// The caller must have generated codes up to (f_hi+Rc-1)+(n_codebooks-1) (the shear
+// lookahead) for the window to be seam-free; frames past H are treated as pad.
+bool dac_decode_window(const dac_model & m, const int32_t * codes, int H,
+                       int f_lo, int f_hi, int Lc, int Rc, std::vector<float> & audio);
+
+// Encode a mono f32 waveform as a 16-bit PCM mono WAV byte buffer (RIFF/WAVE).
+std::vector<uint8_t> dac_wav_bytes(const std::vector<float> & audio, int sample_rate);
+
+// Write a 16-bit PCM mono WAV file.
 bool dac_write_wav(const char * path, const std::vector<float> & audio, int sample_rate);

@@ -27,6 +27,8 @@ zonos2-cli out/zonos2-q8_0.gguf --tts "Hello, world." out.wav \
 - **CPU and CUDA**, same GGUF files. CUDA targets sm_90 (H100) by default.
 - **Real-time on GPU:** ~300 fps decode, **RTF ≈ 0.28–0.32** (~3.5× faster than real-time)
   via a fused `flash_attn_ext` decode step, an F16 KV cache, and CUDA-graph replay.
+- **HTTP server** (`zonos2-server`) mirroring the reference FastAPI: low-latency streaming
+  PCM, OpenAI `/v1/audio/speech`, in-process reference-audio voice cloning, and a browser UI.
 - **Numerically validated against the PyTorch reference** at every stage — the backbone to
   cosine ≥ 0.9999 / matching argmax, the speaker encoder and DAC decoder **bit-exact**.
 - **Quantization:** F16 (lossless from the bf16 checkpoint), **Q8_0** (7.7 GB, quant-sensitive
@@ -42,13 +44,17 @@ src/
   zonos2-graph.cpp        backbone graph (prefill/validate) + KV-cache decode + zonos2_generate
   zonos2-sampler.{h,cpp}  per-codebook sampler (temp/top-k/top-p/min-p, rep penalty, EOS)
   zonos2-prompt.cpp       text → input-id prompt (mirrors tts/prompt.py + scheduler)
-  spk-encoder.cpp         ECAPA-TDNN speaker encoder → spk-encoder-cli
-  dac.{h,cpp}             DAC-44kHz decoder library
-  dac-cli.cpp             standalone codes → wav CLI
+  spk-encoder.{h,cpp}     ECAPA-TDNN speaker encoder library (shared by CLI + server)
+  spk-encoder-cli.cpp     spk-encoder-cli (wav/mel/clone → [2048] embedding)
+  dac.{h,cpp}             DAC-44kHz decoder library (full + windowed/streaming decode)
+  dac-cli.cpp             standalone codes → wav CLI (+ --seam self-check)
   main.cpp                zonos2-cli (summary / validate / generate / tts / build-prompt)
+  server.cpp              zonos2-server (HTTP TTS server; mirrors ../ZONOS2's FastAPI)
   quantize.cpp            gguf→gguf requantizer → quantize-cli (bulk or --experts-only)
   perplexity.cpp          KL-divergence / perplexity eval → zonos2-perplexity
   npy.h                   tiny .npy reader/writer
+vendor/                   header-only deps: cpp-httplib, nlohmann/json (server only)
+web/tts_ui.html           browser UI served by zonos2-server at /
 models/                   GGUF converters + the PyTorch validation harness (see below)
 ggml/                     vendored submodule (pinned 3af5f57)
 out/                      generated GGUFs + golden/validation data (git-ignored)
@@ -61,7 +67,8 @@ out/                      generated GGUFs + golden/validation data (git-ignored)
 Tagged releases ship self-contained binaries (statically linked against `libggml`)
 on the [Releases](../../releases) page, built by CI for: Linux x64 (CPU and Vulkan),
 macOS arm64 (Metal), and Windows x64 (Vulkan). Each archive holds `zonos2-cli`,
-`spk-encoder-cli`, and `dac-cli` — no shared-library install needed. The model GGUFs
+`zonos2-server` (+ the `web/` UI), `spk-encoder-cli`, `dac-cli`, and `quantize-cli` — no
+shared-library install needed. The model GGUFs
 are *not* bundled; convert or download them separately (see [Models](#models-one-time-conversion)).
 Vulkan builds need a Vulkan-capable GPU driver at runtime. For CUDA (sm_90/H100),
 build from source as below.
@@ -81,8 +88,10 @@ cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cuda -j
 ```
 
-Each build produces three executables: **`zonos2-cli`**, **`spk-encoder-cli`**, **`dac-cli`**.
-CUDA-graph replay (needed for the real-time decode) is enabled automatically for CUDA builds.
+Each build produces **`zonos2-cli`**, **`zonos2-server`**, **`spk-encoder-cli`**, **`dac-cli`**,
+**`quantize-cli`**, and **`zonos2-perplexity`**. CUDA-graph replay (needed for the real-time
+decode) is enabled automatically for CUDA builds. The server links two header-only libraries
+vendored under `vendor/` (cpp-httplib, nlohmann/json) — no extra install.
 
 ## Models (one-time conversion)
 
@@ -206,6 +215,60 @@ zonos2-cli out/zonos2-q8_0.gguf --tts "Cloned voice demo." out.wav \
 The repo's three bundled reference voices live in `ZONOS2/default_voices/*.mp3`. The speaker
 encoder also accepts `--wav <24kHz-mono.npy>`, `--raw <f32le>`, or a precomputed
 `--mel <[T,128].npy>`.
+
+### HTTP server
+
+`zonos2-server` loads the backbone + DAC (+ optional speaker encoder) once and serves an HTTP
+API that mirrors the reference [`../ZONOS2`](https://huggingface.co/Zyphra/ZONOS2) FastAPI
+server, including **low-latency streaming** and **in-process voice cloning**:
+
+```bash
+zonos2-server out/zonos2-f16.gguf --dac out/dac.gguf --spk out/spk-encoder.gguf \
+    --host 0.0.0.0 --port 1919 --gpu
+# then open http://localhost:1919/  for the browser UI
+```
+
+| route | method | description |
+|---|---|---|
+| `/tts/generate` | POST | JSON → **streaming float32 PCM** (`stream:true`, default) or buffered (`format:"wav"`) |
+| `/v1/audio/speech` | POST | OpenAI-compatible (`input`, `response_format` = `pcm` streams / `wav` buffers) |
+| `/tts/capabilities` | GET | feature flags for the loaded model |
+| `/tts/speakers` | GET/POST | list / cache a session speaker (audio upload or `.npy` embedding) |
+| `/tts/speakers/{id}/preview` | GET | cached reference audio (WAV) |
+| `/v1/models`, `/v1`, `/health` | GET | status / model list |
+| `/` | GET | bundled `web/tts_ui.html` |
+
+```bash
+# stream raw float32 PCM @ 44.1 kHz (chunked) and play it
+curl -sN localhost:1919/tts/generate -d '{"text":"Streaming hello.","seed":1}' | aplay -f FLOAT_LE -r 44100 -c 1
+# buffered WAV
+curl -s localhost:1919/tts/generate -d '{"text":"Hi.","stream":false,"format":"wav","seed":1}' -o out.wav
+# clone a voice by uploading reference audio (base64), per request or cached for the session
+curl -s localhost:1919/tts/generate -d "{\"text\":\"Cloned.\",\"seed\":1,\"clean_speaker_background\":true,\
+\"speaker_audio_base64\":\"$(base64 -w0 voice.mp3)\"}" -o cloned.pcm
+```
+
+The JSON body accepts the reference fields: `text`, sampling (`temperature`, `topk`, `top_p`,
+`min_p`, `seed`, `repetition_{window,penalty,codebooks}`, `max_tokens`), conditioning
+(`speaking_rate_enabled`/`speaking_rate_bucket`, `quality_enabled`/`quality_buckets`,
+`clean_speaker_background`, `accurate_mode`), speaker (`speaker_audio_base64`,
+`speaker_embedding_base64` for a `.npy`, `speaker_embedding_id` for a session-cached one),
+`fade_out_ms`, `stream`, `format`. Audio uploads are decoded with `ffmpeg` (must be on PATH).
+
+Server flags: `--gpu`/`--cpu`, `--spk <encoder.gguf>` (enables audio-upload cloning),
+`--max N` (frame ceiling, default 2000 ≈ 23 s), `--stream-block`/`--stream-context` (streaming
+granularity / conv-context frames, ≥16 is seam-free), `--dac-cpu` (run the DAC on CPU under
+`--gpu`), `--ui <path>`. One synthesis runs at a time (the model isn't thread-safe); concurrent
+requests queue.
+
+> **Differences from the Python server (documented honestly via `/tts/capabilities`):**
+> the C++ tokenizer is **byte-level**, so `language` is accepted-but-ignored and
+> `text_normalization` is unsupported (`text_normalization_enabled:false`); speaker **blending**
+> and a default-voices directory are not implemented. `/tts/generate` (buffered) is **bit-identical
+> to `zonos2-cli --tts`** for matching params; streamed audio matches the buffered decode to
+> ≈−82 dB on GPU (block-vs-full-decode float variance — bit-identical on CPU or with `--dac-cpu`).
+> Output is deterministic for fixed `(text, seed, sampling, max_tokens)`; changing `max_tokens`
+> perturbs audio at the float level (it sizes the KV window, which reorders flash-attention sums).
 
 ### Standalone components
 

@@ -414,7 +414,7 @@ bool zonos2_moe_capture(const zonos2_model & m, const float * ids, int n_tokens,
 static int generate_recompute(const zonos2_model & m, const float * prompt_ids, int n0,
                               int max_frames, const zonos2_sampling & sp,
                               std::vector<int32_t> & out_codes, int & eos_frame,
-                              const float * spk, int spk_pos) {
+                              const float * spk, int spk_pos, const zonos2_frame_cb & on_frame) {
     const zonos2_hparams & hp = m.hp;
     const int W = (int) hp.n_codebooks + 1;
     const int ncb = (int) hp.n_codebooks;
@@ -470,6 +470,11 @@ static int generate_recompute(const zonos2_model & m, const float * prompt_ids, 
 
         for (int cb = 0; cb < ncb; ++cb) out_codes.push_back(frame[cb]);
         ++n_frames;
+
+        if (on_frame) {
+            const std::vector<int32_t> fc(frame.begin(), frame.end());
+            if (!on_frame(n_frames - 1, fc.data(), ncb)) break;   // client aborted
+        }
 
         // feed back as next input frame (audio codes + text pad); delay handled by shear_up later
         for (int cb = 0; cb < ncb; ++cb) seq.push_back(frame[cb]);
@@ -532,7 +537,7 @@ void zonos2_context_free(zonos2_context & c) {
 static int generate_kv(const zonos2_model & m, const float * prompt_ids, int n0,
                        int max_frames, const zonos2_sampling & sp,
                        std::vector<int32_t> & out_codes, int & eos_frame,
-                       const float * spk, int spk_pos) {
+                       const float * spk, int spk_pos, const zonos2_frame_cb & on_frame) {
     const zonos2_hparams & hp = m.hp;
     const int W = (int) hp.n_codebooks + 1, ncb = (int) hp.n_codebooks, av = (int) hp.audio_vocab;
     const int max_seq = ((n0 + max_frames + 8 + 255) / 256) * 256; // multiple of FATTN_KQ_STRIDE (flash vec kernel)
@@ -601,6 +606,11 @@ static int generate_kv(const zonos2_model & m, const float * prompt_ids, int n0,
         for (int cb = 0; cb < ncb; ++cb) out_codes.push_back(frame[cb]);
         ++n_frames;
 
+        if (on_frame) {
+            const std::vector<int32_t> fc(frame.begin(), frame.end());
+            if (!on_frame(n_frames - 1, fc.data(), ncb)) break;   // client aborted
+        }
+
         int max_eoa = -1;
         for (int cb = 0; cb < ncb; ++cb) if (frame[cb] == (int) hp.eoa_id) max_eoa = cb;
         if (eos_frame < 0 && max_eoa >= 0) { eos_frame = std::max(0, step - max_eoa); countdown = ncb + 1; }
@@ -639,8 +649,26 @@ static int generate_kv(const zonos2_model & m, const float * prompt_ids, int n0,
 int zonos2_generate(const zonos2_model & m, const float * prompt_ids, int n0,
                     int max_frames, const zonos2_sampling & sp,
                     std::vector<int32_t> & out_codes, int & eos_frame, bool use_kv,
-                    const float * spk, int spk_pos) {
-    return use_kv
-        ? generate_kv       (m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos)
-        : generate_recompute(m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos);
+                    const float * spk, int spk_pos, std::vector<int32_t> * out_full_ids,
+                    const zonos2_frame_cb & on_frame) {
+    const size_t codes0 = out_codes.size();
+    const int nf = use_kv
+        ? generate_kv       (m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos, on_frame)
+        : generate_recompute(m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos, on_frame);
+
+    if (out_full_ids) {
+        // Rebuild the exact input sequence the model saw: prompt rows, then each generated
+        // frame's codes plus the text-pad column. Identical for both decode paths (delay shear
+        // is applied inside the graph, so these pre-shear ids match the prompt convention).
+        const int W = (int) m.hp.n_codebooks + 1, ncb = (int) m.hp.n_codebooks;
+        out_full_ids->clear();
+        out_full_ids->reserve((size_t) (n0 + nf) * W);
+        for (int i = 0; i < n0 * W; ++i) out_full_ids->push_back((int32_t) lroundf(prompt_ids[i]));
+        for (int f = 0; f < nf; ++f) {
+            const int32_t * fr = &out_codes[codes0 + (size_t) f * ncb];
+            for (int cb = 0; cb < ncb; ++cb) out_full_ids->push_back(fr[cb]);
+            out_full_ids->push_back((int32_t) m.hp.text_vocab);
+        }
+    }
+    return nf;
 }

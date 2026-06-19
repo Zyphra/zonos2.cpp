@@ -1,47 +1,23 @@
-// spk-encoder-cli — standalone ggml port of the ECAPA-TDNN speaker encoder
+// spk-encoder — ggml port of the ECAPA-TDNN speaker encoder
 // (marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B, actually a ~6M-param ECAPA-TDNN).
 // log-mel [128,T] -> 2048-d x-vector. Optional in-graph mel frontend from a 24 kHz
 // mono waveform (STFT via DFT matmul + slaney mel + log). CPU backend.
-//
-//   spk-encoder-cli <spk.gguf> --mel <mel.npy> <out_emb.npy>
-//   spk-encoder-cli <spk.gguf> --wav <wav24k.npy> <out_emb.npy>
 #include "compat.h"
+#include "spk-encoder.h"
+
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
-#include "npy.h"
 
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <map>
 #include <string>
 #include <vector>
 
-struct spk_model {
-    ggml_context * ctx_w = nullptr;
-    ggml_backend_t backend = nullptr;
-    ggml_backend_buffer_type_t buft = nullptr;
-    ggml_backend_buffer_t buf_w = nullptr;
-    std::map<std::string, ggml_tensor *> t;
-    // hparams
-    int mel_dim = 128, enc_dim = 2048;
-    int n_fft = 1024, hop = 256, win = 1024, sr = 24000;
-    int block0_k = 5;
-    int res2net_scale = 8;
-    std::vector<int> res_dils = {2, 3, 4};  // SE-Res2Net block dilations
-    float fmin = 0.0f, fmax = 12000.0f;
-
-    ggml_tensor * get(const std::string & n) const {
-        auto it = t.find(n);
-        if (it == t.end()) { fprintf(stderr, "spk: missing tensor '%s'\n", n.c_str()); return nullptr; }
-        return it->second;
-    }
-};
-
-static bool spk_load(spk_model & m, const char * path) {
+bool spk_load(spk_model & m, const char * path) {
     ggml_context * ctx_meta = nullptr;
     gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ &ctx_meta };
     gguf_context * gguf = gguf_init_from_file(path, gp);
@@ -99,6 +75,13 @@ static bool spk_load(spk_model & m, const char * path) {
             m.t.size(), m.enc_dim, m.block0_k, m.res_dils[0], m.res_dils[1], m.res_dils[2]);
     gguf_free(gguf);
     return true;
+}
+
+void spk_free(spk_model & m) {
+    if (m.buf_w)   ggml_backend_buffer_free(m.buf_w);
+    if (m.ctx_w)   ggml_free(m.ctx_w);
+    if (m.backend) ggml_backend_free(m.backend);
+    m.buf_w = nullptr; m.ctx_w = nullptr; m.backend = nullptr; m.t.clear();
 }
 
 // ---- graph helpers (activations are channel-major [C, T]; ne0=C, ne1=T) ----
@@ -215,122 +198,112 @@ static ggml_tensor * build_ecapa(ggml_context * ctx, const spk_model & m, ggml_t
     return ggml_reshape_1d(ctx, emb, m.enc_dim);
 }
 
-int main(int argc, char ** argv) {
-    if (argc < 5) {
-        fprintf(stderr, "usage: %s <spk.gguf> --clone <audio>       <out.npy>   (any file; shells ffmpeg)\n"
-                        "       %s <spk.gguf> --mel   <mel.npy>      <out.npy>   (log-mel [T,128])\n"
-                        "       %s <spk.gguf> --wav   <wav24k.npy>   <out.npy>   (24kHz mono f32 npy)\n"
-                        "       %s <spk.gguf> --raw   <wav24k.f32le> <out.npy>   (ffmpeg -ar 24000 -ac 1 -f f32le)\n",
-                argv[0], argv[0], argv[0], argv[0]);
-        return 1;
-    }
-    const char * gguf_path = argv[1];
-    const std::string mode = argv[2];
-    const char * in_path = argv[3];
-    const char * out_path = argv[4];
+// ---- compute drivers ----
 
-    spk_model m;
-    if (!spk_load(m, gguf_path)) return 1;
+namespace {
+struct spk_input { ggml_tensor * t; const float * data; size_t n; };
 
-    ggml_context * ctx = ggml_init({ (size_t) 256 * 1024 * 1024, nullptr, /*no_alloc=*/ true });
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
-
-    // ---- build the mel input tensor (and, for --wav, the mel frontend) ----
-    std::vector<float> host_in;       // data to upload into the first input tensor
-    ggml_tensor * input = nullptr;    // tensor to receive host_in
-    std::vector<float> cosb, sinb;    // for --wav DFT basis
-    ggml_tensor * cosB = nullptr, * sinB = nullptr;
-    ggml_tensor * mel = nullptr;
-
-    if (mode == "--mel") {
-        std::vector<float> md; std::vector<int64_t> sh;
-        if (!npy::load_f32(in_path, md, sh) || sh.size() != 2) { fprintf(stderr, "bad mel npy\n"); return 1; }
-        const int64_t T = sh[0], MD = sh[1];   // [T, mel_dim]
-        input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, MD, T);  // ne=[mel,T]; row-major [T,mel] maps directly
-        ggml_set_input(input);
-        host_in = md;
-        mel = input;
-        fprintf(stderr, "mel: [T=%lld, mel=%lld]\n", (long long) T, (long long) MD);
-    } else if (mode == "--wav" || mode == "--raw" || mode == "--clone") {
-        std::vector<float> wav;
-        if (mode == "--wav") {                 // [N] f32 npy of 24 kHz mono samples
-            std::vector<int64_t> sh;
-            if (!npy::load_f32(in_path, wav, sh)) { fprintf(stderr, "bad wav npy\n"); return 1; }
-        } else if (mode == "--raw") {          // headerless float32 LE mono @ sample_rate
-            FILE * rf = fopen(in_path, "rb");   // e.g. ffmpeg -i v.mp3 -ac 1 -ar 24000 -f f32le -
-            if (!rf) { fprintf(stderr, "cannot open raw %s\n", in_path); return 1; }
-            fseeko(rf, 0, SEEK_END); long sz = ftello(rf); fseeko(rf, 0, SEEK_SET);
-            wav.resize(sz / sizeof(float));
-            if (fread(wav.data(), 1, (size_t) sz, rf) != (size_t) sz) { fprintf(stderr, "raw read fail\n"); fclose(rf); return 1; }
-            fclose(rf);
-        } else {                               // --clone: decode any audio via ffmpeg -> 24 kHz mono f32
-            std::string cmd = "ffmpeg -v error -i '" + std::string(in_path) +
-                              "' -ac 1 -ar " + std::to_string(m.sr) + " -f f32le -";
-            FILE * pp = popen(cmd.c_str(), "r");
-            if (!pp) { fprintf(stderr, "cannot run ffmpeg\n"); return 1; }
-            float buf[8192]; size_t n;
-            while ((n = fread(buf, sizeof(float), 8192, pp)) > 0) wav.insert(wav.end(), buf, buf + n);
-            int rc = pclose(pp);
-            if (rc != 0 || wav.empty()) { fprintf(stderr, "ffmpeg failed (rc=%d, %zu samples) for %s\n", rc, wav.size(), in_path); return 1; }
-        }
-        const int N = (int) wav.size();
-        const int nfft = m.n_fft, hop = m.hop, win = m.win, nfreq = nfft / 2 + 1;
-        const int pad = (nfft - hop) / 2;                       // 384, reflect-pad the waveform
-        std::vector<float> wp(N + 2 * pad);
-        for (int i = 0; i < pad; ++i) { wp[i] = wav[pad - i]; wp[N + pad + i] = wav[N - 2 - i]; }
-        for (int i = 0; i < N; ++i) wp[pad + i] = wav[i];
-        const int nframes = 1 + (int) (wp.size() - nfft) / hop;
-        // analysis window (from gguf), fold into the framed segments
-        ggml_tensor * wt = m.get("mel_window");
-        std::vector<float> window(win);
-        ggml_backend_tensor_get(wt, window.data(), 0, win * sizeof(float));
-        host_in.assign((size_t) win * nframes, 0.0f);          // framed: ne=[win, nframes]
-        for (int fr = 0; fr < nframes; ++fr)
-            for (int n = 0; n < win; ++n)
-                host_in[(size_t) fr * win + n] = wp[fr * hop + n] * window[n];
-        input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, win, nframes);
-        ggml_set_input(input);
-        // DFT basis cos/sin: ne=[win, nfreq], element (n,freq) = cos/sin(2pi*freq*n/nfft)
-        cosb.assign((size_t) win * nfreq, 0.0f);
-        sinb.assign((size_t) win * nfreq, 0.0f);
-        for (int fq = 0; fq < nfreq; ++fq)
-            for (int n = 0; n < win; ++n) {
-                double a = 2.0 * M_PI * fq * n / nfft;
-                cosb[(size_t) fq * win + n] = (float) cos(a);
-                sinb[(size_t) fq * win + n] = (float) sin(a);
-            }
-        cosB = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, win, nfreq); ggml_set_input(cosB);
-        sinB = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, win, nfreq); ggml_set_input(sinB);
-        ggml_tensor * re = ggml_mul_mat(ctx, cosB, input);     // [nfreq, nframes]
-        ggml_tensor * im = ggml_mul_mat(ctx, sinB, input);
-        ggml_tensor * mag = ggml_sqrt(ctx, ggml_add(ctx, ggml_sqr(ctx, re), ggml_sqr(ctx, im)));  // magnitude
-        ggml_tensor * fb = m.get("mel_fb");                    // ne=[nfreq, n_mels]
-        ggml_tensor * me = ggml_mul_mat(ctx, fb, mag);         // [n_mels, nframes]
-        mel = ggml_log(ctx, ggml_clamp(ctx, me, 1e-5f, FLT_MAX));
-        fprintf(stderr, "wav: N=%d -> %d frames, nfreq=%d\n", N, nframes, nfreq);
-    } else {
-        fprintf(stderr, "unknown mode %s\n", mode.c_str());
-        return 1;
-    }
-
-    ggml_tensor * emb = build_ecapa(ctx, m, mel);
+// Build + compute the graph ending at `emb`, upload `inputs`, and read back the enc_dim vector.
+std::vector<float> spk_run(const spk_model & m, ggml_context * ctx, ggml_tensor * emb,
+                           const std::vector<spk_input> & inputs) {
     ggml_set_output(emb);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
     ggml_build_forward_expand(gf, emb);
 
     ggml_gallocr_t galloc = ggml_gallocr_new(m.buft);
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) { fprintf(stderr, "alloc failed\n"); return 1; }
-
-    ggml_backend_tensor_set(input, host_in.data(), 0, host_in.size() * sizeof(float));
-    if (cosB) ggml_backend_tensor_set(cosB, cosb.data(), 0, cosb.size() * sizeof(float));
-    if (sinB) ggml_backend_tensor_set(sinB, sinb.data(), 0, sinb.size() * sizeof(float));
-
-    if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) { fprintf(stderr, "compute failed\n"); return 1; }
-
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) { fprintf(stderr, "spk: alloc failed\n"); ggml_gallocr_free(galloc); return {}; }
+    for (const auto & in : inputs) ggml_backend_tensor_set(in.t, in.data, 0, in.n * sizeof(float));
+    if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "spk: compute failed\n"); ggml_gallocr_free(galloc); return {};
+    }
     std::vector<float> out(m.enc_dim);
-    ggml_backend_tensor_get(emb, out.data(), 0, m.enc_dim * sizeof(float));
-    double nrm = 0; for (float v : out) nrm += (double) v * v;
-    fprintf(stderr, "emb: [%d] norm=%.4f\n", m.enc_dim, sqrt(nrm));
-    npy::save_f32(out_path, out.data(), { (int64_t) m.enc_dim });
-    fprintf(stderr, "wrote %s\n", out_path);
-    return 0;
+    ggml_backend_tensor_get(emb, out.data(), 0, (size_t) m.enc_dim * sizeof(float));
+    ggml_gallocr_free(galloc);
+    return out;
+}
+} // namespace
+
+std::vector<float> spk_embed_from_mel(const spk_model & m, const float * mel_data, int T) {
+    if (T <= 0) { fprintf(stderr, "spk: empty mel\n"); return {}; }
+    ggml_context * ctx = ggml_init({ (size_t) 256 * 1024 * 1024, nullptr, /*no_alloc=*/ true });
+    // ne=[mel,T]; a row-major [T,mel] host buffer maps directly.
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m.mel_dim, T);
+    ggml_set_input(input);
+    ggml_tensor * emb = build_ecapa(ctx, m, input);
+    std::vector<float> out = spk_run(m, ctx, emb, {{ input, mel_data, (size_t) m.mel_dim * T }});
+    ggml_free(ctx);
+    return out;
+}
+
+std::vector<float> spk_embed_from_pcm24k(const spk_model & m, const float * wav, int N) {
+    if (N <= 0) { fprintf(stderr, "spk: empty waveform\n"); return {}; }
+    const int nfft = m.n_fft, hop = m.hop, win = m.win, nfreq = nfft / 2 + 1;
+    const int pad = (nfft - hop) / 2;                       // reflect-pad the waveform
+    std::vector<float> wp((size_t) N + 2 * pad);
+    for (int i = 0; i < pad; ++i) { wp[i] = wav[pad - i]; wp[N + pad + i] = wav[N - 2 - i]; }
+    for (int i = 0; i < N; ++i) wp[pad + i] = wav[i];
+    const int nframes = 1 + (int) (wp.size() - nfft) / hop;
+    if (nframes <= 0) { fprintf(stderr, "spk: waveform too short (%d samples)\n", N); return {}; }
+
+    ggml_context * ctx = ggml_init({ (size_t) 256 * 1024 * 1024, nullptr, /*no_alloc=*/ true });
+
+    // analysis window (from gguf), folded into the framed segments
+    ggml_tensor * wt = m.get("mel_window");
+    std::vector<float> window(win);
+    ggml_backend_tensor_get(wt, window.data(), 0, (size_t) win * sizeof(float));
+    std::vector<float> host_in((size_t) win * nframes, 0.0f);          // framed: ne=[win, nframes]
+    for (int fr = 0; fr < nframes; ++fr)
+        for (int n = 0; n < win; ++n)
+            host_in[(size_t) fr * win + n] = wp[(size_t) fr * hop + n] * window[n];
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, win, nframes);
+    ggml_set_input(input);
+
+    // DFT basis cos/sin: ne=[win, nfreq], element (n,freq) = cos/sin(2pi*freq*n/nfft)
+    std::vector<float> cosb((size_t) win * nfreq, 0.0f), sinb((size_t) win * nfreq, 0.0f);
+    for (int fq = 0; fq < nfreq; ++fq)
+        for (int n = 0; n < win; ++n) {
+            double a = 2.0 * M_PI * fq * n / nfft;
+            cosb[(size_t) fq * win + n] = (float) cos(a);
+            sinb[(size_t) fq * win + n] = (float) sin(a);
+        }
+    ggml_tensor * cosB = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, win, nfreq); ggml_set_input(cosB);
+    ggml_tensor * sinB = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, win, nfreq); ggml_set_input(sinB);
+    ggml_tensor * re = ggml_mul_mat(ctx, cosB, input);     // [nfreq, nframes]
+    ggml_tensor * im = ggml_mul_mat(ctx, sinB, input);
+    ggml_tensor * mag = ggml_sqrt(ctx, ggml_add(ctx, ggml_sqr(ctx, re), ggml_sqr(ctx, im)));  // magnitude
+    ggml_tensor * fb = m.get("mel_fb");                    // ne=[nfreq, n_mels]
+    ggml_tensor * me = ggml_mul_mat(ctx, fb, mag);         // [n_mels, nframes]
+    ggml_tensor * mel = ggml_log(ctx, ggml_clamp(ctx, me, 1e-5f, FLT_MAX));
+
+    ggml_tensor * emb = build_ecapa(ctx, m, mel);
+    std::vector<float> out = spk_run(m, ctx, emb, {
+        { input, host_in.data(), host_in.size() },
+        { cosB,  cosb.data(),    cosb.size()    },
+        { sinB,  sinb.data(),    sinb.size()    },
+    });
+    ggml_free(ctx);
+    return out;
+}
+
+std::vector<float> spk_decode_audio_file(const spk_model & m, const char * path) {
+    // decode any audio via ffmpeg -> 24 kHz mono f32
+    std::string cmd = "ffmpeg -v error -i '" + std::string(path) +
+                      "' -ac 1 -ar " + std::to_string(m.sr) + " -f f32le -";
+    FILE * pp = popen(cmd.c_str(), "r");
+    if (!pp) { fprintf(stderr, "spk: cannot run ffmpeg\n"); return {}; }
+    std::vector<float> wav;
+    float buf[8192]; size_t n;
+    while ((n = fread(buf, sizeof(float), 8192, pp)) > 0) wav.insert(wav.end(), buf, buf + n);
+    int rc = pclose(pp);
+    if (rc != 0 || wav.empty()) {
+        fprintf(stderr, "spk: ffmpeg failed (rc=%d, %zu samples) for %s\n", rc, wav.size(), path);
+        return {};
+    }
+    return wav;
+}
+
+std::vector<float> spk_embed_from_file(const spk_model & m, const char * path) {
+    std::vector<float> wav = spk_decode_audio_file(m, path);
+    if (wav.empty()) return {};
+    return spk_embed_from_pcm24k(m, wav.data(), (int) wav.size());
 }

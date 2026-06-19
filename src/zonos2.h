@@ -6,6 +6,7 @@
 #include "ggml-alloc.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -196,13 +197,24 @@ struct zonos2_context {
 bool zonos2_context_init(zonos2_context & ctx, const zonos2_model & model, int max_seq);
 void zonos2_context_free(zonos2_context & ctx);
 
+// Per-frame callback for streaming: invoked once per generated frame with its 0-based index,
+// the frame's `ncb` audio codes (pre-shear, raw), and ncb. Return false to abort generation
+// early (e.g. the HTTP client disconnected). The codes pointer is only valid for the call.
+using zonos2_frame_cb = std::function<bool(int frame_idx, const int32_t * codes, int ncb)>;
+
 // Autoregressive generation. use_kv=true: one prefill + single-token decodes with a KV
 // cache (real-time, O(n)). use_kv=false: recompute the full prefill each step (O(n^2),
 // reference path). prompt_ids: row-major [n0, n_codebooks+1] (floats). Appends generated
 // audio codes to out_codes (flattened [n_frames * n_codebooks]); sets eos_frame. Returns n_frames.
 // `spk` (optional, [spk_dim] f32) clones a voice: during prefill the embedding column at
 // `spk_pos` (default 0, the prompt's speaker slot) is overwritten by spk_proj(spk_lda(spk)).
+// If `out_full_ids` is non-null, it receives the exact teacher-forcing sequence the model
+// consumed — row-major [n0 + n_frames, n_codebooks+1] (prompt rows followed by each generated
+// frame's codes + the text-pad column, pre-shear) — suitable as an imatrix calibration corpus.
+// `on_frame` (optional) streams each frame's codes as they are generated; returning false stops.
 int zonos2_generate(const zonos2_model & model, const float * prompt_ids, int n0,
                     int max_frames, const zonos2_sampling & sp,
                     std::vector<int32_t> & out_codes, int & eos_frame, bool use_kv = true,
-                    const float * spk = nullptr, int spk_pos = 0);
+                    const float * spk = nullptr, int spk_pos = 0,
+                    std::vector<int32_t> * out_full_ids = nullptr,
+                    const zonos2_frame_cb & on_frame = {});
