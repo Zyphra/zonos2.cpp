@@ -88,12 +88,26 @@ CUDA-graph replay (needed for the real-time decode) is enabled automatically for
 
 ### Prebuilt GGUFs (Hugging Face)
 
-Skip the conversion below by pulling the ready-made non-quant GGUFs from
+Skip the conversion below by pulling the ready-made GGUFs from
 [`Zyphra/ZONOS2-GGUF`](https://huggingface.co/Zyphra/ZONOS2-GGUF) — the F16 backbone plus
 the DAC and speaker-encoder files (identical to what the converter emits):
 
 ```bash
 hf download Zyphra/ZONOS2-GGUF zonos2-f16.gguf dac.gguf spk-encoder.gguf --local-dir out
+```
+
+Ready-made **experts-only quants** of the backbone are also published — drop-in replacements
+for `zonos2-f16.gguf` that pair with the same `dac.gguf` / `spk-encoder.gguf` (quality and
+sizes in [Quantization](#quantization)):
+
+```bash
+# pick one; Q4_K matches Q8_0 quality at ~45% the size, Q3_K is the aggressive-but-safe pick
+hf download Zyphra/ZONOS2-GGUF zonos2-q4_k-experts.gguf --local-dir out   # 4.6 GB
+hf download Zyphra/ZONOS2-GGUF zonos2-q3_k-experts.gguf --local-dir out   # 3.6 GB
+hf download Zyphra/ZONOS2-GGUF zonos2-q2_k-experts.gguf --local-dir out   # 2.9 GB, edge of usable
+
+# then use it like any backbone, e.g.
+zonos2-cli out/zonos2-q4_k-experts.gguf --tts "Hello." out.wav --dac out/dac.gguf --gpu
 ```
 
 From the F16 backbone you can make any quantization locally with `quantize-cli` — no
