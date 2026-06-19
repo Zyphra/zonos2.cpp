@@ -1,0 +1,33 @@
+diff --git a/src/ggml-cuda/conv-transpose-1d.cu b/src/ggml-cuda/conv-transpose-1d.cu
+index 8418ba6..eea1a5c 100644
+--- a/src/ggml-cuda/conv-transpose-1d.cu
++++ b/src/ggml-cuda/conv-transpose-1d.cu
+@@ -12,19 +12,22 @@ static  __global__ void conv_transpose_1d_kernel(
+     }
+ 
+     int out_index = global_index / dst_ne0;
++    int idx = global_index % dst_ne0;
++
++    // Only taps i with i*s0 <= idx < i*s0 + K contribute; compute that range directly
++    // instead of scanning all of src1_ne0 (avoids O(L^2) work for long inputs).
++    int i_min = (idx - src0_ne0 + s0) / s0;   // ceil((idx-K+1)/s0); valid floor when numerator >= 0
++    if (i_min < 0) i_min = 0;
++    int i_max = idx / s0;
++    if (i_max > src1_ne0 - 1) i_max = src1_ne0 - 1;
+ 
+     float accumulator = 0;
+ 
+     for (int c = 0; c < src0_ne2; c++) {
+-        int idx = global_index % dst_ne0;
+-
+         int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+         int input_offset = src1_ne0 * c;
+ 
+-        for (int i = 0; i < src1_ne0; i++) {
+-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
+-                continue;
+-            }
++        for (int i = i_min; i <= i_max; i++) {
+             int weight_idx = idx - i*s0;
+ 
+             float kernel_weight = src0[kernel_offset + weight_idx];

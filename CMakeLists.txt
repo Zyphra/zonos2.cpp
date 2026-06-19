@@ -18,7 +18,33 @@ if (GGML_CUDA)
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE) # CUDA-graph replay for real-time decode
 endif()
 
-# --- ggml (vendored submodule) ---
+# --- ggml (upstream submodule, pinned to a pristine SHA) ---
+# We carry local ggml fixes as patches under patches/ rather than forking the
+# submodule. They are (re)applied idempotently at configure time: the reverse
+# --check skips an already-patched tree, so re-running cmake is a no-op. If a
+# future submodule bump makes a patch no longer apply, configure fails loudly.
+find_package(Git REQUIRED)
+file(GLOB GGML_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch)
+list(SORT GGML_PATCHES)
+foreach(_patch ${GGML_PATCHES})
+    get_filename_component(_name ${_patch} NAME)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_CURRENT_SOURCE_DIR}/ggml apply --reverse --check ${_patch}
+        RESULT_VARIABLE _applied OUTPUT_QUIET ERROR_QUIET)
+    if (_applied EQUAL 0)
+        message(STATUS "ggml patch already applied: ${_name}")
+    else()
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_CURRENT_SOURCE_DIR}/ggml apply ${_patch}
+            RESULT_VARIABLE _rc ERROR_VARIABLE _err)
+        if (_rc EQUAL 0)
+            message(STATUS "ggml patch applied: ${_name}")
+        else()
+            message(FATAL_ERROR "Failed to apply ggml patch ${_name}:\n${_err}")
+        endif()
+    endif()
+endforeach()
+
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(ggml)
