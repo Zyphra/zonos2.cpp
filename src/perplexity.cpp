@@ -11,12 +11,14 @@
 //   zonos2-perplexity <model.gguf> --perplexity <ids.npy> [more.npy ...]
 #include "zonos2.h"
 #include "npy.h"
+#include "imatrix.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -36,8 +38,9 @@ void usage(const char * a0) {
         "usage: %s <model.gguf> --perplexity <ids.npy> [more.npy ...] [--speaker s.npy] [--cpu|--gpu]\n"
         "       %s <ref.gguf>   --kl-divergence-base <base.bin> <ids.npy> [more.npy ...] [--speaker s.npy] [--cpu|--gpu]\n"
         "       %s <quant.gguf> --kl-divergence <base.bin> [--cpu|--gpu]\n"
+        "       %s <f16.gguf>   --imatrix-out <imatrix.bin> <ids.npy> [more.npy ...] [--cpu|--gpu]\n"
         "  (ids.npy: row-major [n, n_codebooks+1] input_ids, e.g. from `zonos2-cli --build-prompt`)\n",
-        a0, a0, a0);
+        a0, a0, a0, a0);
 }
 
 // load a 2-D [n, W] input_ids npy; W must equal n_codebooks+1.
@@ -297,13 +300,86 @@ int run_kl_divergence(const zonos2_model & m, const std::string & base_path) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// --imatrix-out : collect per-expert importance (mean activation^2) over the corpus
+// ---------------------------------------------------------------------------
+int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
+                const float * spk, int spk_pos, const std::string & out_path) {
+    const int ne = (int) m.hp.n_expert;
+    if (ne == 0) { fprintf(stderr, "imatrix: model has no experts\n"); return 1; }
+
+    struct acc_t { int n_embd = 0, n_ff = 0; std::vector<double> gu, dn; std::vector<int64_t> cnt; };
+    std::map<int, acc_t> acc;                                  // per MoE layer
+
+    std::vector<zonos2_moe_act> acts;
+    size_t si = 0;
+    for (const auto & s : seqs) {
+        acts.clear();
+        if (!zonos2_moe_capture(m, s.ids.data(), s.n, acts, spk, spk_pos)) return 1;
+        for (const auto & a : acts) {
+            acc_t & A = acc[a.layer];
+            if (A.gu.empty()) {
+                A.n_embd = a.n_embd; A.n_ff = a.n_ff;
+                A.gu.assign((size_t) ne * a.n_embd, 0.0);
+                A.dn.assign((size_t) ne * a.n_ff, 0.0);
+                A.cnt.assign(ne, 0);
+            }
+            for (int t = 0; t < a.n; ++t) {
+                for (int j = 0; j < a.k; ++j) {
+                    const int e = a.sel[(size_t) t * a.k + j];
+                    if (e < 0 || e >= ne) continue;
+                    A.cnt[e]++;
+                    const float * x  = &a.moe_in[(size_t) t * a.n_embd];
+                    double * gu = &A.gu[(size_t) e * a.n_embd];
+                    for (int c = 0; c < a.n_embd; ++c) gu[c] += (double) x[c] * x[c];
+                    const float * yv = &a.moe_y[((size_t) t * a.k + j) * a.n_ff];
+                    double * dn = &A.dn[(size_t) e * a.n_ff];
+                    for (int c = 0; c < a.n_ff; ++c) dn[c] += (double) yv[c] * yv[c];
+                }
+            }
+        }
+        fprintf(stderr, "imatrix: seq %zu/%zu (%d rows)\n", ++si, seqs.size(), s.n);
+    }
+
+    std::map<std::string, imatrix::entry> im;
+    int64_t total_hits = 0; int zero_slots = 0, n_layers = 0;
+    for (auto & kv : acc) {
+        const std::string p = "blk." + std::to_string(kv.first) + ".";
+        acc_t & A = kv.second; ++n_layers;
+        imatrix::entry gate, up, down;
+        gate.n_expert = up.n_expert = down.n_expert = (uint32_t) ne;
+        gate.n_in = up.n_in = (uint32_t) A.n_embd; down.n_in = (uint32_t) A.n_ff;
+        gate.data.resize((size_t) ne * A.n_embd);
+        down.data.resize((size_t) ne * A.n_ff);
+        for (int e = 0; e < ne; ++e) {
+            const double inv = A.cnt[e] > 0 ? 1.0 / (double) A.cnt[e] : 0.0;
+            if (A.cnt[e] == 0) ++zero_slots;
+            total_hits += A.cnt[e];
+            for (int c = 0; c < A.n_embd; ++c) gate.data[(size_t) e*A.n_embd + c] = (float) (A.gu[(size_t) e*A.n_embd + c] * inv);
+            for (int c = 0; c < A.n_ff;   ++c) down.data[(size_t) e*A.n_ff   + c] = (float) (A.dn[(size_t) e*A.n_ff   + c] * inv);
+        }
+        up.data = gate.data;                                   // gate/up share the same input
+        im[p + "ffn_gate_exps.weight"] = std::move(gate);
+        im[p + "ffn_up_exps.weight"]   = std::move(up);
+        im[p + "ffn_down_exps.weight"] = std::move(down);
+    }
+    if (!imatrix::save(out_path, im)) return 1;
+
+    printf("\n=== imatrix ===\n");
+    printf("wrote %s : %d MoE layers, %d experts, %lld routed (token,expert) hits\n",
+           out_path.c_str(), n_layers, ne, (long long) total_hits);
+    if (zero_slots)
+        printf("WARNING: %d (layer,expert) slots saw zero tokens — add more/diverse calibration prompts\n", zero_slots);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     if (argc < 3) { usage(argv[0]); return 1; }
     const std::string model_path = argv[1];
 
-    enum { NONE, PPL, KLBASE, KLDIV } mode = NONE;
+    enum { NONE, PPL, KLBASE, KLDIV, IMATRIX } mode = NONE;
     bool use_gpu = false;
     std::string base_path, spk_path;
     std::vector<std::string> ids_paths;
@@ -316,13 +392,14 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--perplexity")) mode = PPL;
         else if (!strcmp(a, "--kl-divergence-base") && i + 1 < argc) { mode = KLBASE; base_path = argv[++i]; }
         else if (!strcmp(a, "--kl-divergence")      && i + 1 < argc) { mode = KLDIV;  base_path = argv[++i]; }
+        else if (!strcmp(a, "--imatrix-out")        && i + 1 < argc) { mode = IMATRIX; base_path = argv[++i]; }
         else if (!strcmp(a, "--speaker")     && i + 1 < argc) spk_path = argv[++i];
         else if (!strcmp(a, "--speaker-pos") && i + 1 < argc) spk_pos  = atoi(argv[++i]);
         else if (a[0] != '-') ids_paths.push_back(a); // positional input_ids npy
         else { usage(argv[0]); return 1; }
     }
     if (mode == NONE) { usage(argv[0]); return 1; }
-    if ((mode == PPL || mode == KLBASE) && ids_paths.empty()) {
+    if ((mode == PPL || mode == KLBASE || mode == IMATRIX) && ids_paths.empty()) {
         fprintf(stderr, "perplexity: need at least one <ids.npy>\n"); return 1;
     }
 
@@ -352,8 +429,9 @@ int main(int argc, char ** argv) {
         bool ok = true;
         for (size_t i = 0; i < ids_paths.size() && ok; ++i) ok = load_ids(ids_paths[i], W, seqs[i]);
         if (ok) {
-            rc = (mode == PPL) ? run_perplexity(model, seqs, spk_ptr, spk_pos)
-                               : run_kl_base(model, base_path, seqs, spk_ptr, spk_pos);
+            rc = (mode == PPL)     ? run_perplexity(model, seqs, spk_ptr, spk_pos)
+               : (mode == IMATRIX) ? run_imatrix(model, seqs, spk_ptr, spk_pos, base_path)
+                                   : run_kl_base(model, base_path, seqs, spk_ptr, spk_pos);
         }
     }
 

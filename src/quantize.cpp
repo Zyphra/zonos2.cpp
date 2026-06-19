@@ -20,10 +20,12 @@
 //     cut KLD ~19x for +0.24 GB). Off by default so plain --experts-only is uniform-bit.
 #include "ggml.h"
 #include "gguf.h"
+#include "imatrix.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -88,6 +90,23 @@ static ggml_type next_ktier(ggml_type t) {
 // stacks — takes one K-quant tier above gate/up. Rescues 2-bit experts (q2_k down→q3_k cut
 // KLD ~19x for +0.24 GB); marginal above q4_k. Left off by default so plain --experts-only
 // stays a uniform-bit recipe.
+// Quantize `src` ([ne0, ne1, ne2]) to `dst`. With a matching per-expert imatrix, each expert
+// slice (ne1 rows of ne0) is quantized with its own importance vector; a degenerate (all-zero)
+// slice falls back to uniform RTN so the K-quant solvers don't divide by zero. ggml_quantize_chunk
+// indexes by `start` (= e*ne1*ne0), offsetting both src and dst internally.
+static void quantize_with_imatrix(ggml_type tt, const float * src, void * dst,
+                                  int64_t ne0, int64_t ne1, int64_t ne2, const imatrix::entry * im) {
+    if (im && (int64_t) im->n_in == ne0 && (int64_t) im->n_expert == ne2) {
+        for (int64_t e = 0; e < ne2; ++e) {
+            const float * imv = &im->data[(size_t) e * ne0];
+            double s = 0.0; for (int64_t c = 0; c < ne0; ++c) s += imv[c];
+            ggml_quantize_chunk(tt, src, dst, e * ne1 * ne0, ne1, ne0, s > 0.0 ? imv : nullptr);
+        }
+    } else {
+        ggml_quantize_chunk(tt, src, dst, 0, ne1 * ne2, ne0, nullptr);
+    }
+}
+
 static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_only, bool down_tier_up) {
     if (ggml_n_dims(t) == 1)        return t->type;                  // 1-D: keep (F32)
     const std::string n = ggml_get_name(t);
@@ -106,22 +125,29 @@ static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_
 
 int main(int argc, char ** argv) {
     bool experts_only = false, down_tier_up = false;
+    const char * imat_path = nullptr;
     std::vector<const char *> pos;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--experts-only")) experts_only = true;
         else if (!strcmp(argv[i], "--down-tier-up")) down_tier_up = true;
+        else if (!strcmp(argv[i], "--imatrix") && i + 1 < argc) imat_path = argv[++i];
         else pos.push_back(argv[i]);
     }
     if (pos.size() != 3) {
-        fprintf(stderr, "usage: %s <in-f16.gguf> <out.gguf> <type> [--experts-only] [--down-tier-up]\n"
+        fprintf(stderr, "usage: %s <in-f16.gguf> <out.gguf> <type> [--experts-only] [--down-tier-up] [--imatrix f.bin]\n"
                         "  --experts-only: apply <type> only to MoE expert stacks; spine stays q8_0\n"
                         "  --down-tier-up: put the expert down projection one K-tier up (rescues q2_k)\n"
+                        "  --imatrix f.bin: per-expert importance matrix from `zonos2-perplexity --imatrix-out`\n"
                         "  type:", argv[0]);
         for (const auto & q : QTYPES) fprintf(stderr, " %s", q.name);
         fprintf(stderr, "\n");
         return 1;
     }
     const char * in_path = pos[0], * out_path = pos[1], * type_s = pos[2];
+
+    std::map<std::string, imatrix::entry> imat;
+    if (imat_path && !imatrix::load(imat_path, imat)) return 1;
+    if (imat_path) fprintf(stderr, "quantize: loaded imatrix %s (%zu tensors)\n", imat_path, imat.size());
 
     ggml_type bulk = GGML_TYPE_COUNT; uint32_t ftype = 1;
     for (const auto & q : QTYPES) if (!strcmp(type_s, q.name)) { bulk = q.type; ftype = q.ftype; }
@@ -158,11 +184,11 @@ int main(int argc, char ** argv) {
     // Pass 2: requantize tensor by tensor.
     std::vector<float> f32;
     size_t in_bytes = 0, out_bytes = 0;
-    int n_quant = 0, n_kept = 0;
+    int n_quant = 0, n_kept = 0, n_imat = 0;
     for (int64_t i = 0; i < n_tensors; i++) {
         ggml_tensor * t = ggml_get_tensor(ctx_in, gguf_get_tensor_name(gin, i));
         const ggml_type tt = pick_qtype(t, bulk, experts_only, down_tier_up);
-        const int64_t   ne0 = t->ne[0], n = ggml_nelements(t), nrows = n / ne0;
+        const int64_t   ne0 = t->ne[0], n = ggml_nelements(t);
 
         ggml_tensor * d = ggml_new_tensor(ctx_out, tt, ggml_n_dims(t), t->ne);
         ggml_set_name(d, ggml_get_name(t));
@@ -175,7 +201,10 @@ int main(int argc, char ** argv) {
             if (t->type == GGML_TYPE_F16)      ggml_fp16_to_fp32_row((const ggml_fp16_t *) t->data, f32.data(), n);
             else if (t->type == GGML_TYPE_F32) memcpy(f32.data(), t->data, n * sizeof(float));
             else { fprintf(stderr, "quantize: unexpected source type for %s\n", ggml_get_name(t)); return 1; }
-            ggml_quantize_chunk(tt, f32.data(), d->data, 0, nrows, ne0, nullptr);
+            auto it = imat.find(ggml_get_name(t));
+            const imatrix::entry * im = (it != imat.end()) ? &it->second : nullptr;
+            if (im) n_imat++;
+            quantize_with_imatrix(tt, f32.data(), d->data, ne0, t->ne[1], t->ne[2], im);
             n_quant++;
         }
         gguf_add_tensor(gout, d);
@@ -185,9 +214,13 @@ int main(int argc, char ** argv) {
 
     if (!gguf_write_to_file(gout, out_path, false)) { fprintf(stderr, "quantize: write failed\n"); return 1; }
 
-    fprintf(stderr, "quantize: %s -> %s [%s%s]: %d tensors (%d quantized, %d kept), %.2f GB -> %.2f GB\n",
-            in_path, out_path, type_s, experts_only ? (down_tier_up ? ", experts-only, down-tier-up" : ", experts-only") : "",
-            (int) n_tensors, n_quant, n_kept, in_bytes / 1e9, out_bytes / 1e9);
+    fprintf(stderr, "quantize: %s -> %s [%s%s%s]: %d tensors (%d quantized%s, %d kept), %.2f GB -> %.2f GB\n",
+            in_path, out_path, type_s,
+            experts_only ? (down_tier_up ? ", experts-only, down-tier-up" : ", experts-only") : "",
+            imat_path ? ", imatrix" : "",
+            (int) n_tensors, n_quant,
+            n_imat ? (std::string(", ") + std::to_string(n_imat) + " w/ imatrix").c_str() : "",
+            n_kept, in_bytes / 1e9, out_bytes / 1e9);
 
     gguf_free(gout); ggml_free(ctx_out); gguf_free(gin); ggml_free(ctx_in);
     return 0;

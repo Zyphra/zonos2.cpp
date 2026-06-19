@@ -134,6 +134,23 @@ bool zonos2_logits(const zonos2_model & model, const float * ids, int n_tokens,
                    std::vector<float> & out_logits,
                    const float * spk = nullptr, int spk_pos = 0);
 
+// One MoE layer's captured prefill activations, for per-expert importance-matrix collection.
+// Memory order matches ggml (ne0 fastest): moe_in[t*n_embd + c], moe_y[(t*k + j)*n_ff + c],
+// sel[t*k + j] (the expert id of token t's j-th route).
+struct zonos2_moe_act {
+    int layer  = 0;
+    int n_embd = 0, n_ff = 0, k = 0, n = 0;
+    std::vector<float>   moe_in;  // [n, n_embd]  gate/up expert input
+    std::vector<float>   moe_y;   // [n, k, n_ff] down expert input (silu(gate)*up)
+    std::vector<int32_t> sel;     // [n, k]       top-k expert routing
+};
+
+// Run one prefill over `ids` capturing each MoE layer's expert inputs + routing. Appends one
+// zonos2_moe_act per MoE layer (in layer order) to `out`. spk/spk_pos as in zonos2_validate.
+bool zonos2_moe_capture(const zonos2_model & model, const float * ids, int n_tokens,
+                        std::vector<zonos2_moe_act> & out,
+                        const float * spk = nullptr, int spk_pos = 0);
+
 // Options for building a TTS prompt from text (mirrors zonos2/tts/prompt.py +
 // scheduler speaker frames). Defaults reproduce the reference offline prompt.
 struct zonos2_prompt_options {

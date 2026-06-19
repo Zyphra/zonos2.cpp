@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,7 +32,17 @@ struct gctx {
     ggml_tensor * spk = nullptr; // input speaker embedding [spk_dim]
     int spk_pos = -1;
     bool capture = true;                   // false during generation (lean graph)
+    bool cap_moe = false;                   // capture per-MoE-layer inputs for imatrix collection
     std::vector<std::pair<std::string, ggml_tensor *>> caps;
+
+    // force a read-back output regardless of `capture` (used for imatrix moe inputs).
+    ggml_tensor * out_named(const std::string & name, ggml_tensor * t) {
+        if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
+        ggml_set_output(t);
+        ggml_set_name(t, name.c_str());
+        caps.push_back({name, t});
+        return t;
+    }
 
     // KV cache
     std::vector<ggml_tensor *> * kc = nullptr;  // per-layer K cache [head_dim, max_seq, n_head_kv]
@@ -165,6 +176,11 @@ static ggml_tensor * build_moe(gctx & g, ggml_tensor * cur, const zonos2_layer &
     ggml_tensor * up   = ggml_mul_mat_id(ctx, ly.ffn_up_exps,   cur3, sel); // [n_ff, k, n]
     ggml_tensor * gate = ggml_mul_mat_id(ctx, ly.ffn_gate_exps, cur3, sel); // [n_ff, k, n]
     ggml_tensor * y    = ggml_mul(ctx, up, ggml_silu(ctx, gate));
+    if (g.cap_moe) {
+        g.out_named("moe_in_"  + std::to_string(L), cur); // [n_embd, n]  gate/up input
+        g.out_named("moe_y_"   + std::to_string(L), y);   // [n_ff, k, n] down input
+        g.out_named("moe_sel_" + std::to_string(L), sel); // [k, n] i32   routing
+    }
     ggml_tensor * exps = ggml_mul_mat_id(ctx, ly.ffn_down_exps, y, sel);    // [n_embd, k, n]
     exps = ggml_mul(ctx, exps, weights);                                    // scale by route prob
 
@@ -350,6 +366,44 @@ bool zonos2_logits(const zonos2_model & m, const float * ids, int n_tokens,
     if (ok) {
         out_logits.resize((size_t) m.hp.audio_vocab * m.hp.n_codebooks * n_tokens);
         ggml_backend_tensor_get(logits, out_logits.data(), 0, out_logits.size() * sizeof(float));
+    }
+    if (galloc) ggml_gallocr_free(galloc);
+    if (ctx) ggml_free(ctx);
+    return ok;
+}
+
+bool zonos2_moe_capture(const zonos2_model & m, const float * ids, int n_tokens,
+                        std::vector<zonos2_moe_act> & out, const float * spk, int spk_pos) {
+    gctx g;
+    g.cap_moe = true;
+    ggml_context * ctx = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_tensor * res = prefill_run(m, ids, n_tokens, /*capture=*/false, /*n_layer_limit=*/-1,
+                                    spk, spk_pos, g, ctx, galloc);
+    const bool ok = res != nullptr;
+    if (ok) {
+        std::map<int, zonos2_moe_act> by_layer;            // keyed by layer index, ordered
+        for (auto & c : g.caps) {
+            const std::string & nm = c.first;
+            const int L = atoi(nm.c_str() + nm.rfind('_') + 1);
+            ggml_tensor * t = c.second;
+            zonos2_moe_act & a = by_layer[L];
+            a.layer = L;
+            if (nm.rfind("moe_in_", 0) == 0) {
+                a.n_embd = (int) t->ne[0]; a.n = (int) t->ne[1];
+                a.moe_in.resize(ggml_nelements(t));
+                ggml_backend_tensor_get(t, a.moe_in.data(), 0, ggml_nbytes(t));
+            } else if (nm.rfind("moe_y_", 0) == 0) {
+                a.n_ff = (int) t->ne[0]; a.k = (int) t->ne[1]; a.n = (int) t->ne[2];
+                a.moe_y.resize(ggml_nelements(t));
+                ggml_backend_tensor_get(t, a.moe_y.data(), 0, ggml_nbytes(t));
+            } else if (nm.rfind("moe_sel_", 0) == 0) {
+                a.k = (int) t->ne[0]; a.n = (int) t->ne[1];
+                a.sel.resize(ggml_nelements(t));
+                ggml_backend_tensor_get(t, a.sel.data(), 0, ggml_nbytes(t));
+            }
+        }
+        for (auto & kv : by_layer) out.push_back(std::move(kv.second));
     }
     if (galloc) ggml_gallocr_free(galloc);
     if (ctx) ggml_free(ctx);
