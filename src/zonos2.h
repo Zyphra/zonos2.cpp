@@ -123,6 +123,17 @@ bool zonos2_validate(const zonos2_model & model, const float * ids, int n_tokens
                      const char * out_dir, int n_layer_limit,
                      const float * spk = nullptr, int spk_pos = 0);
 
+// Run a single prefill forward over `ids` (row-major [n_tokens, n_codebooks+1], values as
+// floats) and copy the full post-softcap logits into `out_logits`, resized to
+// n_tokens*n_codebooks*audio_vocab in C-order [n_tokens, n_codebooks, audio_vocab]: the value
+// for (position t, codebook cb, vocab v) lives at ((size_t)t*n_codebooks + cb)*audio_vocab + v.
+// `spk`/`spk_pos` inject a speaker embedding exactly as in zonos2_validate. Returns false on
+// failure. NB: prefill self-attention is O(n^2) in memory; keep n within n_ctx_train and split
+// long corpora into multiple sequences rather than one giant prefill.
+bool zonos2_logits(const zonos2_model & model, const float * ids, int n_tokens,
+                   std::vector<float> & out_logits,
+                   const float * spk = nullptr, int spk_pos = 0);
+
 // Options for building a TTS prompt from text (mirrors zonos2/tts/prompt.py +
 // scheduler speaker frames). Defaults reproduce the reference offline prompt.
 struct zonos2_prompt_options {

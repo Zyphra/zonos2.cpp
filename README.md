@@ -29,8 +29,10 @@ zonos2-cli out/zonos2-q8_0.gguf --tts "Hello, world." out.wav \
   via a fused `flash_attn_ext` decode step, an F16 KV cache, and CUDA-graph replay.
 - **Numerically validated against the PyTorch reference** at every stage — the backbone to
   cosine ≥ 0.9999 / matching argmax, the speaker encoder and DAC decoder **bit-exact**.
-- **Quantization:** F16 (lossless from the bf16 checkpoint) and **Q8_0** (7.7 GB, with the
-  quant-sensitive matrices kept at F16). Q4_K is the one remaining TODO.
+- **Quantization:** F16 (lossless from the bf16 checkpoint), **Q8_0** (7.7 GB, quant-sensitive
+  matrices kept at F16), and **experts-only K-quants** — `quantize-cli --experts-only` puts
+  Q4_K/Q3_K on the MoE experts while pinning the spine at Q8_0, matching Q8_0 quality at ~45%
+  the size. Quant quality is scored with the `zonos2-perplexity` KL-divergence tool.
 
 ## Repository layout
 
@@ -44,6 +46,8 @@ src/
   dac.{h,cpp}             DAC-44kHz decoder library
   dac-cli.cpp             standalone codes → wav CLI
   main.cpp                zonos2-cli (summary / validate / generate / tts / build-prompt)
+  quantize.cpp            gguf→gguf requantizer → quantize-cli (bulk or --experts-only)
+  perplexity.cpp          KL-divergence / perplexity eval → zonos2-perplexity
   npy.h                   tiny .npy reader/writer
 models/                   GGUF converters + the PyTorch validation harness (see below)
 ggml/                     vendored submodule (pinned 3af5f57)
@@ -270,9 +274,12 @@ Measured on one H100 with `zonos2-q8_0.gguf` (decode is the dominant cost):
 - **Q8_0** — bulk 2-D/3-D matrices at Q8_0, 1-D at F32, and the quant-sensitive tensors
   (embedding tables, output head, all router weights) bumped to F16. 7.7 GB, +41 MB over
   pure Q8_0, strictly better against golden; CUDA graphs still replay.
-- **Q4_K and other K-quants** — produced by `quantize-cli` (below) via `ggml_quantize_chunk`.
-  The pure-Python converter still can't emit K-quants (`gguf.quants` raises
-  `NotImplementedError`), so quantize from the F16 GGUF instead.
+- **K-quants (Q4_K … Q2_K)** — produced by `quantize-cli` via `ggml_quantize_chunk` (the
+  pure-Python converter can't emit them). **Do not K-quant the whole backbone.** Sub-8-bit
+  weights on the attention/dense-FFN spine perturb the residual just enough to flip the MoE
+  router's top-k expert choice, and the output then decorrelates — full Q4_K measures
+  KL-divergence **6.7** / top-1 **5%** vs F16, despite the quantizer itself being numerically
+  correct. Quantize the **experts only** (`--experts-only`) and keep the spine at Q8_0; see below.
 
 ### Making quants from the F16 GGUF
 
@@ -280,7 +287,8 @@ Measured on one H100 with `zonos2-q8_0.gguf` (decode is the dominant cost):
 needed, so it runs straight off the HF download:
 
 ```bash
-quantize-cli out/zonos2-f16.gguf out/zonos2-q4_k.gguf q4_k
+quantize-cli out/zonos2-f16.gguf out/zonos2-q8_0.gguf q8_0
+quantize-cli out/zonos2-f16.gguf out/zonos2-q4_k-experts.gguf q4_k --experts-only
 # types: q8_0 q4_0 q4_1 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k iq4_nl iq4_xs
 ```
 
@@ -291,6 +299,48 @@ block-aligned. The whole F16 file is loaded into RAM (~15 GB) alongside the outp
 the machine accordingly. Quantizing from F16 (vs the bf16 checkpoint) is numerically
 equivalent — f16 is lossless for these weights, so the result matches the converter's Q8_0 to
 within quantizer rounding (≈1 element in 4M off by one LSB).
+
+### Recommended: K-quant the experts only
+
+The MoE expert stacks (`ffn_{gate,up,down}_exps`) are most of the backbone's weights but
+tolerate low bits, because the router and the residual feeding it stay clean. `--experts-only`
+applies the requested type to the expert stacks and pins the spine at Q8_0 (the sensitive set
+— embeddings, output head, routers — stays F16, 1-D stays F32). KL-divergence vs the F16
+backbone, measured with `zonos2-perplexity` over the golden prompt (sizes as `quantize-cli`
+reports them, decimal GB):
+
+| backbone | mean KLD | top-1 | PPL ratio | size |
+|---|---|---|---|---|
+| Q8_0 (full) | 0.0010 | 100% | 1.004 | 8.2 GB |
+| **Q4_K experts-only** | 0.0019 | 100% | 1.005 | 4.6 GB |
+| **Q3_K experts-only** | 0.0046 | 99.1% | 1.009 | 3.6 GB |
+| Q2_K experts-only | 0.157 | 99.1% | 1.16 | 2.9 GB |
+| Q4_K (full) | 6.73 | 5.1% | 848× | 4.5 GB |
+
+Q4_K-experts matches Q8_0 quality at ~45% the size; Q3_K is the aggressive-but-safe pick; Q2_K
+is where 2-bit expert error finally leaks into the residual (top-1 holds but the tail diverges).
+
+### Measuring quant quality (`zonos2-perplexity`)
+
+Teacher-forced perplexity and KL-divergence between a quantized backbone and an F16 reference —
+the ZONOS2 analogue of llama.cpp's `perplexity` tool. Each `(frame, codebook)` pair is one
+prediction event over the 1026-way audio vocab; position *t*'s logits score frame *t+1*'s
+codes. A two-pass base-file workflow keeps one model resident at a time, so the F16 reference is
+computed once and reused for every quant:
+
+```bash
+# 1) write reference distributions from the F16 backbone over a corpus of input-id .npy files
+zonos2-perplexity out/zonos2-f16.gguf --kl-divergence-base out/ref.kld out/golden/input_ids.npy
+# 2) score any quant against that base — prints PPL, KLD mean/median/p99, top-1, per-codebook
+zonos2-perplexity out/zonos2-q4_k-experts.gguf --kl-divergence out/ref.kld
+# plain perplexity, no reference needed
+zonos2-perplexity out/zonos2-f16.gguf --perplexity out/golden/input_ids.npy
+```
+
+The corpus is any set of `[n, n_codebooks+1]` input-id `.npy` files (e.g. from
+`zonos2-cli --build-prompt`, or a real prompt's `input_ids.npy`); pass several to average over
+a longer corpus. The base file embeds the input ids and the reference log-probs, so pass 2 needs
+only the base and the quant model.
 
 ## Notes
 

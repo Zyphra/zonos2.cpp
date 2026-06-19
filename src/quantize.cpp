@@ -11,8 +11,11 @@
 // Quantization is ggml_quantize_chunk, so K-quants (Q4_K, Q5_K, Q6_K, ...) work
 // here even though the pure-Python converter cannot emit them.
 //
-// Usage:  quantize-cli <in-f16.gguf> <out.gguf> <type>
+// Usage:  quantize-cli <in-f16.gguf> <out.gguf> <type> [--experts-only]
 //   type: q8_0 q4_0 q4_1 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k iq4_nl iq4_xs
+//   --experts-only: low-bit <type> on the MoE expert stacks only; spine stays q8_0. Per the
+//     KLD analysis the spine (attention/dense-FFN/router) flips routing under sub-q8 bits,
+//     while the experts (the bulk of the weights) tolerate it -- best size/quality tradeoff.
 #include "ggml.h"
 #include "gguf.h"
 
@@ -57,21 +60,43 @@ static ggml_type higher_tier(ggml_type bulk, int64_t ne0) {
     }
 }
 
-static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk) {
+// The MoE expert FFN stacks (ffn_{gate,up,down}_exps): the bulk of the parameters and,
+// per KLD analysis, the only weights that tolerate sub-q8 bits without flipping routing.
+static bool is_expert(const std::string & n) {
+    return n.find("_exps") != std::string::npos;
+}
+
+// experts_only: apply the (low-bit) bulk quant ONLY to the expert stacks; keep the whole
+// spine (attention, dense FFN, routers, head, embeddings) at q8_0 so router inputs stay
+// clean and top-k expert selection does not flip. Sensitive set stays F16 as usual.
+static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_only) {
     if (ggml_n_dims(t) == 1)        return t->type;                  // 1-D: keep (F32)
-    if (is_high_precision(ggml_get_name(t))) return higher_tier(bulk, t->ne[0]);
+    const std::string n = ggml_get_name(t);
+    if (experts_only && !is_expert(n)) {
+        if (is_high_precision(n)) return GGML_TYPE_F16;
+        return (t->ne[0] % 32 == 0) ? GGML_TYPE_Q8_0 : GGML_TYPE_F16; // spine stays q8_0
+    }
+    if (is_high_precision(n)) return higher_tier(bulk, t->ne[0]);
     if (t->ne[0] % ggml_blck_size(bulk) != 0) return GGML_TYPE_F16;  // not block-aligned
     return bulk;
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <in-f16.gguf> <out.gguf> <type>\n  type:", argv[0]);
+    bool experts_only = false;
+    std::vector<const char *> pos;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--experts-only")) experts_only = true;
+        else pos.push_back(argv[i]);
+    }
+    if (pos.size() != 3) {
+        fprintf(stderr, "usage: %s <in-f16.gguf> <out.gguf> <type> [--experts-only]\n"
+                        "  --experts-only: apply <type> only to MoE expert stacks; spine stays q8_0\n"
+                        "  type:", argv[0]);
         for (const auto & q : QTYPES) fprintf(stderr, " %s", q.name);
         fprintf(stderr, "\n");
         return 1;
     }
-    const char * in_path = argv[1], * out_path = argv[2], * type_s = argv[3];
+    const char * in_path = pos[0], * out_path = pos[1], * type_s = pos[2];
 
     ggml_type bulk = GGML_TYPE_COUNT; uint32_t ftype = 1;
     for (const auto & q : QTYPES) if (!strcmp(type_s, q.name)) { bulk = q.type; ftype = q.ftype; }
@@ -95,7 +120,7 @@ int main(int argc, char ** argv) {
     size_t need = 0;
     for (int64_t i = 0; i < n_tensors; i++) {
         ggml_tensor * t = ggml_get_tensor(ctx_in, gguf_get_tensor_name(gin, i));
-        const ggml_type tt = pick_qtype(t, bulk);
+        const ggml_type tt = pick_qtype(t, bulk, experts_only);
         need += ggml_row_size(tt, t->ne[0]) * (ggml_nelements(t) / t->ne[0]);
     }
     need += (size_t) (n_tensors + 1) * ggml_tensor_overhead() + (1u << 20);
@@ -111,7 +136,7 @@ int main(int argc, char ** argv) {
     int n_quant = 0, n_kept = 0;
     for (int64_t i = 0; i < n_tensors; i++) {
         ggml_tensor * t = ggml_get_tensor(ctx_in, gguf_get_tensor_name(gin, i));
-        const ggml_type tt = pick_qtype(t, bulk);
+        const ggml_type tt = pick_qtype(t, bulk, experts_only);
         const int64_t   ne0 = t->ne[0], n = ggml_nelements(t), nrows = n / ne0;
 
         ggml_tensor * d = ggml_new_tensor(ctx_out, tt, ggml_n_dims(t), t->ne);
@@ -135,9 +160,9 @@ int main(int argc, char ** argv) {
 
     if (!gguf_write_to_file(gout, out_path, false)) { fprintf(stderr, "quantize: write failed\n"); return 1; }
 
-    fprintf(stderr, "quantize: %s -> %s [%s]: %d tensors (%d quantized, %d kept), %.2f GB -> %.2f GB\n",
-            in_path, out_path, type_s, (int) n_tensors, n_quant, n_kept,
-            in_bytes / 1e9, out_bytes / 1e9);
+    fprintf(stderr, "quantize: %s -> %s [%s%s]: %d tensors (%d quantized, %d kept), %.2f GB -> %.2f GB\n",
+            in_path, out_path, type_s, experts_only ? ", experts-only" : "",
+            (int) n_tensors, n_quant, n_kept, in_bytes / 1e9, out_bytes / 1e9);
 
     gguf_free(gout); ggml_free(ctx_out); gguf_free(gin); ggml_free(ctx_in);
     return 0;

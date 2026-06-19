@@ -272,27 +272,29 @@ void save_tensor(const std::string & dir, const std::string & name, ggml_tensor 
     npy::save_f32(dir + "/" + name + ".npy", buf.data(), shape);
 }
 
-} // namespace
-
-bool zonos2_validate(const zonos2_model & m, const float * ids, int n_tokens,
-                     const char * out_dir, int n_layer_limit,
-                     const float * spk, int spk_pos) {
+// Build + compute one prefill graph over `ids` (row-major [n_tokens, W=n_codebooks+1] floats).
+// Shared by zonos2_validate (capture=true, dumps caps) and zonos2_logits (capture=false, bulk
+// read). On success returns build_graph's output tensor; the caller must read it back before
+// freeing *ctx_out / *galloc_out. Returns nullptr on failure (ctx/galloc still owned by caller).
+static ggml_tensor * prefill_run(const zonos2_model & m, const float * ids, int n_tokens,
+                                 bool capture, int n_layer_limit, const float * spk, int spk_pos,
+                                 gctx & g, ggml_context *& ctx, ggml_gallocr_t & galloc) {
     struct ggml_init_params ip = { (size_t) 256 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
-    ggml_context * ctx = ggml_init(ip);
+    ctx = ggml_init(ip);
 
-    gctx g;
-    g.m = &m; g.ctx = ctx; g.n = n_tokens;
+    g.m = &m; g.ctx = ctx; g.n = n_tokens; g.capture = capture;
     g.spk_pos = spk ? spk_pos : -1;
     ggml_tensor * out = build_graph(g, n_layer_limit);
+    ggml_set_output(out);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
     ggml_build_forward_expand(gf, out);
     for (auto & c : g.caps) ggml_build_forward_expand(gf, c.second);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(m.buft);
+    galloc = ggml_gallocr_new(m.buft);
     if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        fprintf(stderr, "validate: graph alloc failed\n");
-        ggml_gallocr_free(galloc); ggml_free(ctx); return false;
+        fprintf(stderr, "prefill: graph alloc failed\n");
+        return nullptr;
     }
 
     // set inputs: column k of the [n_tokens, W] id matrix
@@ -310,18 +312,48 @@ bool zonos2_validate(const zonos2_model & m, const float * ids, int n_tokens,
         ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
     }
 
-    fprintf(stderr, "validate: computing graph (%d nodes) ...\n", ggml_graph_n_nodes(gf));
+    fprintf(stderr, "prefill: computing graph (%d nodes) ...\n", ggml_graph_n_nodes(gf));
     if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "validate: compute failed\n");
-        ggml_gallocr_free(galloc); ggml_free(ctx); return false;
+        fprintf(stderr, "prefill: compute failed\n");
+        return nullptr;
     }
+    return out;
+}
 
-    for (auto & c : g.caps) save_tensor(out_dir, c.first, c.second);
-    fprintf(stderr, "validate: wrote %zu tensors to %s\n", g.caps.size(), out_dir);
+} // namespace
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx);
-    return true;
+bool zonos2_validate(const zonos2_model & m, const float * ids, int n_tokens,
+                     const char * out_dir, int n_layer_limit,
+                     const float * spk, int spk_pos) {
+    gctx g;
+    ggml_context * ctx = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_tensor * out = prefill_run(m, ids, n_tokens, /*capture=*/true, n_layer_limit, spk, spk_pos, g, ctx, galloc);
+    const bool ok = out != nullptr;
+    if (ok) {
+        for (auto & c : g.caps) save_tensor(out_dir, c.first, c.second);
+        fprintf(stderr, "validate: wrote %zu tensors to %s\n", g.caps.size(), out_dir);
+    }
+    if (galloc) ggml_gallocr_free(galloc);
+    if (ctx) ggml_free(ctx);
+    return ok;
+}
+
+bool zonos2_logits(const zonos2_model & m, const float * ids, int n_tokens,
+                   std::vector<float> & out_logits, const float * spk, int spk_pos) {
+    gctx g;
+    ggml_context * ctx = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_tensor * logits = prefill_run(m, ids, n_tokens, /*capture=*/false, /*n_layer_limit=*/-1,
+                                       spk, spk_pos, g, ctx, galloc);
+    const bool ok = logits != nullptr;
+    if (ok) {
+        out_logits.resize((size_t) m.hp.audio_vocab * m.hp.n_codebooks * n_tokens);
+        ggml_backend_tensor_get(logits, out_logits.data(), 0, out_logits.size() * sizeof(float));
+    }
+    if (galloc) ggml_gallocr_free(galloc);
+    if (ctx) ggml_free(ctx);
+    return ok;
 }
 
 // O(n^2) reference path: rebuild the full prefill graph each step (no cache).
