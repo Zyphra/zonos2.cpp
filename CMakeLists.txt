@@ -47,3 +47,8 @@ target_link_libraries(spk-encoder-cli PRIVATE ggml)
 add_executable(dac-cli src/dac-cli.cpp src/dac.cpp)
 target_include_directories(dac-cli PRIVATE src ggml/include)
 target_link_libraries(dac-cli PRIVATE ggml)
+
+# --- gguf -> gguf requantizer (F16 backbone -> Q8_0 / K-quants) ---
+add_executable(quantize-cli src/quantize.cpp)
+target_include_directories(quantize-cli PRIVATE src ggml/include)
+target_link_libraries(quantize-cli PRIVATE ggml)

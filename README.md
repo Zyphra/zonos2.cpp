@@ -82,6 +82,21 @@ CUDA-graph replay (needed for the real-time decode) is enabled automatically for
 
 ## Models (one-time conversion)
 
+### Prebuilt GGUFs (Hugging Face)
+
+Skip the conversion below by pulling the ready-made non-quant GGUFs from
+[`Zyphra/ZONOS2-GGUF`](https://huggingface.co/Zyphra/ZONOS2-GGUF) — the F16 backbone plus
+the DAC and speaker-encoder files (identical to what the converter emits):
+
+```bash
+hf download Zyphra/ZONOS2-GGUF zonos2-f16.gguf dac.gguf spk-encoder.gguf --local-dir out
+```
+
+From the F16 backbone you can make any quantization locally with `quantize-cli` — no
+checkpoint or Python required (see [Quantization](#quantization)).
+
+### Converting from the checkpoints
+
 Inference is Python-free, but you convert the original checkpoints to GGUF once. Two
 Python environments are involved, and they are **not** the same:
 
@@ -250,13 +265,32 @@ Measured on one H100 with `zonos2-q8_0.gguf` (decode is the dominant cost):
 
 ## Quantization
 
-- **F16** — lossless for these in-range bf16 weights; one file serves CPU + CUDA.
+- **F16** — lossless for these in-range bf16 weights; one file serves every backend. The
+  published master on HF and the input to `quantize-cli`.
 - **Q8_0** — bulk 2-D/3-D matrices at Q8_0, 1-D at F32, and the quant-sensitive tensors
   (embedding tables, output head, all router weights) bumped to F16. 7.7 GB, +41 MB over
   pure Q8_0, strictly better against golden; CUDA graphs still replay.
-- **Q4_K** — not yet wired. Blocked in pure Python (the vendored `gguf.quants.quantize`
-  raises `NotImplementedError` for K-quants); the path forward is `ggml_quantize_chunk` via
-  ctypes against `libggml-base.so`. `pick_qtype` in the converter is already structured for it.
+- **Q4_K and other K-quants** — produced by `quantize-cli` (below) via `ggml_quantize_chunk`.
+  The pure-Python converter still can't emit K-quants (`gguf.quants` raises
+  `NotImplementedError`), so quantize from the F16 GGUF instead.
+
+### Making quants from the F16 GGUF
+
+`quantize-cli` requantizes the F16 backbone to any ggml quant type — no checkpoint or Python
+needed, so it runs straight off the HF download:
+
+```bash
+quantize-cli out/zonos2-f16.gguf out/zonos2-q4_k.gguf q4_k
+# types: q8_0 q4_0 q4_1 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k iq4_nl iq4_xs
+```
+
+It mirrors the converter's per-tensor policy: 1-D tensors stay F32, the quant-sensitive set
+(output head, token/audio embeddings, MoE routers) is kept one tier above the bulk quant, and
+every other matrix takes the requested type — falling back to F16 if its row length isn't
+block-aligned. The whole F16 file is loaded into RAM (~15 GB) alongside the output, so size
+the machine accordingly. Quantizing from F16 (vs the bf16 checkpoint) is numerically
+equivalent — f16 is lossless for these weights, so the result matches the converter's Q8_0 to
+within quantizer rounding (≈1 element in 4M off by one LSB).
 
 ## Notes
 
