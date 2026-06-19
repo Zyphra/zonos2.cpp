@@ -16,7 +16,8 @@ static void usage(const char * a0) {
         "       %s <model.gguf> --generate <input_ids.npy> <out.{npy,wav}> [--dac <dac.gguf>] [--speaker <spk.npy>] ...\n"
         "       %s <model.gguf> --tts \"<text>\" <out.{npy,wav}> [--dac <dac.gguf>] [--speaker <spk.npy>] [--greedy] [--max N] ...\n"
         "       %s <model.gguf> --build-prompt \"<text>\" <out_ids.npy> [--speaker <spk.npy>]\n"
-        "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n",
+        "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n"
+        "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n",
         a0, a0, a0, a0, a0);
 }
 
@@ -65,7 +66,7 @@ int main(int argc, char ** argv) {
     const std::string path = argv[1];
     bool use_gpu = false;
     bool validate = false, generate = false, do_tts = false, do_build_prompt = false;
-    std::string ids_path, out_dir, out_codes, spk_path, text, prompt_out, dac_path;
+    std::string ids_path, out_dir, out_codes, spk_path, text, prompt_out, dac_path, dump_ids_path;
     int n_layer_limit = -1, max_frames = 400, spk_pos = 0;
     bool use_kv = true;
     zonos2_sampling sp;
@@ -92,6 +93,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--seed")   && i + 1 < argc) sp.seed = (uint32_t) atoi(argv[++i]);
         else if (!strcmp(argv[i], "--greedy")) sp.greedy = true;
         else if (!strcmp(argv[i], "--recompute")) use_kv = false;
+        else if (!strcmp(argv[i], "--dump-ids") && i + 1 < argc) dump_ids_path = argv[++i];
         else { usage(argv[0]); return 1; }
     }
 
@@ -143,10 +145,18 @@ int main(int argc, char ** argv) {
         printf("generate: prompt [%d, %lld], max=%d, %s, seed=%u, %s\n",
                n0, (long long) shape[1], max_frames, sp.greedy ? "greedy" : "sampling", sp.seed,
                use_kv ? "kv-cache" : "recompute");
-        std::vector<int32_t> codes;
+        std::vector<int32_t> codes, full_ids;
         int eos_frame = -1;
-        const int n_frames = zonos2_generate(model, ids.data(), n0, max_frames, sp, codes, eos_frame, use_kv, spk_ptr, spk_pos);
+        const int n_frames = zonos2_generate(model, ids.data(), n0, max_frames, sp, codes, eos_frame,
+                                             use_kv, spk_ptr, spk_pos,
+                                             dump_ids_path.empty() ? nullptr : &full_ids);
         const int ncb = (int) model.hp.n_codebooks;
+        if (!dump_ids_path.empty()) {
+            const int W = ncb + 1;
+            std::vector<float> ff(full_ids.begin(), full_ids.end());
+            npy::save_f32(dump_ids_path, ff.data(), { (int64_t) (full_ids.size() / W), (int64_t) W });
+            printf("dump-ids: %zu rows x %d -> %s\n", full_ids.size() / W, W, dump_ids_path.c_str());
+        }
         printf("generate: %d frames, eos_frame=%d\n", n_frames, eos_frame);
         if (n_frames > 0) {
             printf("  frame0:");
@@ -182,10 +192,17 @@ int main(int argc, char ** argv) {
         printf("tts: \"%s\" -> prompt [%d, %d], spk_pos=%d, max=%d, %s, %s\n",
                text.c_str(), n0, ncb + 1, sp_pos, max_frames,
                sp.greedy ? "greedy" : "sampling", use_kv ? "kv-cache" : "recompute");
-        std::vector<int32_t> codes;
+        std::vector<int32_t> codes, full_ids;
         int eos_frame = -1;
         const int n_frames = zonos2_generate(model, idf.data(), n0, max_frames, sp, codes,
-                                             eos_frame, use_kv, spk_ptr, sp_pos >= 0 ? sp_pos : 0);
+                                             eos_frame, use_kv, spk_ptr, sp_pos >= 0 ? sp_pos : 0,
+                                             dump_ids_path.empty() ? nullptr : &full_ids);
+        if (!dump_ids_path.empty()) {
+            const int W = ncb + 1;
+            std::vector<float> ff(full_ids.begin(), full_ids.end());
+            npy::save_f32(dump_ids_path, ff.data(), { (int64_t) (full_ids.size() / W), (int64_t) W });
+            printf("dump-ids: %zu rows x %d -> %s\n", full_ids.size() / W, W, dump_ids_path.c_str());
+        }
         printf("tts: %d frames, eos_frame=%d\n", n_frames, eos_frame);
         if (n_frames > 0) {
             printf("  frame0:");

@@ -38,7 +38,7 @@ void usage(const char * a0) {
         "usage: %s <model.gguf> --perplexity <ids.npy> [more.npy ...] [--speaker s.npy] [--cpu|--gpu]\n"
         "       %s <ref.gguf>   --kl-divergence-base <base.bin> <ids.npy> [more.npy ...] [--speaker s.npy] [--cpu|--gpu]\n"
         "       %s <quant.gguf> --kl-divergence <base.bin> [--cpu|--gpu]\n"
-        "       %s <f16.gguf>   --imatrix-out <imatrix.bin> <ids.npy> [more.npy ...] [--cpu|--gpu]\n"
+        "       %s <f16.gguf>   --imatrix-out <imatrix.bin> <ids.npy> [more.npy ...] [--imatrix-min-hits N] [--cpu|--gpu]\n"
         "  (ids.npy: row-major [n, n_codebooks+1] input_ids, e.g. from `zonos2-cli --build-prompt`)\n",
         a0, a0, a0, a0);
 }
@@ -304,7 +304,7 @@ int run_kl_divergence(const zonos2_model & m, const std::string & base_path) {
 // --imatrix-out : collect per-expert importance (mean activation^2) over the corpus
 // ---------------------------------------------------------------------------
 int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
-                const float * spk, int spk_pos, const std::string & out_path) {
+                const float * spk, int spk_pos, const std::string & out_path, int min_hits) {
     const int ne = (int) m.hp.n_expert;
     if (ne == 0) { fprintf(stderr, "imatrix: model has no experts\n"); return 1; }
 
@@ -342,7 +342,8 @@ int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
     }
 
     std::map<std::string, imatrix::entry> im;
-    int64_t total_hits = 0; int zero_slots = 0, n_layers = 0;
+    int64_t total_hits = 0; int zero_slots = 0, below_thresh = 0, n_layers = 0;
+    std::vector<int64_t> all_cnt;                              // every (layer,expert) hit count
     for (auto & kv : acc) {
         const std::string p = "blk." + std::to_string(kv.first) + ".";
         acc_t & A = kv.second; ++n_layers;
@@ -352,9 +353,15 @@ int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
         gate.data.resize((size_t) ne * A.n_embd);
         down.data.resize((size_t) ne * A.n_ff);
         for (int e = 0; e < ne; ++e) {
-            const double inv = A.cnt[e] > 0 ? 1.0 / (double) A.cnt[e] : 0.0;
+            // Experts seen fewer than min_hits times get a zeroed row: the apply side
+            // (quantize-cli) treats an all-zero importance vector as degenerate and falls back
+            // to plain RTN, which beats trusting a noise-dominated importance estimate.
+            const bool keep = A.cnt[e] >= min_hits;
+            const double inv = keep ? 1.0 / (double) A.cnt[e] : 0.0;
             if (A.cnt[e] == 0) ++zero_slots;
+            else if (!keep)    ++below_thresh;
             total_hits += A.cnt[e];
+            all_cnt.push_back(A.cnt[e]);
             for (int c = 0; c < A.n_embd; ++c) gate.data[(size_t) e*A.n_embd + c] = (float) (A.gu[(size_t) e*A.n_embd + c] * inv);
             for (int c = 0; c < A.n_ff;   ++c) down.data[(size_t) e*A.n_ff   + c] = (float) (A.dn[(size_t) e*A.n_ff   + c] * inv);
         }
@@ -365,11 +372,20 @@ int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
     }
     if (!imatrix::save(out_path, im)) return 1;
 
+    std::sort(all_cnt.begin(), all_cnt.end());
+    const int64_t hmin = all_cnt.empty() ? 0 : all_cnt.front();
+    const int64_t hmed = all_cnt.empty() ? 0 : all_cnt[all_cnt.size() / 2];
+    const int64_t hmax = all_cnt.empty() ? 0 : all_cnt.back();
     printf("\n=== imatrix ===\n");
     printf("wrote %s : %d MoE layers, %d experts, %lld routed (token,expert) hits\n",
            out_path.c_str(), n_layers, ne, (long long) total_hits);
-    if (zero_slots)
-        printf("WARNING: %d (layer,expert) slots saw zero tokens — add more/diverse calibration prompts\n", zero_slots);
+    printf("per-(layer,expert) hits: min %lld, median %lld, max %lld (min-hits floor = %d)\n",
+           (long long) hmin, (long long) hmed, (long long) hmax, min_hits);
+    if (zero_slots || below_thresh)
+        printf("fallback to RTN: %d slots zero-hit, %d below floor (of %d total) — %s\n",
+               zero_slots, below_thresh, (int) all_cnt.size(),
+               (zero_slots + below_thresh) * 4 > (int) all_cnt.size()
+                   ? "consider more/longer generation traces" : "ok, well-covered");
     return 0;
 }
 
@@ -384,6 +400,7 @@ int main(int argc, char ** argv) {
     std::string base_path, spk_path;
     std::vector<std::string> ids_paths;
     int spk_pos = 0;
+    int imat_min_hits = 32;   // experts seen fewer than this many times fall back to RTN
 
     for (int i = 2; i < argc; ++i) {
         const char * a = argv[i];
@@ -393,6 +410,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--kl-divergence-base") && i + 1 < argc) { mode = KLBASE; base_path = argv[++i]; }
         else if (!strcmp(a, "--kl-divergence")      && i + 1 < argc) { mode = KLDIV;  base_path = argv[++i]; }
         else if (!strcmp(a, "--imatrix-out")        && i + 1 < argc) { mode = IMATRIX; base_path = argv[++i]; }
+        else if (!strcmp(a, "--imatrix-min-hits")   && i + 1 < argc) imat_min_hits = atoi(argv[++i]);
         else if (!strcmp(a, "--speaker")     && i + 1 < argc) spk_path = argv[++i];
         else if (!strcmp(a, "--speaker-pos") && i + 1 < argc) spk_pos  = atoi(argv[++i]);
         else if (a[0] != '-') ids_paths.push_back(a); // positional input_ids npy
@@ -430,7 +448,7 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < ids_paths.size() && ok; ++i) ok = load_ids(ids_paths[i], W, seqs[i]);
         if (ok) {
             rc = (mode == PPL)     ? run_perplexity(model, seqs, spk_ptr, spk_pos)
-               : (mode == IMATRIX) ? run_imatrix(model, seqs, spk_ptr, spk_pos, base_path)
+               : (mode == IMATRIX) ? run_imatrix(model, seqs, spk_ptr, spk_pos, base_path, imat_min_hits)
                                    : run_kl_base(model, base_path, seqs, spk_ptr, spk_pos);
         }
     }
