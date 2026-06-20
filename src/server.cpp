@@ -54,7 +54,24 @@ struct CachedSpeaker {
 };
 
 struct ReqJob;  // continuous-batching work item (defined after GenReq)
-struct DacTask; // a unit of DAC decode work handed to a pool lane (defined after ReqJob)
+
+// A DAC decode unit handed from the backbone worker to a pool lane. Carries a snapshot of the codes
+// (the worker keeps mutating job->codes, so the lane must not read it live). WINDOW emits a
+// streaming block; FINALIZE flushes the streaming tail or does the single buffered decode, then
+// marks the channel finished. `drop` skips the decode (client gone) but still finishes the channel.
+// Defined here (not after ReqJob) so DacLane's std::deque<DacTask> sees a complete type — libc++
+// instantiates the deque block-size on the member, which requires sizeof(DacTask). The
+// std::shared_ptr<ReqJob> is fine with ReqJob still incomplete.
+struct DacTask {
+    std::shared_ptr<ReqJob> job;
+    std::vector<int32_t> codes;          // snapshot of job->codes[0 : H*ncb)
+    int H = 0;                           // frames in the snapshot
+    enum Kind { WINDOW, FINALIZE } kind = WINDOW;
+    int f_lo = 0, f_hi = 0, Lc = 0, Rc = 0;
+    bool buffered = false;               // FINALIZE: full dac_decode vs windowed tail
+    bool finish = false;                 // FINALIZE: signal channel done after this task
+    bool drop = false;                   // skip decode, just finish
+};
 
 // One DAC pool lane: a thread + its own dac_model instance (ggml backends are not reentrant, so
 // parallel decode needs independent instances) + a FIFO task queue. Each request is pinned to one
@@ -222,21 +239,6 @@ struct ReqJob {
     bool finished = false;
     bool failed   = false;
     bool client_dropped = false;         // set by the handler when the socket drops
-};
-
-// A DAC decode unit handed from the backbone worker to a pool lane. Carries a snapshot of the codes
-// (the worker keeps mutating job->codes, so the lane must not read it live). WINDOW emits a
-// streaming block; FINALIZE flushes the streaming tail or does the single buffered decode, then
-// marks the channel finished. `drop` skips the decode (client gone) but still finishes the channel.
-struct DacTask {
-    std::shared_ptr<ReqJob> job;
-    std::vector<int32_t> codes;          // snapshot of job->codes[0 : H*ncb)
-    int H = 0;                           // frames in the snapshot
-    enum Kind { WINDOW, FINALIZE } kind = WINDOW;
-    int f_lo = 0, f_hi = 0, Lc = 0, Rc = 0;
-    bool buffered = false;               // FINALIZE: full dac_decode vs windowed tail
-    bool finish = false;                 // FINALIZE: signal channel done after this task
-    bool drop = false;                   // skip decode, just finish
 };
 
 // Resolve a speaker vector from a request's speaker_* fields. Returns true if one was set,
