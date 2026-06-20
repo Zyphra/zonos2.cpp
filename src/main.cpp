@@ -1,11 +1,14 @@
 // zonos2-cli — load a ZONOS2 GGUF; print summary or run prefill validation.
 #include "zonos2.h"
+#include "zonos2-sampler.h"
 #include "dac.h"
 #include "npy.h"
 #include "ggml.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -16,9 +19,10 @@ static void usage(const char * a0) {
         "       %s <model.gguf> --generate <input_ids.npy> <out.{npy,wav}> [--dac <dac.gguf>] [--speaker <spk.npy>] ...\n"
         "       %s <model.gguf> --tts \"<text>\" <out.{npy,wav}> [--dac <dac.gguf>] [--speaker <spk.npy>] [--greedy] [--max N] ...\n"
         "       %s <model.gguf> --build-prompt \"<text>\" <out_ids.npy> [--speaker <spk.npy>]\n"
+        "       %s <model.gguf> --batch-test \"<t1|t2|...>\" [--slots N] [--max N] [--greedy] [--dac <dac.gguf>] --gpu\n"
         "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n"
         "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n",
-        a0, a0, a0, a0, a0);
+        a0, a0, a0, a0, a0, a0);
 }
 
 static bool ends_with(const std::string & s, const char * suf) {
@@ -61,13 +65,205 @@ static void pr(const char * nm, const ggml_tensor * t) {
            (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type));
 }
 
+static std::vector<std::string> split_pipe(const std::string & s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (;;) {
+        size_t p = s.find('|', start);
+        out.push_back(s.substr(start, p == std::string::npos ? std::string::npos : p - start));
+        if (p == std::string::npos) break;
+        start = p + 1;
+    }
+    return out;
+}
+
+// Raw decode-throughput probe: prefill `n_slots` identical sequences, warm up the CUDA graph, then
+// time `n_steps` batched decode steps, ignoring EOS (tokens are fed back but generation never
+// stops). Measures the decode-graph rate independent of model correctness — usable on quants that
+// won't generate naturally (e.g. q4_k emits EOS at frame 0). Reports aggregate frames/s.
+static int run_decode_bench(zonos2_model & model, const std::string & text, int n_slots, int n_steps) {
+    const int ncb = (int) model.hp.n_codebooks, av = (int) model.hp.audio_vocab;
+    if (n_slots < 1) n_slots = 1;
+
+    zonos2_prompt_options opt; int n0 = 0, sp_pos = -1;
+    std::vector<int32_t> ids = zonos2_build_prompt(model, text, opt, n0, sp_pos);
+    std::vector<float> idf(ids.begin(), ids.end());
+
+    zonos2_batch_ctx bc;
+    if (!zonos2_batch_init(bc, model, n_slots, n0 + n_steps + 8)) {
+        fprintf(stderr, "decode-bench: batch init failed\n"); return 1;
+    }
+    zonos2_sampling sp; sp.greedy = true;            // argmax feedback; values don't affect timing
+    std::vector<zonos2_sampler> smp(n_slots, zonos2_sampler(sp, ncb, av));
+    std::vector<zonos2_slot> slots(n_slots);
+    std::vector<std::vector<float>> lo(n_slots, std::vector<float>((size_t) av * ncb));
+    std::vector<int32_t> sink;                        // throwaway codes
+    std::vector<zonos2_slot *> active(n_slots);
+    for (int i = 0; i < n_slots; ++i) {
+        slots[i] = zonos2_slot{}; slots[i].index = i; slots[i].active = true; slots[i].n_past = n0;
+        if (!zonos2_batch_slot_prefill(bc, i, idf.data(), n0, nullptr, 0, lo[i].data())) {
+            fprintf(stderr, "decode-bench: prefill slot %d failed\n", i); zonos2_batch_free(bc); return 1;
+        }
+        active[i] = &slots[i];
+    }
+    auto step_once = [&]() {
+        for (int i = 0; i < n_slots; ++i) {          // sample -> next_ids (ignore done/eos)
+            zonos2_slot_sample(model, slots[i], smp[i], lo[i].data(), sink, n_steps + n0 + 16, {});
+            slots[i].done = false;
+        }
+        zonos2_batch_step(bc, active);
+        for (int i = 0; i < n_slots; ++i)
+            memcpy(lo[i].data(), zonos2_batch_slot_logits(bc, i), (size_t) av * ncb * sizeof(float));
+    };
+
+    for (int w = 0; w < 8; ++w) step_once();         // warm up CUDA graph
+    auto t0 = std::chrono::steady_clock::now();
+    for (int s = 0; s < n_steps; ++s) step_once();
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    const double fps = (double) n_slots * n_steps / dt;
+    const double rt  = fps / (44100.0 / 512.0);
+    printf("decode-bench: slots=%d steps=%d  %.3fs  %.0f frames/s  %.1fx real-time  (%.1f frames/s/slot)\n",
+           n_slots, n_steps, dt, fps, rt, fps / n_slots);
+    zonos2_batch_free(bc);
+    return 0;
+}
+
+// Batched-decode validation harness. `texts` is '|'-separated; each becomes one active slot (extra
+// slots up to --slots stay idle, exercising idle-slot safety). For every request it (1) runs the
+// single-sequence reference (zonos2_generate) and (2) runs the same prompt through the batch
+// runtime, then compares. With --greedy and --slots 1 the batch result must be bit-identical to the
+// reference (same VEC kernel); for n_slots>1 the decode routes through the MMA kernel so exact
+// agreement is reported per frame. Identical prompts in two slots must always match exactly (F.2).
+static int run_batch_test(zonos2_model & model, const std::string & texts_joined, int n_slots,
+                          int max_frames, const zonos2_sampling & sp_in,
+                          const std::string & dac_path, bool use_gpu) {
+    const int ncb = (int) model.hp.n_codebooks, av = (int) model.hp.audio_vocab;
+    std::vector<std::string> texts = split_pipe(texts_joined);
+    const int n_req = (int) texts.size();
+    if (n_slots < n_req) n_slots = n_req;
+
+    struct Job {
+        std::string text;
+        std::vector<float> idf;          // prompt ids [n0*W] floats
+        int n0 = 0;
+        std::unique_ptr<zonos2_sampler> smp;
+        zonos2_slot slot;
+        std::vector<float> logits;       // [av*ncb] current sampling source
+        std::vector<int32_t> codes;
+        int eos_frame = -1;
+    };
+    std::vector<Job> jobs(n_req);
+    int max_n0 = 0;
+    for (int i = 0; i < n_req; ++i) {
+        zonos2_prompt_options opt; int n0 = 0, sp_pos = -1;
+        std::vector<int32_t> ids = zonos2_build_prompt(model, texts[i], opt, n0, sp_pos);
+        jobs[i].text = texts[i];
+        jobs[i].idf.assign(ids.begin(), ids.end());
+        jobs[i].n0 = n0;
+        max_n0 = std::max(max_n0, n0);
+    }
+
+    // single-sequence reference (current KV path) per request
+    std::vector<std::vector<int32_t>> ref_codes(n_req);
+    std::vector<int> ref_eos(n_req, -1);
+    for (int i = 0; i < n_req; ++i) {
+        zonos2_sampling spr = sp_in;
+        int eos = -1;
+        zonos2_generate(model, jobs[i].idf.data(), jobs[i].n0, max_frames, spr, ref_codes[i], eos, true, nullptr, 0);
+        ref_eos[i] = eos;
+    }
+
+    zonos2_batch_ctx bc;
+    if (!zonos2_batch_init(bc, model, n_slots, max_n0 + max_frames)) {
+        fprintf(stderr, "batch-test: batch init failed\n"); return 1;
+    }
+
+    for (int i = 0; i < n_req; ++i) {
+        jobs[i].smp = std::make_unique<zonos2_sampler>(sp_in, ncb, av);
+        jobs[i].slot = zonos2_slot{};
+        jobs[i].slot.index  = i;
+        jobs[i].slot.active = true;
+        jobs[i].slot.n_past = jobs[i].n0;
+        jobs[i].logits.assign((size_t) av * ncb, 0.0f);
+        if (!zonos2_batch_slot_prefill(bc, i, jobs[i].idf.data(), jobs[i].n0, nullptr, 0, jobs[i].logits.data())) {
+            jobs[i].slot.done = true;
+            fprintf(stderr, "batch-test: prefill slot %d failed\n", i);
+        }
+    }
+
+    for (;;) {
+        bool any = false;                         // sample phase
+        for (int i = 0; i < n_req; ++i) {
+            Job & j = jobs[i];
+            if (!j.slot.active || j.slot.done) continue;
+            zonos2_slot_sample(model, j.slot, *j.smp, j.logits.data(), j.codes, max_frames, {});
+            j.eos_frame = j.slot.eos_frame;
+            any = true;
+        }
+        if (!any) break;
+        std::vector<zonos2_slot *> step_list;     // step phase
+        for (int i = 0; i < n_req; ++i)
+            if (jobs[i].slot.active && !jobs[i].slot.done) step_list.push_back(&jobs[i].slot);
+        if (step_list.empty()) break;
+        zonos2_batch_step(bc, step_list);
+        for (zonos2_slot * sp : step_list)
+            memcpy(jobs[sp->index].logits.data(), zonos2_batch_slot_logits(bc, sp->index),
+                   (size_t) av * ncb * sizeof(float));
+    }
+
+    printf("\n=== batch-test: %d requests in %d slots, %s, max=%d ===\n",
+           n_req, n_slots, sp_in.greedy ? "greedy" : "sampling", max_frames);
+    int fails = 0;
+    for (int i = 0; i < n_req; ++i) {
+        const auto & b = jobs[i].codes;
+        const auto & r = ref_codes[i];
+        const int nb = (int) b.size() / ncb, nr = (int) r.size() / ncb, cmp = std::min(nb, nr);
+        int first_div = -1, agree = 0;
+        for (int f = 0; f < cmp; ++f) {
+            bool eq = true;
+            for (int cb = 0; cb < ncb; ++cb)
+                if (b[(size_t) f * ncb + cb] != r[(size_t) f * ncb + cb]) { eq = false; break; }
+            if (eq) ++agree; else if (first_div < 0) first_div = f;
+        }
+        const bool exact = (nb == nr && agree == cmp);
+        printf("  req %d \"%.28s\": batch=%d(eos=%d) ref=%d(eos=%d)  agree=%d/%d first_div=%d %s\n",
+               i, jobs[i].text.c_str(), nb, jobs[i].eos_frame, nr, ref_eos[i], agree, cmp, first_div,
+               exact ? "EXACT" : "");
+        if (n_slots == 1 && sp_in.greedy && !exact) ++fails;  // F.1 must be bit-exact
+    }
+    for (int i = 0; i < n_req; ++i)
+        for (int k = i + 1; k < n_req; ++k)
+            if (jobs[i].text == jobs[k].text) {
+                const bool same = jobs[i].codes == jobs[k].codes;
+                printf("  F.2 slots %d,%d identical prompt -> %s\n", i, k, same ? "MATCH" : "MISMATCH");
+                if (!same) ++fails;
+            }
+
+    if (!dac_path.empty() && n_req > 0 && !jobs[0].codes.empty()) {
+        dac_model dm;
+        if (dac_load(dm, dac_path.c_str(), use_gpu)) {
+            std::vector<float> audio;
+            const int nf = (int) jobs[0].codes.size() / ncb;
+            if (dac_decode(dm, jobs[0].codes.data(), nf, ncb, jobs[0].eos_frame, audio))
+                dac_write_wav("/tmp/batch_slot0.wav", audio, dm.sample_rate);
+            dac_free(dm);
+            printf("  wrote /tmp/batch_slot0.wav\n");
+        }
+    }
+
+    zonos2_batch_free(bc);
+    printf("batch-test: %s\n", fails ? "FAIL" : "OK");
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     const std::string path = argv[1];
     bool use_gpu = false;
-    bool validate = false, generate = false, do_tts = false, do_build_prompt = false;
+    bool validate = false, generate = false, do_tts = false, do_build_prompt = false, do_batch_test = false, do_decode_bench = false;
     std::string ids_path, out_dir, out_codes, spk_path, text, prompt_out, dac_path, dump_ids_path;
-    int n_layer_limit = -1, max_frames = 400, spk_pos = 0;
+    int n_layer_limit = -1, max_frames = 400, spk_pos = 0, n_slots = 1;
     bool use_kv = true;
     zonos2_sampling sp;
     for (int i = 2; i < argc; ++i) {
@@ -85,6 +281,13 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--build-prompt") && i + 2 < argc) {
             do_build_prompt = true; text = argv[++i]; prompt_out = argv[++i];
         }
+        else if (!strcmp(argv[i], "--batch-test") && i + 1 < argc) {
+            do_batch_test = true; text = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--decode-bench") && i + 1 < argc) {
+            do_decode_bench = true; text = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--slots")  && i + 1 < argc) n_slots = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) n_layer_limit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max")    && i + 1 < argc) max_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dac") && i + 1 < argc) dac_path = argv[++i];
@@ -118,6 +321,18 @@ int main(int argc, char ** argv) {
         printf("speaker: %zu-d vector from %s, pos=%d\n", spk.size(), spk_path.c_str(), spk_pos);
     }
     const float * spk_ptr = spk.empty() ? nullptr : spk.data();
+
+    if (do_batch_test) {
+        const int rc = run_batch_test(model, text, n_slots, max_frames, sp, dac_path, use_gpu);
+        zonos2_model_free(model);
+        return rc;
+    }
+
+    if (do_decode_bench) {
+        const int rc = run_decode_bench(model, text, n_slots, max_frames);
+        zonos2_model_free(model);
+        return rc;
+    }
 
     if (validate) {
         std::vector<float> ids;

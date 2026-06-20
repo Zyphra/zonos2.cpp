@@ -24,16 +24,23 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "zonos2-sampler.h"
 
 using json = nlohmann::json;
 
@@ -46,9 +53,23 @@ struct CachedSpeaker {
     double created = 0;
 };
 
+struct ReqJob;  // continuous-batching work item (defined after GenReq)
+struct DacTask; // a unit of DAC decode work handed to a pool lane (defined after ReqJob)
+
+// One DAC pool lane: a thread + its own dac_model instance (ggml backends are not reentrant, so
+// parallel decode needs independent instances) + a FIFO task queue. Each request is pinned to one
+// lane for its lifetime, so its PCM blocks decode in order; different requests use different lanes.
+struct DacLane {
+    dac_model dac;
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<DacTask> q;
+};
+
 struct ServerState {
     zonos2_model model;
-    dac_model    dac;
+    dac_model    dac;          // metadata (sample_rate) + WAV encoding (no backend compute)
     spk_model    spk;
     bool have_spk = false;
     bool use_gpu  = false;
@@ -56,9 +77,21 @@ struct ServerState {
     int max_frames   = 2000;   // ~23s ceiling; per-request max_tokens clamps below this
     int stream_block = 40;     // frames per streamed PCM block (~0.46s)
     int stream_ctx   = 24;     // conv-context frames each side (>=16 is seam-free); see dac_decode_window
+    int batch_slots  = 4;      // continuous-batching width (concurrent in-flight syntheses)
+    int dac_threads  = 4;      // DAC decode pool lanes (parallel decode across requests)
     std::string ui_path = "web/tts_ui.html";
 
-    std::mutex gpu_mtx;        // serialize generate + decode (single in-flight synthesis)
+    // continuous-batching scheduler: one worker thread owns the backbone + batch context and only
+    // produces codes; DAC decode is offloaded to the pool so the worker never blocks on it. HTTP
+    // handlers enqueue jobs and stream results back through each job's channel.
+    std::thread worker;
+    std::atomic<bool> stop{false};
+    std::mutex sched_mtx;                 // guards `incoming`
+    std::condition_variable sched_cv;     // wakes the worker on a new job / shutdown
+    std::deque<std::shared_ptr<ReqJob>> incoming;
+
+    std::vector<DacLane> dac_lanes;       // DAC decode pool (size dac_threads)
+    uint64_t next_lane = 0;               // round-robin lane assignment (worker thread only)
 
     std::mutex spk_mtx;          // guards `sessions`
     std::mutex spk_compute_mtx;  // serialize ECAPA encoder compute (shared spk ggml backend, not reentrant)
@@ -160,6 +193,50 @@ struct GenReq {
     double fade_out_ms = 0;
     bool stream = true;
     std::string format = "pcm";         // "pcm" (float32) | "wav"
+};
+
+// One in-flight synthesis. The HTTP handler fills the request fields + prompt and enqueues it; the
+// worker thread owns the runtime fields (slot/sampler/codes) once admitted and streams PCM blocks
+// back through the channel (mutex/cv/pcm). For buffered requests the worker pushes one final block.
+struct ReqJob {
+    // request (handler-filled, read-only to the worker)
+    GenReq gr;
+    std::vector<float> idf;              // prompt ids [n0*W] as floats
+    int n0 = 0, spk_pos = 0;
+    bool stream = true;                  // chunked float32 PCM vs buffered (wav / pcm)
+    bool wav = false;
+
+    // runtime (worker-owned)
+    zonos2_slot slot;
+    std::unique_ptr<zonos2_sampler> smp;
+    std::vector<float> logits;           // [av*ncb] current sampling source
+    std::vector<int32_t> codes;
+    int eos_frame = -1;
+    int emitted = 0;                     // frames already handed to the DAC pool (streaming)
+    int lane = 0;                        // assigned DAC pool lane (decodes this job's blocks in order)
+
+    // channel: DAC pool -> handler
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::vector<float>> pcm;  // ready PCM blocks (float32)
+    bool finished = false;
+    bool failed   = false;
+    bool client_dropped = false;         // set by the handler when the socket drops
+};
+
+// A DAC decode unit handed from the backbone worker to a pool lane. Carries a snapshot of the codes
+// (the worker keeps mutating job->codes, so the lane must not read it live). WINDOW emits a
+// streaming block; FINALIZE flushes the streaming tail or does the single buffered decode, then
+// marks the channel finished. `drop` skips the decode (client gone) but still finishes the channel.
+struct DacTask {
+    std::shared_ptr<ReqJob> job;
+    std::vector<int32_t> codes;          // snapshot of job->codes[0 : H*ncb)
+    int H = 0;                           // frames in the snapshot
+    enum Kind { WINDOW, FINALIZE } kind = WINDOW;
+    int f_lo = 0, f_hi = 0, Lc = 0, Rc = 0;
+    bool buffered = false;               // FINALIZE: full dac_decode vs windowed tail
+    bool finish = false;                 // FINALIZE: signal channel done after this task
+    bool drop = false;                   // skip decode, just finish
 };
 
 // Resolve a speaker vector from a request's speaker_* fields. Returns true if one was set,
@@ -291,81 +368,189 @@ static bool parse_gen_req(ServerState & s, const json & j, const std::string & s
     return true;
 }
 
-// --------------------------------------------------------------------------- synthesis
+// --------------------------------------------------------------------------- synthesis worker
+//
+// One worker thread owns the backbone and a single zonos2_batch_ctx (batch_slots wide); it only
+// produces codes. DAC decode is offloaded to a pool of lanes (each its own dac_model) so the
+// backbone never blocks on it. Each tick: admit waiting jobs into free slots (prefill), sample one
+// frame per active slot, hand ready blocks to the job's DAC lane, evict finished slots, batch-step
+// the rest. The decode graph is static-shape and CUDA-graph-replayed; per-slot prefill runs a
+// separate one-off graph (one re-capture per admit). For bit-exact single-stream output use
+// --dac-cpu (CPU DAC keeps the backbone CUDA graph undisturbed); GPU DAC is best for throughput.
 
-// Buffered: generate all frames, decode once, return audio bytes + content type.
-static bool synth_buffered(ServerState & s, const GenReq & req,
-                           std::vector<uint8_t> & body, std::string & content_type) {
-    int n0 = 0, spk_pos = -1;
-    zonos2_prompt_options opt = req.opt;
-    const float * spk_ptr = req.spk.empty() ? nullptr : req.spk.data();
-    std::vector<int32_t> ids = zonos2_build_prompt(s.model, req.text, opt, n0, spk_pos);
-    std::vector<float> idf(ids.begin(), ids.end());
-    const int ncb = (int) s.model.hp.n_codebooks;
-
-    std::vector<int32_t> codes; int eos_frame = -1;
-    const int nf = zonos2_generate(s.model, idf.data(), n0, req.max_frames, req.sp, codes, eos_frame,
-                                   /*use_kv=*/true, spk_ptr, spk_pos >= 0 ? spk_pos : 0);
-    if (nf <= 0) return false;
-
-    std::vector<float> audio;
-    if (!dac_decode(s.dac, codes.data(), nf, ncb, eos_frame, audio)) return false;
-    apply_fade(audio, req.fade_out_ms, s.dac.sample_rate);
-
-    if (req.format == "wav") {
-        body = dac_wav_bytes(audio, s.dac.sample_rate);
-        content_type = "audio/wav";
-    } else {
-        body.resize(audio.size() * sizeof(float));
-        memcpy(body.data(), audio.data(), body.size());
-        content_type = "audio/pcm";
-    }
-    return true;
+static void push_pcm(ReqJob & job, std::vector<float> && pcm) {
+    if (pcm.empty()) return;
+    std::lock_guard<std::mutex> lk(job.m);
+    job.pcm.push_back(std::move(pcm));
+    job.cv.notify_one();
 }
 
-// Streaming: generate with a per-frame callback, decode ready blocks via dac_decode_window,
-// and write float32 PCM to the sink as it is produced. Returns false if the client dropped.
-static bool synth_stream(ServerState & s, const GenReq & req, httplib::DataSink & sink) {
-    int n0 = 0, spk_pos = -1;
-    zonos2_prompt_options opt = req.opt;
-    const float * spk_ptr = req.spk.empty() ? nullptr : req.spk.data();
-    std::vector<int32_t> ids = zonos2_build_prompt(s.model, req.text, opt, n0, spk_pos);
-    std::vector<float> idf(ids.begin(), ids.end());
-    const int ncb = (int) s.model.hp.n_codebooks;
+static void job_finish(ReqJob & job, bool failed) {
+    std::lock_guard<std::mutex> lk(job.m);
+    job.failed   = failed;
+    job.finished = true;
+    job.cv.notify_one();
+}
 
-    const int BLOCK = s.stream_block, CTX = s.stream_ctx, SHEAR = ncb - 1;
-    std::vector<int32_t> codes;
-    int eos_frame = -1, emitted = 0;
-    bool client_ok = true;
+static void dac_lane_submit(DacLane & lane, DacTask && t) {
+    std::lock_guard<std::mutex> lk(lane.m);
+    lane.q.push_back(std::move(t));
+    lane.cv.notify_one();
+}
 
-    auto on_frame = [&](int idx, const int32_t * /*fr*/, int /*ncb_*/) -> bool {
-        const int H = idx + 1;   // frames generated so far (codes already appended)
-        while (H - emitted >= BLOCK + CTX + SHEAR) {
-            const int f_hi = H - CTX - SHEAR;                  // hold back conv ctx + shear lookahead
+// DAC pool lane: own a dac_model, decode tasks FIFO, push PCM to the job channel. A job is pinned to
+// one lane, so its blocks stay ordered; FINALIZE tasks carry `finish` to close the channel last.
+static void dac_lane_loop(ServerState & s, DacLane & lane) {
+    const int ncb = lane.dac.n_codebooks, sr = lane.dac.sample_rate;
+    for (;;) {
+        DacTask t;
+        {
+            std::unique_lock<std::mutex> lk(lane.m);
+            lane.cv.wait(lk, [&]{ return !lane.q.empty() || s.stop.load(); });
+            if (lane.q.empty()) { if (s.stop.load()) break; continue; }
+            t = std::move(lane.q.front()); lane.q.pop_front();
+        }
+        ReqJob & job = *t.job;
+        if (!t.drop) {
             std::vector<float> pcm;
-            if (!dac_decode_window(s.dac, codes.data(), H, emitted, f_hi, CTX, CTX, pcm)) return false;
-            if (!sink.write((const char *) pcm.data(), pcm.size() * sizeof(float))) { client_ok = false; return false; }
-            emitted = f_hi;
+            if (t.kind == DacTask::WINDOW) {
+                if (dac_decode_window(lane.dac, t.codes.data(), t.H, t.f_lo, t.f_hi, t.Lc, t.Rc, pcm))
+                    push_pcm(job, std::move(pcm));
+            } else if (t.buffered) {
+                if (t.H > 0 && dac_decode(lane.dac, t.codes.data(), t.H, ncb, job.eos_frame, pcm)) {
+                    apply_fade(pcm, job.gr.fade_out_ms, sr);
+                    push_pcm(job, std::move(pcm));
+                }
+            } else { // streaming tail: [f_lo, f_hi) with Rc=0, faded
+                if (t.f_hi > t.f_lo &&
+                    dac_decode_window(lane.dac, t.codes.data(), t.H, t.f_lo, t.f_hi, t.Lc, /*Rc=*/0, pcm)) {
+                    apply_fade(pcm, job.gr.fade_out_ms, sr);
+                    push_pcm(job, std::move(pcm));
+                }
+            }
         }
-        return true;
-    };
-
-    const int nf = zonos2_generate(s.model, idf.data(), n0, req.max_frames, req.sp, codes, eos_frame,
-                                   /*use_kv=*/true, spk_ptr, spk_pos >= 0 ? spk_pos : 0, nullptr, on_frame);
-
-    // flush the tail: decode [emitted, end) with Rc=0 to match a full decode truncated at eos
-    const int end = (eos_frame >= 0 && eos_frame < nf) ? eos_frame : nf;
-    if (client_ok && end > emitted) {
-        std::vector<float> pcm;
-        if (dac_decode_window(s.dac, codes.data(), nf, emitted, end, CTX, /*Rc=*/0, pcm)) {
-            apply_fade(pcm, req.fade_out_ms, s.dac.sample_rate);
-            if (!sink.write((const char *) pcm.data(), pcm.size() * sizeof(float))) client_ok = false;
-        }
+        if (t.finish) job_finish(job, /*failed=*/false);
     }
-    return client_ok;
 }
 
-// Shared handler for /tts/generate and /v1/audio/speech.
+// Streaming: hand every ready block to the job's DAC lane (snapshotting codes, since the worker
+// keeps appending). Mirrors the old synth_stream block cadence; decode happens off-thread.
+static void stream_submit_ready(ServerState & s, const std::shared_ptr<ReqJob> & job) {
+    const int ncb = (int) s.model.hp.n_codebooks;
+    const int BLOCK = s.stream_block, CTX = s.stream_ctx, SHEAR = ncb - 1;
+    const int H = (int) job->codes.size() / ncb;         // frames generated so far
+    while (H - job->emitted >= BLOCK + CTX + SHEAR) {
+        const int f_hi = H - CTX - SHEAR;                // hold back conv ctx + shear lookahead
+        DacTask t; t.job = job; t.kind = DacTask::WINDOW;
+        t.codes.assign(job->codes.begin(), job->codes.begin() + (size_t) H * ncb);
+        t.H = H; t.f_lo = job->emitted; t.f_hi = f_hi; t.Lc = CTX; t.Rc = CTX;
+        dac_lane_submit(s.dac_lanes[job->lane], std::move(t));
+        job->emitted = f_hi;
+    }
+}
+
+// Eviction: hand the final decode (streaming tail or one buffered decode) to the lane, with finish.
+static void submit_finalize(ServerState & s, const std::shared_ptr<ReqJob> & job, bool dropped) {
+    const int ncb = (int) s.model.hp.n_codebooks;
+    const int nf  = (int) job->codes.size() / ncb;
+    DacTask t; t.job = job; t.kind = DacTask::FINALIZE; t.finish = true; t.drop = dropped;
+    if (!dropped) {
+        t.codes = job->codes; t.H = nf;
+        if (job->stream) {
+            const int end = (job->eos_frame >= 0 && job->eos_frame < nf) ? job->eos_frame : nf;
+            t.buffered = false; t.f_lo = job->emitted; t.f_hi = end; t.Lc = s.stream_ctx; t.Rc = 0;
+        } else {
+            t.buffered = true;                            // full decode of [0, nf)
+        }
+    }
+    dac_lane_submit(s.dac_lanes[job->lane], std::move(t));
+}
+
+static void worker_loop(ServerState & s) {
+    const int ncb = (int) s.model.hp.n_codebooks, av = (int) s.model.hp.audio_vocab;
+    const int B = s.batch_slots;
+    const int slot_cap_frames = s.max_frames + 1024;   // headroom for prompt rows
+    zonos2_batch_ctx bc;
+    if (!zonos2_batch_init(bc, s.model, B, slot_cap_frames)) {
+        fprintf(stderr, "worker: batch init failed; synthesis disabled\n");
+        return;
+    }
+    std::vector<std::shared_ptr<ReqJob>> slot_job(B);
+
+    while (!s.stop.load()) {
+        // 1. admit waiting jobs into free slots (prefill into the slot's cache band)
+        for (int i = 0; i < B; ++i) {
+            if (slot_job[i]) continue;
+            std::shared_ptr<ReqJob> job;
+            { std::lock_guard<std::mutex> lk(s.sched_mtx);
+              if (!s.incoming.empty()) { job = s.incoming.front(); s.incoming.pop_front(); } }
+            if (!job) break;
+            job->slot = zonos2_slot{};
+            job->slot.index = i; job->slot.active = true; job->slot.n_past = job->n0;
+            job->lane = (int) (s.next_lane++ % s.dac_lanes.size()); // round-robin DAC lane
+            job->smp = std::make_unique<zonos2_sampler>(job->gr.sp, ncb, av);
+            job->logits.assign((size_t) av * ncb, 0.0f);
+            const float * spk = job->gr.spk.empty() ? nullptr : job->gr.spk.data();
+            if (!zonos2_batch_slot_prefill(bc, i, job->idf.data(), job->n0, spk, job->spk_pos, job->logits.data())) {
+                job_finish(*job, /*failed=*/true);
+                continue;                                   // leave slot free
+            }
+            slot_job[i] = job;
+        }
+
+        // 2. nothing in flight -> block until a job arrives (or shutdown)
+        bool any = false;
+        for (int i = 0; i < B; ++i) if (slot_job[i]) { any = true; break; }
+        if (!any) {
+            std::unique_lock<std::mutex> lk(s.sched_mtx);
+            if (s.incoming.empty() && !s.stop.load())
+                s.sched_cv.wait_for(lk, std::chrono::milliseconds(200));
+            continue;
+        }
+
+        // 3. sample one frame per active slot from its current logits
+        for (int i = 0; i < B; ++i) {
+            auto & job = slot_job[i];
+            if (!job || job->slot.done) continue;
+            { std::lock_guard<std::mutex> lk(job->m);
+              if (job->client_dropped) { job->slot.done = true; continue; } }
+            zonos2_slot_sample(s.model, job->slot, *job->smp, job->logits.data(),
+                               job->codes, job->gr.max_frames, {});
+            job->eos_frame = job->slot.eos_frame;
+            if (job->stream) stream_submit_ready(s, job);
+        }
+
+        // 4. evict finished slots: hand the final decode to the DAC lane (which signals the handler
+        //    after it drains), then free the slot immediately so the backbone keeps going.
+        for (int i = 0; i < B; ++i) {
+            auto & job = slot_job[i];
+            if (!job || !job->slot.done) continue;
+            bool dropped; { std::lock_guard<std::mutex> lk(job->m); dropped = job->client_dropped; }
+            submit_finalize(s, job, dropped);
+            slot_job[i].reset();
+        }
+
+        // 5. one batched decode step over the still-active slots, refill their logits
+        std::vector<zonos2_slot *> step_list;
+        for (int i = 0; i < B; ++i)
+            if (slot_job[i] && !slot_job[i]->slot.done) step_list.push_back(&slot_job[i]->slot);
+        if (!step_list.empty()) {
+            zonos2_batch_step(bc, step_list);
+            for (zonos2_slot * sp : step_list)
+                memcpy(slot_job[sp->index]->logits.data(), zonos2_batch_slot_logits(bc, sp->index),
+                       (size_t) av * ncb * sizeof(float));
+        }
+    }
+
+    // drain: signal any still-occupied slots so their handlers unblock
+    for (auto & job : slot_job) if (job) job_finish(*job, /*failed=*/true);
+    zonos2_batch_free(bc);
+}
+
+// --------------------------------------------------------------------------- request handler
+
+// Shared handler for /tts/generate and /v1/audio/speech. Parses + builds the prompt on the handler
+// thread, then hands the job to the worker and streams (chunked) or waits (buffered) for the result.
 static void handle_generate(ServerState & s, const httplib::Request & req, httplib::Response & res) {
     json j = json::parse(req.body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded()) { set_json(res, {{"error", "invalid JSON body"}}, 400); return; }
@@ -373,33 +558,69 @@ static void handle_generate(ServerState & s, const httplib::Request & req, httpl
     const std::string session = req.get_header_value("X-TTS-Session-ID");
     GenReq gr; std::string err;
     if (!parse_gen_req(s, j, session, gr, err)) { set_json(res, {{"error", err}}, 400); return; }
+
+    auto job = std::make_shared<ReqJob>();
+    job->gr = gr;
+    {
+        zonos2_prompt_options opt = gr.opt;             // CPU-only prompt build, safe off the worker
+        int n0 = 0, sp_pos = -1;
+        std::vector<int32_t> ids = zonos2_build_prompt(s.model, gr.text, opt, n0, sp_pos);
+        job->idf.assign(ids.begin(), ids.end());
+        job->n0 = n0;
+        job->spk_pos = sp_pos >= 0 ? sp_pos : 0;
+    }
+    job->stream = gr.stream && gr.format != "wav";
+    job->wav    = (gr.format == "wav");
+
     res.set_header("X-Seed", std::to_string(gr.sp.seed));   // report the seed used (reproduce by sending it back)
 
-    if (gr.stream && gr.format != "wav") {
+    { std::lock_guard<std::mutex> lk(s.sched_mtx); s.incoming.push_back(job); }
+    s.sched_cv.notify_one();
+
+    if (job->stream) {
         res.set_header("X-Audio-Sample-Rate", std::to_string(s.dac.sample_rate));
         res.set_header("X-Audio-Channels", "1");
         res.set_header("X-Audio-Format", "float32");
         res.set_chunked_content_provider("audio/pcm",
-            [&s, gr](size_t /*offset*/, httplib::DataSink & sink) -> bool {
-                std::lock_guard<std::mutex> lk(s.gpu_mtx);
-                synth_stream(s, gr, sink);
-                sink.done();
-                return true;
+            [job](size_t /*offset*/, httplib::DataSink & sink) -> bool {
+                for (;;) {
+                    std::vector<float> block; bool done = false;
+                    {
+                        std::unique_lock<std::mutex> lk(job->m);
+                        job->cv.wait(lk, [&]{ return !job->pcm.empty() || job->finished; });
+                        if (!job->pcm.empty()) { block = std::move(job->pcm.front()); job->pcm.pop_front(); }
+                        else done = job->finished;
+                    }
+                    if (!block.empty() &&
+                        !sink.write((const char *) block.data(), block.size() * sizeof(float))) {
+                        std::lock_guard<std::mutex> lk(job->m); job->client_dropped = true;
+                        return false;                       // client dropped; worker evicts next tick
+                    }
+                    if (done) { sink.done(); return true; }
+                }
             });
         return;
     }
 
-    // buffered (wav, or pcm with stream=false)
-    std::vector<uint8_t> body; std::string ct;
-    bool ok;
-    { std::lock_guard<std::mutex> lk(s.gpu_mtx); ok = synth_buffered(s, gr, body, ct); }
-    if (!ok) { set_json(res, {{"error", "generation failed"}}, 500); return; }
-    if (ct == "audio/pcm") {
+    // buffered (wav, or pcm with stream=false): wait for completion, then assemble the body
+    std::vector<float> audio;
+    bool failed;
+    {
+        std::unique_lock<std::mutex> lk(job->m);
+        job->cv.wait(lk, [&]{ return job->finished; });
+        failed = job->failed;
+        for (auto & b : job->pcm) audio.insert(audio.end(), b.begin(), b.end());
+    }
+    if (failed) { set_json(res, {{"error", "generation failed"}}, 500); return; }
+    if (job->wav) {
+        std::vector<uint8_t> body = dac_wav_bytes(audio, s.dac.sample_rate);
+        res.set_content((const char *) body.data(), body.size(), "audio/wav");
+    } else {
         res.set_header("X-Audio-Sample-Rate", std::to_string(s.dac.sample_rate));
         res.set_header("X-Audio-Channels", "1");
         res.set_header("X-Audio-Format", "float32");
+        res.set_content((const char *) audio.data(), audio.size() * sizeof(float), "audio/pcm");
     }
-    res.set_content((const char *) body.data(), body.size(), ct);
 }
 
 // --------------------------------------------------------------------------- speaker endpoints
@@ -568,6 +789,8 @@ static void usage(const char * a0) {
         "  --dac-cpu           run the DAC decoder on CPU even with --gpu (isolates the\n"
         "                      backbone CUDA graph; makes streamed audio bit-exact)\n"
         "  --max N             max frames per request (default 2000, ~23s)\n"
+        "  --batch N           continuous-batching width / concurrent syntheses (default 4)\n"
+        "  --dac-threads N     DAC decode pool lanes, parallel decode across requests (default 4)\n"
         "  --stream-block N    frames per streamed PCM block (default 40)\n"
         "  --stream-context N  conv-context frames each side, >=16 seam-free (default 24)\n"
         "  --ui PATH           web UI html to serve at / (default web/tts_ui.html)\n", a0);
@@ -590,6 +813,8 @@ int main(int argc, char ** argv) {
         else if (a == "--cpu") s.use_gpu = false;
         else if (a == "--dac-cpu") dac_cpu = true;
         else if (a == "--max" && i + 1 < argc) s.max_frames = atoi(argv[++i]);
+        else if (a == "--batch" && i + 1 < argc) s.batch_slots = std::max(1, atoi(argv[++i]));
+        else if (a == "--dac-threads" && i + 1 < argc) s.dac_threads = std::max(1, atoi(argv[++i]));
         else if (a == "--stream-block" && i + 1 < argc) s.stream_block = atoi(argv[++i]);
         else if (a == "--stream-context" && i + 1 < argc) s.stream_ctx = atoi(argv[++i]);
         else if (a == "--ui" && i + 1 < argc) s.ui_path = argv[++i];
@@ -603,6 +828,18 @@ int main(int argc, char ** argv) {
         if (!spk_load(s.spk, spk_path.c_str())) { fprintf(stderr, "failed to load speaker encoder\n"); return 1; }
         s.have_spk = true;
     }
+
+    // DAC decode pool: one dac_model instance + thread per lane (ggml backends are not reentrant).
+    s.dac_lanes = std::vector<DacLane>(s.dac_threads);
+    for (int i = 0; i < s.dac_threads; ++i) {
+        if (!dac_load(s.dac_lanes[i].dac, dac_path.c_str(), s.use_gpu && !dac_cpu)) {
+            fprintf(stderr, "failed to load dac for pool lane %d\n", i); return 1;
+        }
+    }
+    for (int i = 0; i < s.dac_threads; ++i)
+        s.dac_lanes[i].th = std::thread(dac_lane_loop, std::ref(s), std::ref(s.dac_lanes[i]));
+
+    s.worker = std::thread(worker_loop, std::ref(s));   // owns backbone; produces codes for the pool
 
     httplib::Server svr;
     svr.set_payload_max_length(64ull * 1024 * 1024);   // allow multi-MB speaker uploads
@@ -651,9 +888,21 @@ int main(int argc, char ** argv) {
     });
     svr.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) { res.status = 204; });
 
-    fprintf(stderr, "zonos2-server: backbone=%s dac=%s spk=%s backend=%s\n",
-            model_path.c_str(), dac_path.c_str(), s.have_spk ? spk_path.c_str() : "(none)", s.use_gpu ? "GPU" : "CPU");
+    fprintf(stderr, "zonos2-server: backbone=%s dac=%s spk=%s backend=%s batch=%d dac-threads=%d\n",
+            model_path.c_str(), dac_path.c_str(), s.have_spk ? spk_path.c_str() : "(none)",
+            s.use_gpu ? "GPU" : "CPU", s.batch_slots, s.dac_threads);
     fprintf(stderr, "zonos2-server: listening on http://%s:%d  (UI: %s)\n", host.c_str(), port, s.ui_path.c_str());
-    if (!svr.listen(host, port)) { fprintf(stderr, "error: failed to bind %s:%d\n", host.c_str(), port); return 1; }
+    const bool ok = svr.listen(host, port);
+
+    s.stop.store(true);                 // stop the worker + DAC pool before returning
+    s.sched_cv.notify_all();
+    if (s.worker.joinable()) s.worker.join();
+    for (auto & lane : s.dac_lanes) {
+        { std::lock_guard<std::mutex> lk(lane.m); }
+        lane.cv.notify_all();
+        if (lane.th.joinable()) lane.th.join();
+        dac_free(lane.dac);
+    }
+    if (!ok) { fprintf(stderr, "error: failed to bind %s:%d\n", host.c_str(), port); return 1; }
     return 0;
 }

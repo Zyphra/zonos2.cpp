@@ -182,25 +182,95 @@ struct zonos2_sampling {
     bool     greedy        = false;
 };
 
-// Incremental KV cache: per-layer K/V buffers persisted across decode steps.
-struct zonos2_context {
-    const zonos2_model * model = nullptr;
-    int max_seq = 0;
-    int n_past  = 0;
-    struct ggml_context *      ctx_kv  = nullptr;
-    ggml_backend_buffer_t      buf_kv  = nullptr;
-    std::vector<struct ggml_tensor *> k_cache; // per layer [head_dim, n_head_kv, max_seq]
-    std::vector<struct ggml_tensor *> v_cache;
-    ggml_gallocr_t galloc = nullptr;           // reused across prefill + decode steps
-};
-
-bool zonos2_context_init(zonos2_context & ctx, const zonos2_model & model, int max_seq);
-void zonos2_context_free(zonos2_context & ctx);
+struct zonos2_sampler; // defined in zonos2-sampler.h
 
 // Per-frame callback for streaming: invoked once per generated frame with its 0-based index,
 // the frame's `ncb` audio codes (pre-shear, raw), and ncb. Return false to abort generation
 // early (e.g. the HTTP client disconnected). The codes pointer is only valid for the call.
 using zonos2_frame_cb = std::function<bool(int frame_idx, const int32_t * codes, int ncb)>;
+
+// ---------------------------------------------------------------------------
+// Batched / continuous-batching runtime
+// ---------------------------------------------------------------------------
+// A fixed-width batch of `n_slots` independent decode sequences sharing one model. The KV cache is
+// a unified per-layer tensor [head_dim, n_slots*slot_cap, n_head_kv]; slot s owns the row band
+// [s*slot_cap, (s+1)*slot_cap). The decode graph is built once with g.n=n_slots and replayed as a
+// CUDA graph; each slot attends only its own band via a per-slot (ne33) mask, so idle/short slots
+// cost nothing in attention. Per-slot prefill runs a separate one-off graph writing into the band.
+struct zonos2_batch_ctx {
+    const zonos2_model * model = nullptr;
+    int n_slots  = 0;
+    int slot_cap = 0;                 // rows per slot (multiple of FATTN stride 256)
+    int W = 0, ncb = 0, av = 0;       // n_codebooks+1, n_codebooks, audio_vocab
+
+    // unified KV cache (per layer)
+    struct ggml_context *      ctx_kv = nullptr;
+    ggml_backend_buffer_t      buf_kv = nullptr;
+    std::vector<struct ggml_tensor *> k_cache, v_cache;
+
+    // persistent decode graph (built once, replayed); input/output tensor handles
+    struct ggml_context * ctx_dec    = nullptr;
+    struct ggml_cgraph  * gfd        = nullptr;
+    ggml_gallocr_t        galloc_dec = nullptr;
+    std::vector<struct ggml_tensor *> dec_ids;          // [W], each [n_slots] I32
+    struct ggml_tensor *  dec_pos_rope  = nullptr;      // [n_slots] I32
+    struct ggml_tensor *  dec_pos_cache = nullptr;      // [n_slots] I32
+    struct ggml_tensor *  dec_mask      = nullptr;      // [slot_cap,1,1,n_slots] F16
+    struct ggml_tensor *  dec_logits    = nullptr;      // [av, ncb, n_slots]
+
+    ggml_gallocr_t galloc_prefill = nullptr;            // reused for per-slot prefill graphs
+
+    // host scratch (reused each step)
+    std::vector<int32_t> h_ids;        // [W*n_slots]
+    std::vector<int32_t> h_pos_rope;   // [n_slots]
+    std::vector<int32_t> h_pos_cache;  // [n_slots]
+    std::vector<uint16_t> h_mask;      // [slot_cap*n_slots] (ggml_fp16_t)
+    std::vector<float>   h_logits;     // [n_slots*av*ncb]
+};
+
+// Per-slot decode runtime (graph-facing state only; the sampler, generated codes, and any output
+// sink live in the caller's per-request object). Reset on admission into a free slot.
+struct zonos2_slot {
+    int  index = -1;        // cache slot / decode column
+    bool active = false;
+    bool done   = false;
+    int  n_past = 0;        // logical position where the next frame is written
+    int  step   = 0;        // frames sampled so far (== frame index of the next sample)
+    int  eos_frame = -1;
+    int  countdown = -1;
+    std::vector<int32_t> next_ids; // [W] next input frame (audio codes + text pad)
+};
+
+// Allocate the unified cache + persistent decode graph. slot_cap_frames is the per-sequence window
+// (prompt rows + max generated frames); it is rounded up to a multiple of 256. Returns false on
+// allocation failure.
+bool zonos2_batch_init(zonos2_batch_ctx & bc, const zonos2_model & model, int n_slots, int slot_cap_frames);
+void zonos2_batch_free(zonos2_batch_ctx & bc);
+
+// Prefill one sequence into `slot`'s cache band (single-sequence graph). prompt_ids is row-major
+// [n0, n_codebooks+1] floats; out_logits receives the final prompt frame's logits [audio_vocab *
+// n_codebooks] (C-order [n_codebooks, audio_vocab]), i.e. the seed for sampling frame 0. spk as in
+// zonos2_generate. Returns false if n0 > slot_cap or on compute failure.
+bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * prompt_ids, int n0,
+                               const float * spk, int spk_pos, float * out_logits);
+
+// One batched decode step. `active` lists the currently-active (non-done) slots; their `index`
+// selects the decode column. Each active slot's next_ids is written at its n_past, the graph is
+// computed, and each slot's n_past is incremented. Idle columns are masked to a single zero key.
+// Read a slot's resulting logits with zonos2_batch_slot_logits().
+void zonos2_batch_step(zonos2_batch_ctx & bc, const std::vector<zonos2_slot *> & active);
+
+// Pointer to slot `index`'s logits within the last step's readback: [audio_vocab * n_codebooks],
+// C-order [n_codebooks, audio_vocab]. Valid until the next zonos2_batch_step.
+const float * zonos2_batch_slot_logits(const zonos2_batch_ctx & bc, int index);
+
+// Sample one frame for `slot` from `logits` ([audio_vocab*n_codebooks]) using `smp`, append its
+// codes to out_codes, and advance the slot's eos/countdown/step state + prepare next_ids. Sets
+// slot.done when finished (eos countdown elapsed, max_frames reached, or on_frame returned false).
+// Mirrors the per-frame logic of the single-sequence KV path so CLI and server stay identical.
+bool zonos2_slot_sample(const zonos2_model & model, zonos2_slot & slot, zonos2_sampler & smp,
+                        const float * logits, std::vector<int32_t> & out_codes,
+                        int max_frames, const zonos2_frame_cb & on_frame);
 
 // Autoregressive generation. use_kv=true: one prefill + single-token decodes with a KV
 // cache (real-time, O(n)). use_kv=false: recompute the full prefill each step (O(n^2),

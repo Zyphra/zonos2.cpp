@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <utility>
@@ -24,7 +25,11 @@ struct gctx {
     ggml_context * ctx = nullptr;
     int n = 0;
     std::vector<ggml_tensor *> ids;
-    ggml_tensor * pos = nullptr;
+    // Two position inputs (length g.n). For a single sequence they coincide (0..n-1); for a
+    // batched decode they differ: pos_rope carries each column's logical position (for RoPE),
+    // pos_cache the absolute cache row (slot*slot_cap + logical) where set_rows writes its K/V.
+    ggml_tensor * pos_rope  = nullptr;
+    ggml_tensor * pos_cache = nullptr;
     ggml_tensor * router_states = nullptr; // EDA state threaded across MoE layers
 
     // speaker conditioning: overwrite the embedding at column spk_pos with the
@@ -44,12 +49,15 @@ struct gctx {
         return t;
     }
 
-    // KV cache
-    std::vector<ggml_tensor *> * kc = nullptr;  // per-layer K cache [head_dim, max_seq, n_head_kv]
+    // KV cache. The cache is a unified per-layer tensor [head_dim, n_slots*slot_cap, n_head_kv];
+    // slot s owns the contiguous row band [s*slot_cap, (s+1)*slot_cap). For the single-sequence
+    // paths n_slots==1 and slot_cap==max_kv, recovering the original [hd, max_kv, nkv] layout.
+    std::vector<ggml_tensor *> * kc = nullptr;  // per-layer K cache
     std::vector<ggml_tensor *> * vc = nullptr;  // per-layer V cache (same layout)
-    bool decode = false;                        // true: attend over the full cache window via mask
-    int  max_kv = 0;                            // cache window size
-    ggml_tensor * mask = nullptr;               // [max_kv, 1] additive mask (decode only)
+    bool decode = false;                        // true: attend over each slot's cache band via mask
+    int  n_slots  = 1;                          // batch slots = ne3 of the decode attention
+    int  slot_cap = 0;                          // per-slot cache rows (multiple of FATTN stride 256)
+    ggml_tensor * mask = nullptr;               // [slot_cap, 1, 1, n_slots] additive mask (decode only)
     ggml_cgraph * gf = nullptr;                 // graph, for inline set_rows expansion
 
     // mark a tensor as a captured (read-back) graph output
@@ -90,31 +98,41 @@ static ggml_tensor * build_attention(gctx & g, ggml_tensor * cur, const zonos2_l
     q = ggml_mul(ctx, q, ggml_reshape_3d(ctx, ly.attn_temp, 1, nh, 1)); // broadcast over hd, n
     k = ggml_rms_norm(ctx, k, hp.qk_norm_eps);
 
-    // interleaved RoPE (is_neox=False => GGML_ROPE_TYPE_NORMAL)
-    q = ggml_rope_ext(ctx, q, g.pos, nullptr, hd, GGML_ROPE_TYPE_NORMAL,
+    // interleaved RoPE (is_neox=False => GGML_ROPE_TYPE_NORMAL); logical positions
+    q = ggml_rope_ext(ctx, q, g.pos_rope, nullptr, hd, GGML_ROPE_TYPE_NORMAL,
                       (int) hp.n_ctx_train, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    k = ggml_rope_ext(ctx, k, g.pos, nullptr, hd, GGML_ROPE_TYPE_NORMAL,
+    k = ggml_rope_ext(ctx, k, g.pos_rope, nullptr, hd, GGML_ROPE_TYPE_NORMAL,
                       (int) hp.n_ctx_train, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
     ggml_tensor * kqv = nullptr;
 
     if (g.kc) {
-        // append new K/V into the F16 cache at positions g.pos via in-place set_rows. The index
-        // is data (g.pos content), so node properties stay constant across decode steps -> the
-        // decode graph is static-shape and ggml-cuda can capture/replay it.
-        ggml_tensor * kc = (*g.kc)[il];   // [hd, max_kv, nkv] F16
+        // append new K/V into the F16 cache at rows g.pos_cache via in-place set_rows. The index
+        // is data (g.pos_cache content), so node properties stay constant across decode steps ->
+        // the decode graph is static-shape and ggml-cuda can capture/replay it. Each of the n
+        // columns writes a unique absolute row (slot*slot_cap + logical pos).
+        ggml_tensor * kc = (*g.kc)[il];   // [hd, n_slots*slot_cap, nkv] F16
         ggml_tensor * vc = (*g.vc)[il];
         // set_rows takes an F32 source and converts into the F16 cache in place.
         ggml_tensor * kb = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, n, nkv] F32
         ggml_tensor * vb = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
-        ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, kc, kb, g.pos));
-        ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, vc, vb, g.pos));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, kc, kb, g.pos_cache));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, vc, vb, g.pos_cache));
 
         if (g.decode) {
-            // fused flash attention over the cache window (one kernel; mask invalidates j>pos).
-            // K/V are the F16 cache views directly; output is already [hd, nh, n].
-            ggml_tensor * qf = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3)); // [hd, n, nh]
-            kqv = ggml_flash_attn_ext(ctx, qf, kc, vc, g.mask, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
+            // Per-slot batched flash attention. View the unified cache as 4D
+            // [hd, slot_cap, nkv, n_slots] — a no-copy reinterpret since row = slot*slot_cap + pos
+            // — and reshape the single per-slot query to [hd, 1, nh, n_slots]. The ne33 per-slot
+            // mask (g.mask = [slot_cap,1,1,n_slots]) confines slot s to its own band [0, pos_s], so
+            // one fused kernel handles all slots with no cross-slot work. At n_slots==1 this is the
+            // original [hd,max_kv,nkv] cache / [hd,1,nh,1] query — bit-identical to single-seq.
+            ggml_tensor * k4 = ggml_view_4d(ctx, kc, hd, g.slot_cap, nkv, g.n_slots,
+                                            kc->nb[1], kc->nb[2], (size_t) g.slot_cap * kc->nb[1], 0);
+            ggml_tensor * v4 = ggml_view_4d(ctx, vc, hd, g.slot_cap, nkv, g.n_slots,
+                                            vc->nb[1], vc->nb[2], (size_t) g.slot_cap * vc->nb[1], 0);
+            ggml_tensor * qf = ggml_reshape_4d(ctx, q, hd, 1, nh, g.n_slots); // [hd, 1, nh, n_slots]
+            kqv = ggml_flash_attn_ext(ctx, qf, k4, v4, g.mask, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
+            kqv = ggml_reshape_3d(ctx, kqv, hd, nh, g.n_slots);               // [hd, nh, n]
         }
     }
     if (!kqv) {
@@ -233,12 +251,18 @@ ggml_tensor * build_graph(gctx & g, int n_layer_limit) {
     const int nl = (n_layer_limit < 0) ? (int) hp.n_layer
                                        : std::min(n_layer_limit, (int) hp.n_layer);
     if (nl > 0) {
-        g.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, g.n);
-        ggml_set_input(g.pos);
-        ggml_set_name(g.pos, "pos");
+        g.pos_rope = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, g.n);
+        ggml_set_input(g.pos_rope);
+        ggml_set_name(g.pos_rope, "pos_rope");
+        if (g.kc) { // absolute cache write rows; only the KV-cache paths consume this
+            g.pos_cache = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, g.n);
+            ggml_set_input(g.pos_cache);
+            ggml_set_name(g.pos_cache, "pos_cache");
+        }
     }
     if (g.decode) {
-        g.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, g.max_kv, 1); // flash_attn_ext requires F16 mask
+        // per-slot causal mask on ne3; ne2 must stay 1 for the FATTN kernel selector. F16 required.
+        g.mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, g.slot_cap, 1, 1, g.n_slots);
         ggml_set_input(g.mask);
         ggml_set_name(g.mask, "mask");
     }
@@ -320,9 +344,9 @@ static ggml_tensor * prefill_run(const zonos2_model & m, const float * ids, int 
         for (int t = 0; t < n_tokens; ++t) col[t] = (int32_t) lroundf(ids[(size_t) t * W + k]);
         ggml_backend_tensor_set(g.ids[k], col.data(), 0, (size_t) n_tokens * sizeof(int32_t));
     }
-    if (g.pos) {
+    if (g.pos_rope) {
         for (int t = 0; t < n_tokens; ++t) col[t] = t; // contiguous 0-based positions
-        ggml_backend_tensor_set(g.pos, col.data(), 0, (size_t) n_tokens * sizeof(int32_t));
+        ggml_backend_tensor_set(g.pos_rope, col.data(), 0, (size_t) n_tokens * sizeof(int32_t));
     }
     if (g.spk) {
         ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
@@ -450,7 +474,7 @@ static int generate_recompute(const zonos2_model & m, const float * prompt_ids, 
             ggml_backend_tensor_set(g.ids[k], col.data(), 0, (size_t) n * sizeof(int32_t));
         }
         for (int t = 0; t < n; ++t) col[t] = t;
-        ggml_backend_tensor_set(g.pos, col.data(), 0, (size_t) n * sizeof(int32_t));
+        ggml_backend_tensor_set(g.pos_rope, col.data(), 0, (size_t) n * sizeof(int32_t));
         if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) hp.spk_dim * sizeof(float));
 
         if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
@@ -497,152 +521,237 @@ static int generate_recompute(const zonos2_model & m, const float * prompt_ids, 
 }
 
 // ---------------------------------------------------------------------------
-// KV cache + real-time generation
+// Batched / continuous-batching runtime (KV cache + real-time generation)
 // ---------------------------------------------------------------------------
 
-bool zonos2_context_init(zonos2_context & c, const zonos2_model & m, int max_seq) {
-    c.model = &m; c.max_seq = max_seq; c.n_past = 0;
-    const int hd = (int) m.hp.head_dim, nkv = (int) m.hp.n_head_kv, nl = (int) m.hp.n_layer;
+static int round_up_256(int x) { return ((x + 255) / 256) * 256; }
 
+bool zonos2_batch_init(zonos2_batch_ctx & bc, const zonos2_model & m, int n_slots, int slot_cap_frames) {
+    const zonos2_hparams & hp = m.hp;
+    bc = zonos2_batch_ctx();
+    bc.model    = &m;
+    bc.n_slots  = n_slots;
+    bc.slot_cap = round_up_256(slot_cap_frames);
+    bc.W   = (int) hp.n_codebooks + 1;
+    bc.ncb = (int) hp.n_codebooks;
+    bc.av  = (int) hp.audio_vocab;
+
+    const int hd = (int) hp.head_dim, nkv = (int) hp.n_head_kv, nl = (int) hp.n_layer;
+    const int64_t total = (int64_t) n_slots * bc.slot_cap;
+
+    // unified KV cache [hd, n_slots*slot_cap, nkv] per layer; slot s owns rows [s*slot_cap, ...)
     struct ggml_init_params ip = { ggml_tensor_overhead() * (size_t) (2 * nl + 8), nullptr, /*no_alloc=*/ true };
-    c.ctx_kv = ggml_init(ip);
-    c.k_cache.resize(nl);
-    c.v_cache.resize(nl);
+    bc.ctx_kv = ggml_init(ip);
+    bc.k_cache.resize(nl);
+    bc.v_cache.resize(nl);
     for (int i = 0; i < nl; ++i) {
-        // F16 layout [head_dim, max_seq, n_head_kv]: set_rows writes a position (ne1) and the
-        // tensor is directly usable as flash-attn K/V (contiguous in head_dim, no conversion).
-        c.k_cache[i] = ggml_new_tensor_3d(c.ctx_kv, GGML_TYPE_F16, hd, max_seq, nkv);
-        c.v_cache[i] = ggml_new_tensor_3d(c.ctx_kv, GGML_TYPE_F16, hd, max_seq, nkv);
-        ggml_set_name(c.k_cache[i], ("k_cache." + std::to_string(i)).c_str());
-        ggml_set_name(c.v_cache[i], ("v_cache." + std::to_string(i)).c_str());
+        bc.k_cache[i] = ggml_new_tensor_3d(bc.ctx_kv, GGML_TYPE_F16, hd, total, nkv);
+        bc.v_cache[i] = ggml_new_tensor_3d(bc.ctx_kv, GGML_TYPE_F16, hd, total, nkv);
+        ggml_set_name(bc.k_cache[i], ("k_cache." + std::to_string(i)).c_str());
+        ggml_set_name(bc.v_cache[i], ("v_cache." + std::to_string(i)).c_str());
     }
-    c.buf_kv = ggml_backend_alloc_ctx_tensors(c.ctx_kv, m.backend);
-    if (!c.buf_kv) { fprintf(stderr, "zonos2: KV cache alloc failed (%d seq)\n", max_seq); return false; }
-    ggml_backend_buffer_clear(c.buf_kv, 0); // zero so masked-out (unwritten) positions never NaN
-    c.galloc = ggml_gallocr_new(m.buft);
-    return c.galloc != nullptr;
+    bc.buf_kv = ggml_backend_alloc_ctx_tensors(bc.ctx_kv, m.backend);
+    if (!bc.buf_kv) {
+        fprintf(stderr, "zonos2: batch KV alloc failed (%d slots x %d cap)\n", n_slots, bc.slot_cap);
+        zonos2_batch_free(bc); return false;
+    }
+    ggml_backend_buffer_clear(bc.buf_kv, 0); // zero so idle / unwritten positions never NaN
+
+    // persistent decode graph: built + allocated once with g.n = n_slots, replayed every step.
+    struct ggml_init_params ipd = { (size_t) 64 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
+    bc.ctx_dec = ggml_init(ipd);
+    gctx gd; gd.m = &m; gd.ctx = bc.ctx_dec; gd.n = n_slots; gd.capture = false;
+    gd.kc = &bc.k_cache; gd.vc = &bc.v_cache; gd.decode = true;
+    gd.n_slots = n_slots; gd.slot_cap = bc.slot_cap;
+    bc.gfd = ggml_new_graph_custom(bc.ctx_dec, 16384, false); gd.gf = bc.gfd;
+    ggml_tensor * logits = build_graph(gd, -1); ggml_set_output(logits);
+    ggml_build_forward_expand(bc.gfd, logits);
+    bc.galloc_dec = ggml_gallocr_new(m.buft);
+    if (!bc.galloc_dec || !ggml_gallocr_alloc_graph(bc.galloc_dec, bc.gfd)) {
+        fprintf(stderr, "zonos2: batch decode graph alloc failed\n");
+        zonos2_batch_free(bc); return false;
+    }
+    bc.dec_ids       = gd.ids;
+    bc.dec_pos_rope  = gd.pos_rope;
+    bc.dec_pos_cache = gd.pos_cache;
+    bc.dec_mask      = gd.mask;
+    bc.dec_logits    = logits;
+
+    bc.galloc_prefill = ggml_gallocr_new(m.buft);
+
+    bc.h_ids.assign((size_t) bc.W * n_slots, 0);
+    bc.h_pos_rope.assign(n_slots, 0);
+    bc.h_pos_cache.assign(n_slots, 0);
+    bc.h_mask.assign((size_t) bc.slot_cap * n_slots, 0);
+    bc.h_logits.assign((size_t) n_slots * bc.av * bc.ncb, 0.0f);
+    return bc.galloc_prefill != nullptr;
 }
 
-void zonos2_context_free(zonos2_context & c) {
-    if (c.galloc) ggml_gallocr_free(c.galloc);
-    if (c.buf_kv) ggml_backend_buffer_free(c.buf_kv);
-    if (c.ctx_kv) ggml_free(c.ctx_kv);
-    c = zonos2_context();
+void zonos2_batch_free(zonos2_batch_ctx & bc) {
+    if (bc.galloc_dec)     ggml_gallocr_free(bc.galloc_dec);
+    if (bc.galloc_prefill) ggml_gallocr_free(bc.galloc_prefill);
+    if (bc.ctx_dec)        ggml_free(bc.ctx_dec);
+    if (bc.buf_kv)         ggml_backend_buffer_free(bc.buf_kv);
+    if (bc.ctx_kv)         ggml_free(bc.ctx_kv);
+    bc = zonos2_batch_ctx();
+}
+
+bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * prompt_ids, int n0,
+                               const float * spk, int spk_pos, float * out_logits) {
+    const zonos2_model & m = *bc.model;
+    const int W = bc.W, S = bc.slot_cap, av = bc.av, ncb = bc.ncb;
+    if (n0 <= 0 || n0 > S) {
+        fprintf(stderr, "zonos2: prefill n0=%d exceeds slot_cap=%d\n", n0, S);
+        return false;
+    }
+    // single-sequence prefill graph writing K/V into this slot's band [slot*S, slot*S+n0).
+    struct ggml_init_params ip = { (size_t) 256 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    gctx g; g.m = &m; g.ctx = ctx; g.n = n0; g.capture = false;
+    g.spk_pos = spk ? spk_pos : -1;
+    g.kc = &bc.k_cache; g.vc = &bc.v_cache; g.decode = false; g.n_slots = 1; g.slot_cap = S;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false); g.gf = gf;
+    ggml_tensor * logits = build_graph(g, -1); ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+    bool ok = ggml_gallocr_alloc_graph(bc.galloc_prefill, gf);
+    if (ok) {
+        std::vector<int32_t> col(n0);
+        for (int k = 0; k < W; ++k) {
+            for (int t = 0; t < n0; ++t) col[t] = (int32_t) lroundf(prompt_ids[(size_t) t * W + k]);
+            ggml_backend_tensor_set(g.ids[k], col.data(), 0, (size_t) n0 * sizeof(int32_t));
+        }
+        for (int t = 0; t < n0; ++t) col[t] = t;                  // logical rope positions
+        ggml_backend_tensor_set(g.pos_rope, col.data(), 0, (size_t) n0 * sizeof(int32_t));
+        for (int t = 0; t < n0; ++t) col[t] = slot * S + t;       // absolute cache rows in this band
+        ggml_backend_tensor_set(g.pos_cache, col.data(), 0, (size_t) n0 * sizeof(int32_t));
+        if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
+        ok = ggml_backend_graph_compute(m.backend, gf) == GGML_STATUS_SUCCESS;
+        if (ok) ggml_backend_tensor_get(logits, out_logits, (size_t) (n0 - 1) * av * ncb * sizeof(float),
+                                        (size_t) av * ncb * sizeof(float));
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
+void zonos2_batch_step(zonos2_batch_ctx & bc, const std::vector<zonos2_slot *> & active) {
+    const zonos2_model & m = *bc.model;
+    const int N = bc.n_slots, W = bc.W, S = bc.slot_cap, av = bc.av, ncb = bc.ncb;
+    const uint16_t M0   = ggml_fp32_to_fp16(0.0f);
+    const uint16_t MINF = ggml_fp32_to_fp16(-INFINITY);
+
+    // default every column to idle: pad ids, position 0, mask exposing only this band's row 0.
+    for (int c = 0; c < N; ++c) {
+        for (int k = 0; k < W; ++k)
+            bc.h_ids[(size_t) k * N + c] = (k < ncb) ? (int32_t) m.hp.audio_pad_id : (int32_t) m.hp.text_vocab;
+        bc.h_pos_rope[c]  = 0;
+        bc.h_pos_cache[c] = (int32_t) ((size_t) c * S);
+        uint16_t * mc = &bc.h_mask[(size_t) c * S];
+        mc[0] = M0;
+        for (int p = 1; p < S; ++p) mc[p] = MINF;
+    }
+    // active columns: real next frame, logical position n_past, causal mask over [0, n_past].
+    for (zonos2_slot * sp : active) {
+        if (!sp || !sp->active || sp->done) continue;
+        const int c = sp->index;
+        for (int k = 0; k < W; ++k) bc.h_ids[(size_t) k * N + c] = sp->next_ids[k];
+        bc.h_pos_rope[c]  = sp->n_past;
+        bc.h_pos_cache[c] = (int32_t) ((size_t) c * S + sp->n_past);
+        uint16_t * mc = &bc.h_mask[(size_t) c * S];
+        for (int p = 0; p < S; ++p) mc[p] = (p <= sp->n_past) ? M0 : MINF;
+    }
+
+    for (int k = 0; k < W; ++k)
+        ggml_backend_tensor_set(bc.dec_ids[k], &bc.h_ids[(size_t) k * N], 0, (size_t) N * sizeof(int32_t));
+    ggml_backend_tensor_set(bc.dec_pos_rope,  bc.h_pos_rope.data(),  0, (size_t) N * sizeof(int32_t));
+    ggml_backend_tensor_set(bc.dec_pos_cache, bc.h_pos_cache.data(), 0, (size_t) N * sizeof(int32_t));
+    ggml_backend_tensor_set(bc.dec_mask,      bc.h_mask.data(),      0, (size_t) S * N * sizeof(uint16_t));
+
+    ggml_backend_graph_compute(m.backend, bc.gfd);
+    ggml_backend_tensor_get(bc.dec_logits, bc.h_logits.data(), 0,
+                            (size_t) N * av * ncb * sizeof(float));
+
+    for (zonos2_slot * sp : active)
+        if (sp && sp->active && !sp->done) sp->n_past += 1;
+}
+
+const float * zonos2_batch_slot_logits(const zonos2_batch_ctx & bc, int index) {
+    return bc.h_logits.data() + (size_t) index * bc.av * bc.ncb;
+}
+
+bool zonos2_slot_sample(const zonos2_model & m, zonos2_slot & s, zonos2_sampler & smp,
+                        const float * logits, std::vector<int32_t> & out_codes,
+                        int max_frames, const zonos2_frame_cb & on_frame) {
+    const int ncb = (int) m.hp.n_codebooks, av = (int) m.hp.audio_vocab, W = ncb + 1;
+    std::vector<int> frame(ncb);
+    for (int cb = 0; cb < ncb; ++cb) frame[cb] = smp.sample(&logits[(size_t) cb * av], cb);
+    smp.accept(frame);
+    for (int cb = 0; cb < ncb; ++cb) out_codes.push_back(frame[cb]);
+
+    const int frame_idx = s.step;
+    bool keep = true;
+    if (on_frame) {
+        const std::vector<int32_t> fc(frame.begin(), frame.end());
+        keep = on_frame(frame_idx, fc.data(), ncb);
+    }
+
+    int max_eoa = -1;
+    for (int cb = 0; cb < ncb; ++cb) if (frame[cb] == (int) m.hp.eoa_id) max_eoa = cb;
+    if (s.eos_frame < 0 && max_eoa >= 0) { s.eos_frame = std::max(0, frame_idx - max_eoa); s.countdown = ncb + 1; }
+    const bool finished = (s.countdown > 0 && --s.countdown == 0);
+
+    s.next_ids.resize(W);
+    for (int cb = 0; cb < ncb; ++cb) s.next_ids[cb] = frame[cb];
+    s.next_ids[ncb] = (int32_t) m.hp.text_vocab;
+    s.step += 1;
+    if (!keep || finished || s.step >= max_frames) s.done = true;
+    return keep;
 }
 
 // O(n) real-time path: one prefill, then single-token decodes against a persistent KV cache.
-// The decode graph is built + allocated ONCE and reused every step (only input data + cache
-// content change), so its node properties stay constant and ggml-cuda captures/replays it as a
-// CUDA graph — collapsing ~1731 kernel launches/step into one.
+// Implemented as the batch runtime at n_slots=1 — the unified cache collapses to [hd, slot_cap,
+// nkv] and the decode query is [hd,1,nh,1], so it routes through the same flash-attn vec kernel and
+// CUDA-graph replay as a dedicated single-sequence path (verified bit-exact). This keeps the CLI
+// and the server's continuous batcher on one code path.
 static int generate_kv(const zonos2_model & m, const float * prompt_ids, int n0,
                        int max_frames, const zonos2_sampling & sp,
                        std::vector<int32_t> & out_codes, int & eos_frame,
                        const float * spk, int spk_pos, const zonos2_frame_cb & on_frame) {
-    const zonos2_hparams & hp = m.hp;
-    const int W = (int) hp.n_codebooks + 1, ncb = (int) hp.n_codebooks, av = (int) hp.audio_vocab;
-    const int max_seq = ((n0 + max_frames + 8 + 255) / 256) * 256; // multiple of FATTN_KQ_STRIDE (flash vec kernel)
+    const int ncb = (int) m.hp.n_codebooks, av = (int) m.hp.audio_vocab;
+    eos_frame = -1;
 
-    zonos2_context c;
-    if (!zonos2_context_init(c, m, max_seq)) return 0;
+    zonos2_batch_ctx bc;
+    if (!zonos2_batch_init(bc, m, /*n_slots=*/1, /*slot_cap_frames=*/n0 + max_frames + 8)) return 0;
 
     zonos2_sampler smp(sp, ncb, av);
-    eos_frame = -1; int countdown = -1; int n_frames = 0;
-    std::vector<float> lo((size_t) av * ncb);
-    const size_t frame_bytes = (size_t) av * ncb * sizeof(float);
+    zonos2_slot slot;
+    slot.index = 0; slot.active = true; slot.n_past = n0;
 
-    // ---- prefill (one-off graph): populate the cache, get frame-0 logits ----
-    {
-        struct ggml_init_params ip = { (size_t) 256 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
-        ggml_context * ctx = ggml_init(ip);
-        gctx g; g.m = &m; g.ctx = ctx; g.n = n0; g.capture = false;
-        g.spk_pos = spk ? spk_pos : -1;
-        g.kc = &c.k_cache; g.vc = &c.v_cache; g.max_kv = max_seq; g.decode = false;
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false); g.gf = gf;
-        ggml_tensor * logits = build_graph(g, -1); ggml_set_output(logits);
-        ggml_build_forward_expand(gf, logits);
-        bool ok = ggml_gallocr_alloc_graph(c.galloc, gf);
-        if (ok) {
-            std::vector<int32_t> col(n0);
-            for (int k = 0; k < W; ++k) {
-                for (int t = 0; t < n0; ++t) col[t] = (int32_t) lroundf(prompt_ids[(size_t) t * W + k]);
-                ggml_backend_tensor_set(g.ids[k], col.data(), 0, (size_t) n0 * sizeof(int32_t));
-            }
-            for (int t = 0; t < n0; ++t) col[t] = t;
-            ggml_backend_tensor_set(g.pos, col.data(), 0, (size_t) n0 * sizeof(int32_t));
-            if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) hp.spk_dim * sizeof(float));
-            ok = ggml_backend_graph_compute(m.backend, gf) == GGML_STATUS_SUCCESS;
-            if (ok) ggml_backend_tensor_get(logits, lo.data(), (size_t) (n0 - 1) * frame_bytes, frame_bytes);
-        }
-        ggml_free(ctx);
-        if (!ok) { zonos2_context_free(c); return 0; }
-    }
-    c.n_past = n0;
-
-    // ---- persistent decode graph: built + allocated once, reused every step ----
-    struct ggml_init_params ipd = { (size_t) 64 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
-    ggml_context * ctx_dec = ggml_init(ipd);
-    gctx gd; gd.m = &m; gd.ctx = ctx_dec; gd.n = 1; gd.capture = false;
-    gd.kc = &c.k_cache; gd.vc = &c.v_cache; gd.max_kv = max_seq; gd.decode = true;
-    ggml_cgraph * gfd = ggml_new_graph_custom(ctx_dec, 16384, false); gd.gf = gfd;
-    ggml_tensor * dlogits = build_graph(gd, -1); ggml_set_output(dlogits);
-    ggml_build_forward_expand(gfd, dlogits);
-    ggml_gallocr_t galloc_dec = ggml_gallocr_new(m.buft);
-    if (!ggml_gallocr_alloc_graph(galloc_dec, gfd)) {
-        fprintf(stderr, "generate: decode graph alloc failed\n");
-        ggml_gallocr_free(galloc_dec); ggml_free(ctx_dec); zonos2_context_free(c); return 0;
+    std::vector<float> logits((size_t) av * ncb);
+    if (!zonos2_batch_slot_prefill(bc, 0, prompt_ids, n0, spk, spk_pos, logits.data())) {
+        zonos2_batch_free(bc); return 0;
     }
 
-    std::vector<int32_t> idcol(1);
-    std::vector<ggml_fp16_t> maskbuf(max_seq);
-    const ggml_fp16_t MASK0 = ggml_fp32_to_fp16(0.0f);
-    const ggml_fp16_t MASKINF = ggml_fp32_to_fp16(-INFINITY);
-
-    int decode_steps = 0;
+    const std::vector<zonos2_slot *> active = { &slot };
+    int n_frames = 0, decode_steps = 0;
     auto t0 = std::chrono::steady_clock::now();
-    for (int step = 0; step < max_frames; ++step) {
-        std::vector<int> frame(ncb);
-        for (int cb = 0; cb < ncb; ++cb) frame[cb] = smp.sample(&lo[(size_t) cb * av], cb);
-        smp.accept(frame);
-        for (int cb = 0; cb < ncb; ++cb) out_codes.push_back(frame[cb]);
+    for (;;) {
+        zonos2_slot_sample(m, slot, smp, logits.data(), out_codes, max_frames, on_frame);
         ++n_frames;
-
-        if (on_frame) {
-            const std::vector<int32_t> fc(frame.begin(), frame.end());
-            if (!on_frame(n_frames - 1, fc.data(), ncb)) break;   // client aborted
-        }
-
-        int max_eoa = -1;
-        for (int cb = 0; cb < ncb; ++cb) if (frame[cb] == (int) hp.eoa_id) max_eoa = cb;
-        if (eos_frame < 0 && max_eoa >= 0) { eos_frame = std::max(0, step - max_eoa); countdown = ncb + 1; }
-        const bool finished = (countdown > 0 && --countdown == 0);
-        if (finished || step + 1 >= max_frames) break;
-
-        // decode the sampled frame at position c.n_past: set_rows writes it, mask exposes [0, n_past]
-        const int pos = c.n_past;
-        for (int k = 0; k < W; ++k) {
-            idcol[0] = (k < ncb) ? frame[k] : (int) hp.text_vocab;
-            ggml_backend_tensor_set(gd.ids[k], idcol.data(), 0, sizeof(int32_t));
-        }
-        idcol[0] = pos;
-        ggml_backend_tensor_set(gd.pos, idcol.data(), 0, sizeof(int32_t));
-        for (int j = 0; j < max_seq; ++j) maskbuf[j] = (j <= pos) ? MASK0 : MASKINF;
-        ggml_backend_tensor_set(gd.mask, maskbuf.data(), 0, (size_t) max_seq * sizeof(ggml_fp16_t));
-
-        if (ggml_backend_graph_compute(m.backend, gfd) != GGML_STATUS_SUCCESS) break;
-        ggml_backend_tensor_get(dlogits, lo.data(), 0, frame_bytes);
-        c.n_past += 1;
+        if (slot.done) break;
+        zonos2_batch_step(bc, active);
+        memcpy(logits.data(), zonos2_batch_slot_logits(bc, 0), (size_t) av * ncb * sizeof(float));
         ++decode_steps;
     }
-    {
+    eos_frame = slot.eos_frame;
+
+    if (decode_steps > 0) {
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const double frame_s = 512.0 / 44100.0; // one codebook frame at 44.1 kHz
         fprintf(stderr, "generate(kv): %d decode steps in %.3fs = %.1f frames/s (real-time = %.1f), RTF=%.2f\n",
                 decode_steps, dt, decode_steps / dt, 1.0 / frame_s, (dt / decode_steps) / frame_s);
     }
 
-    ggml_gallocr_free(galloc_dec);
-    ggml_free(ctx_dec);
-    zonos2_context_free(c);
+    zonos2_batch_free(bc);
     return n_frames;
 }
 
