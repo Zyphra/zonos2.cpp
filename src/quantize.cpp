@@ -3,9 +3,9 @@
 // Takes the lossless F16 backbone GGUF (e.g. the one published on HF) and writes a
 // quantized copy, mirroring the policy in models/convert-zonos2-to-gguf.py:
 //   - 1-D tensors (norms / biases / temp / eda-scale) are kept as-is (F32).
-//   - the quant-sensitive set (output head, token+audio embeddings, MoE routers)
-//     is kept one tier ABOVE the bulk quant (F16 when bulk is Q8_0/legacy,
-//     else Q8_0).
+//   - the quant-sensitive set (output head, token+audio embeddings, MoE routers,
+//     speaker projection) is kept one tier ABOVE the bulk quant (F16 when bulk is
+//     Q8_0/legacy, else Q8_0).
 //   - every other 2-D/3-D matrix takes the requested bulk quant, falling back to
 //     F16 if its row length isn't a multiple of the quant block size.
 // Quantization is ggml_quantize_chunk, so K-quants (Q4_K, Q5_K, Q6_K, ...) work
@@ -41,12 +41,18 @@ static const qtype QTYPES[] = {
     { "q4_k", GGML_TYPE_Q4_K, 15 }, { "q5_k", GGML_TYPE_Q5_K, 17 },
     { "q6_k", GGML_TYPE_Q6_K, 18 },
     { "iq4_nl", GGML_TYPE_IQ4_NL, 25 }, { "iq4_xs", GGML_TYPE_IQ4_XS, 23 },
+    { "iq3_xxs", GGML_TYPE_IQ3_XXS, 23 }, { "iq3_s", GGML_TYPE_IQ3_S, 26 },
 };
 
 // Tensors kept near-lossless even in a quantized file (see convert-zonos2-to-gguf.py):
 // the output head, the token/audio embedding tables, and the per-layer MoE routers.
 static bool is_high_precision(const std::string & n) {
     if (n == "output.weight" || n == "text_embd.weight") return true;
+    // Speaker projection: its output REPLACES the embedding at spk_pos (not a residual add),
+    // so it seeds the whole residual stream with no downstream averaging. The two-stage
+    // lda->proj is a low-dim speaker code where direction is what SpkSim measures; even Q8_0's
+    // blockwise absmax tanks SpkSim (~66->48) flat across all bulk tiers. ~8 MB to keep at F16.
+    if (n == "spk_lda.weight" || n == "spk_proj.weight") return true;
     if (n.rfind("audio_embd.", 0) == 0) return true;
     if (n.rfind("blk.", 0) == 0 && (n.find(".router_down.") != std::string::npos || n.find(".router_mlp") != std::string::npos)) return true;
     return false;
@@ -107,11 +113,12 @@ static void quantize_with_imatrix(ggml_type tt, const float * src, void * dst,
     }
 }
 
-static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_only, bool down_tier_up) {
+static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_only, bool down_tier_up, bool spine_f16) {
     if (ggml_n_dims(t) == 1)        return t->type;                  // 1-D: keep (F32)
     const std::string n = ggml_get_name(t);
     if (experts_only && !is_expert(n)) {
         if (is_high_precision(n)) return GGML_TYPE_F16;
+        if (spine_f16) return GGML_TYPE_F16;                          // spine fully F16 (A/B: q8 spine vs lossless)
         return (t->ne[0] % 32 == 0) ? GGML_TYPE_Q8_0 : GGML_TYPE_F16; // spine stays q8_0
     }
     if (down_tier_up && is_expert(n) && n.find("ffn_down_exps") != std::string::npos) {
@@ -124,12 +131,13 @@ static ggml_type pick_qtype(const ggml_tensor * t, ggml_type bulk, bool experts_
 }
 
 int main(int argc, char ** argv) {
-    bool experts_only = false, down_tier_up = false;
+    bool experts_only = false, down_tier_up = false, spine_f16 = false;
     const char * imat_path = nullptr;
     std::vector<const char *> pos;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--experts-only")) experts_only = true;
         else if (!strcmp(argv[i], "--down-tier-up")) down_tier_up = true;
+        else if (!strcmp(argv[i], "--spine-f16"))    spine_f16 = true;
         else if (!strcmp(argv[i], "--imatrix") && i + 1 < argc) imat_path = argv[++i];
         else pos.push_back(argv[i]);
     }
@@ -171,7 +179,7 @@ int main(int argc, char ** argv) {
     size_t need = 0;
     for (int64_t i = 0; i < n_tensors; i++) {
         ggml_tensor * t = ggml_get_tensor(ctx_in, gguf_get_tensor_name(gin, i));
-        const ggml_type tt = pick_qtype(t, bulk, experts_only, down_tier_up);
+        const ggml_type tt = pick_qtype(t, bulk, experts_only, down_tier_up, spine_f16);
         need += ggml_row_size(tt, t->ne[0]) * (ggml_nelements(t) / t->ne[0]);
     }
     need += (size_t) (n_tensors + 1) * ggml_tensor_overhead() + (1u << 20);
@@ -187,11 +195,16 @@ int main(int argc, char ** argv) {
     int n_quant = 0, n_kept = 0, n_imat = 0;
     for (int64_t i = 0; i < n_tensors; i++) {
         ggml_tensor * t = ggml_get_tensor(ctx_in, gguf_get_tensor_name(gin, i));
-        const ggml_type tt = pick_qtype(t, bulk, experts_only, down_tier_up);
+        const ggml_type tt = pick_qtype(t, bulk, experts_only, down_tier_up, spine_f16);
         const int64_t   ne0 = t->ne[0], n = ggml_nelements(t);
 
         ggml_tensor * d = ggml_new_tensor(ctx_out, tt, ggml_n_dims(t), t->ne);
         ggml_set_name(d, ggml_get_name(t));
+
+        // Progress: print BEFORE the work so the slow IQ4/K-quant expert tensors are visible
+        // while they run (stderr is unbuffered). '=' means kept as-is, '->' means requantized.
+        fprintf(stderr, "[%4lld/%lld] %-32s %s %s %s\n", (long long) (i + 1), (long long) n_tensors,
+                ggml_get_name(t), ggml_type_name(t->type), tt == t->type ? "==" : "->", ggml_type_name(tt));
 
         if (tt == t->type) {                            // kept (F32 1-D, or F16 sensitive)
             memcpy(d->data, t->data, ggml_nbytes(t));
