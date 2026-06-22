@@ -58,6 +58,7 @@ struct gctx {
     int  n_slots  = 1;                          // batch slots = ne3 of the decode attention
     int  slot_cap = 0;                          // per-slot cache rows (multiple of FATTN stride 256)
     ggml_tensor * mask = nullptr;               // [slot_cap, 1, 1, n_slots] additive mask (decode only)
+    ggml_tensor * mask_causal = nullptr;        // [n, n] F16 causal additive mask (prefill / non-decode)
     ggml_cgraph * gf = nullptr;                 // graph, for inline set_rows expansion
 
     // mark a tensor as a captured (read-back) graph output
@@ -70,6 +71,19 @@ struct gctx {
         return t;
     }
 };
+
+// Fill an [n_kv, n_q] F16 causal additive mask: 0 where key kv <= query q, -inf above the
+// diagonal. Element (kv, q) lives at index q*n + kv. Positions are the contiguous 0..n-1 used
+// by every prefill / non-decode graph, so the same lower-triangular mask serves all of them.
+static void set_causal_mask(ggml_tensor * t, int n) {
+    std::vector<ggml_fp16_t> mk((size_t) n * n);
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int q = 0; q < n; ++q)
+        for (int kv = 0; kv < n; ++kv)
+            mk[(size_t) q * n + kv] = (kv <= q) ? zero : ninf;
+    ggml_backend_tensor_set(t, mk.data(), 0, mk.size() * sizeof(ggml_fp16_t));
+}
 
 // RMSNorm with learnable weight (w may be null for the weightless emb_norm).
 static ggml_tensor * rms_w(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, float eps) {
@@ -136,16 +150,16 @@ static ggml_tensor * build_attention(gctx & g, ggml_tensor * cur, const zonos2_l
         }
     }
     if (!kqv) {
-        // manual causal self-attention over the n tokens (prefill / validate / recompute)
-        ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3)); // [hd, n, nh]
-        ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, n, nkv]
-        ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);                        // [n, n, nh]
-        kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float) hd));
-        kq = ggml_diag_mask_inf(ctx, kq, 0);
-        kq = ggml_soft_max(ctx, kq);
-        ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3)); // [n, hd, nkv]
-        kqv = ggml_mul_mat(ctx, vp, kq);                                     // [hd, n, nh]
-        kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));            // [hd, nh, n]
+        // causal self-attention over the n tokens (prefill / validate / recompute) via flash
+        // attention. ggml_diag_mask_inf has no Metal kernel, so we mask through the same
+        // flash_attn_ext path the decode branch uses, with an F16 [n_kv, n_q] causal mask.
+        // Unpadded n_kv/n_q is fine: CUDA picks the ncols2==1 oob-checked kernel, Metal pads KV
+        // internally, CPU indexes mask rows directly. Output is [hd, nh, n] — no final permute.
+        ggml_tensor * qf = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3)); // [hd, n, nh]
+        ggml_tensor * kf = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, n, nkv]
+        ggml_tensor * vf = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3)); // [hd, n, nkv]
+        kqv = ggml_flash_attn_ext(ctx, qf, kf, vf, g.mask_causal, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
+        kqv = ggml_reshape_3d(ctx, kqv, hd, nh, n);                          // [hd, nh, n]
     }
 
 
@@ -259,6 +273,11 @@ ggml_tensor * build_graph(gctx & g, int n_layer_limit) {
             ggml_set_input(g.pos_cache);
             ggml_set_name(g.pos_cache, "pos_cache");
         }
+        if (!g.decode) { // causal mask consumed by the prefill flash-attention branch
+            g.mask_causal = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, g.n, g.n);
+            ggml_set_input(g.mask_causal);
+            ggml_set_name(g.mask_causal, "mask_causal");
+        }
     }
     if (g.decode) {
         // per-slot causal mask on ne3; ne2 must stay 1 for the FATTN kernel selector. F16 required.
@@ -348,6 +367,7 @@ static ggml_tensor * prefill_run(const zonos2_model & m, const float * ids, int 
         for (int t = 0; t < n_tokens; ++t) col[t] = t; // contiguous 0-based positions
         ggml_backend_tensor_set(g.pos_rope, col.data(), 0, (size_t) n_tokens * sizeof(int32_t));
     }
+    if (g.mask_causal) set_causal_mask(g.mask_causal, n_tokens);
     if (g.spk) {
         ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
     }
@@ -475,6 +495,7 @@ static int generate_recompute(const zonos2_model & m, const float * prompt_ids, 
         }
         for (int t = 0; t < n; ++t) col[t] = t;
         ggml_backend_tensor_set(g.pos_rope, col.data(), 0, (size_t) n * sizeof(int32_t));
+        if (g.mask_causal) set_causal_mask(g.mask_causal, n);
         if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) hp.spk_dim * sizeof(float));
 
         if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
@@ -624,6 +645,7 @@ bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * pr
         ggml_backend_tensor_set(g.pos_rope, col.data(), 0, (size_t) n0 * sizeof(int32_t));
         for (int t = 0; t < n0; ++t) col[t] = slot * S + t;       // absolute cache rows in this band
         ggml_backend_tensor_set(g.pos_cache, col.data(), 0, (size_t) n0 * sizeof(int32_t));
+        if (g.mask_causal) set_causal_mask(g.mask_causal, n0);
         if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
         ok = ggml_backend_graph_compute(m.backend, gf) == GGML_STATUS_SUCCESS;
         if (ok) ggml_backend_tensor_get(logits, out_logits, (size_t) (n0 - 1) * av * ncb * sizeof(float),
