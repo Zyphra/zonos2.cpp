@@ -31,10 +31,12 @@ zonos2-cli out/zonos2-q8_0.gguf --tts "Hello, world." out.wav \
   PCM, OpenAI `/v1/audio/speech`, in-process reference-audio voice cloning, and a browser UI.
 - **Numerically validated against the PyTorch reference** at every stage — the backbone to
   cosine ≥ 0.9999 / matching argmax, the speaker encoder and DAC decoder **bit-exact**.
-- **Quantization:** F16 (lossless from the bf16 checkpoint), **Q8_0** (7.7 GB, quant-sensitive
-  matrices kept at F16), and **experts-only K-quants** — `quantize-cli --experts-only` puts
-  Q4_K/Q3_K on the MoE experts while pinning the spine at Q8_0, matching Q8_0 quality at ~45%
-  the size. Quant quality is scored with the `zonos2-perplexity` KL-divergence tool.
+- **Quantization:** F16 (lossless from the bf16 checkpoint) plus an **F16-spine expert ladder** —
+  `quantize-cli --experts-only --spine-f16` keeps the whole spine (attention, dense FFN, router,
+  embeddings, head) at F16 and K-quants only the MoE experts. The full-precision spine keeps the
+  router on-distribution, so audio quality (WER/SpkSim/UTMOS) stays within eval noise of F16 all
+  the way down to **Q4_K (4.9 GB)**. Quant quality is scored with the `zonos2-perplexity`
+  KL-divergence tool.
 
 ## Repository layout
 
@@ -105,18 +107,19 @@ the DAC and speaker-encoder files (identical to what the converter emits):
 hf download Zyphra/ZONOS2-GGUF zonos2-f16.gguf dac.gguf spk-encoder.gguf --local-dir out
 ```
 
-Ready-made **experts-only quants** of the backbone are also published — drop-in replacements
+Ready-made **F16-spine expert quants** of the backbone are also published — drop-in replacements
 for `zonos2-f16.gguf` that pair with the same `dac.gguf` / `spk-encoder.gguf` (quality and
 sizes in [Quantization](#quantization)):
 
 ```bash
-# pick one; Q4_K matches Q8_0 quality at ~45% the size, Q3_K is the aggressive-but-safe pick
-hf download Zyphra/ZONOS2-GGUF zonos2-q4_k-experts.gguf --local-dir out   # 4.6 GB
-hf download Zyphra/ZONOS2-GGUF zonos2-q3_k-experts.gguf --local-dir out   # 3.6 GB
-hf download Zyphra/ZONOS2-GGUF zonos2-q2_k-experts.gguf --local-dir out   # 2.9 GB, edge of usable
+# pick one; Q8_0 is effectively lossless, Q4_K is the smallest that still holds audio quality
+hf download Zyphra/ZONOS2-GGUF zonos2-q8_0.gguf --local-dir out   # 8.5 GB
+hf download Zyphra/ZONOS2-GGUF zonos2-q6_k.gguf --local-dir out   # 6.8 GB
+hf download Zyphra/ZONOS2-GGUF zonos2-q5_k.gguf --local-dir out   # 5.8 GB
+hf download Zyphra/ZONOS2-GGUF zonos2-q4_k.gguf --local-dir out   # 4.9 GB
 
 # then use it like any backbone, e.g.
-zonos2-cli out/zonos2-q4_k-experts.gguf --tts "Hello." out.wav --dac out/dac.gguf --gpu
+zonos2-cli out/zonos2-q4_k.gguf --tts "Hello." out.wav --dac out/dac.gguf --gpu
 ```
 
 From the F16 backbone you can make any quantization locally with `quantize-cli` — no
@@ -348,15 +351,18 @@ Measured on one H100 with `zonos2-q8_0.gguf` (decode is the dominant cost):
 
 - **F16** — lossless for these in-range bf16 weights; one file serves every backend. The
   published master on HF and the input to `quantize-cli`.
-- **Q8_0** — bulk 2-D/3-D matrices at Q8_0, 1-D at F32, and the quant-sensitive tensors
+- **Q8_0 (full)** — bulk 2-D/3-D matrices at Q8_0, 1-D at F32, and the quant-sensitive tensors
   (embedding tables, output head, all router weights) bumped to F16. 7.7 GB, +41 MB over
-  pure Q8_0, strictly better against golden; CUDA graphs still replay.
-- **K-quants (Q4_K … Q2_K)** — produced by `quantize-cli` via `ggml_quantize_chunk` (the
-  pure-Python converter can't emit them). **Do not K-quant the whole backbone.** Sub-8-bit
-  weights on the attention/dense-FFN spine perturb the residual just enough to flip the MoE
-  router's top-k expert choice, and the output then decorrelates — full Q4_K measures
-  KL-divergence **6.7** / top-1 **5%** vs F16, despite the quantizer itself being numerically
-  correct. Quantize the **experts only** (`--experts-only`) and keep the spine at Q8_0; see below.
+  pure Q8_0, strictly better against golden; CUDA graphs still replay. A solid one-file build,
+  but the F16-spine expert ladder below is both smaller and higher quality at matched size.
+- **Never K-quant the whole backbone.** Produced by `quantize-cli` via `ggml_quantize_chunk` (the
+  pure-Python converter can't emit K-quants), but sub-8-bit weights on the attention/dense-FFN
+  spine perturb the residual just enough to flip the MoE router's top-k expert choice, and the
+  output then decorrelates — full Q4_K measures KL-divergence **6.7** / top-1 **5%** vs F16,
+  despite the quantizer itself being numerically correct.
+- **F16 spine + K-quant experts** (recommended) — `--experts-only --spine-f16` keeps the entire
+  spine at F16 and applies the K-quant only to the MoE expert stacks (most of the weights, but
+  the bits they tolerate). This is the published HF ladder (Q4_K … Q8_0); see below.
 
 ### Making quants from the F16 GGUF
 
@@ -365,7 +371,7 @@ needed, so it runs straight off the HF download:
 
 ```bash
 quantize-cli out/zonos2-f16.gguf out/zonos2-q8_0.gguf q8_0
-quantize-cli out/zonos2-f16.gguf out/zonos2-q4_k-experts.gguf q4_k --experts-only
+quantize-cli out/zonos2-f16.gguf out/zonos2-q4_k.gguf q4_k --experts-only --spine-f16
 # types: q8_0 q4_0 q4_1 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k iq4_nl iq4_xs
 ```
 
@@ -377,25 +383,33 @@ the machine accordingly. Quantizing from F16 (vs the bf16 checkpoint) is numeric
 equivalent — f16 is lossless for these weights, so the result matches the converter's Q8_0 to
 within quantizer rounding (≈1 element in 4M off by one LSB).
 
-### Recommended: K-quant the experts only
+### Recommended: F16 spine + K-quant experts
 
 The MoE expert stacks (`ffn_{gate,up,down}_exps`) are most of the backbone's weights but
-tolerate low bits, because the router and the residual feeding it stay clean. `--experts-only`
-applies the requested type to the expert stacks and pins the spine at Q8_0 (the sensitive set
-— embeddings, output head, routers — stays F16, 1-D stays F32). KL-divergence vs the F16
-backbone, measured with `zonos2-perplexity` over the golden prompt (sizes as `quantize-cli`
-reports them, decimal GB):
+tolerate low bits, as long as the router and the residual feeding it stay clean.
+`--experts-only --spine-f16` keeps the **entire spine at F16** (attention, dense FFN, routers,
+embeddings, head; 1-D stays F32) and applies the K-quant only to the experts. The F16 spine —
+not imatrix calibration — is the dominant quality lever: it roughly halves free-run KLD versus a
+Q8_0 spine.
 
-| backbone | mean KLD | top-1 | PPL ratio | size |
-|---|---|---|---|---|
-| Q8_0 (full) | 0.0010 | 100% | 1.004 | 8.2 GB |
-| **Q4_K experts-only** | 0.0019 | 100% | 1.005 | 4.6 GB |
-| **Q3_K experts-only** | 0.0046 | 99.1% | 1.009 | 3.6 GB |
-| Q2_K experts-only | 0.157 | 99.1% | 1.16 | 2.9 GB |
-| Q4_K (full) | 6.73 | 5.1% | 848× | 4.5 GB |
+Two metric sets vs the F16 backbone, over a multispeaker free-run corpus (the golden prompt is
+useless for ranking — every quant scores ~100% top-1 on it). **KLD/Top-1** track per-frame
+logits (`zonos2-perplexity`); **WER** (Qwen3-ASR), **SpkSim**, and **UTMOS** are end-to-end audio:
 
-Q4_K-experts matches Q8_0 quality at ~45% the size; Q3_K is the aggressive-but-safe pick; Q2_K
-is where 2-bit expert error finally leaks into the residual (top-1 holds but the tail diverges).
+| backbone | bpw | size | KLD ↓ | Top-1 ↑ | WER ↓ | SpkSim ↑ | UTMOS ↑ |
+|---|---|---|---|---|---|---|---|
+| F16 (ref) | 16.0 | 15.3 GB | — | — | 2.79 | 66.75 | 4.40 |
+| **Q8_0** | 8.50 | 8.5 GB | 0.002 | 96.5% | 2.87 | 66.30 | 4.40 |
+| **Q6_K** | 6.56 | 6.8 GB | 0.007 | 92.9% | 3.07 | 66.12 | 4.40 |
+| **Q5_K** | 5.50 | 5.8 GB | 0.025 | 86.3% | 2.98 | 66.30 | 4.40 |
+| **Q4_K** | 4.50 | 4.9 GB | 0.072 | 76.9% | 3.00 | 64.54 | 4.36 |
+
+Although KLD and Top-1 degrade steadily as the experts shrink, **audio quality holds nearly flat
+down to Q4_K** — WER, speaker similarity, and UTMOS stay within eval noise of F16. Q8_0 is the
+effectively-lossless default; Q6_K is the sweet spot; **Q4_K (~4.25–4.5 bpw) is the usable floor**.
+Below that, 3-bit experts fall off a cliff (Q3_K / IQ3_S drop to ~57–59% top-1) and aren't worth
+shipping. At equal bpw, plain K-quants beat the IQ variants (IQ4_XS/NL, IQ3_S) on these experts —
+it's the codebook geometry, not the calibration — so prefer K-quant.
 
 ### Measuring quant quality (`zonos2-perplexity`)
 
@@ -406,18 +420,22 @@ codes. A two-pass base-file workflow keeps one model resident at a time, so the 
 computed once and reused for every quant:
 
 ```bash
-# 1) write reference distributions from the F16 backbone over a corpus of input-id .npy files
-zonos2-perplexity out/zonos2-f16.gguf --kl-divergence-base out/ref.kld out/golden/input_ids.npy
+# 1) write reference distributions from the F16 backbone. A single golden prompt can't rank
+#    quants (every quant scores ~100% top-1 on it); use a multispeaker free-run corpus instead.
+#    scripts/gen_kld_corpus.sh synthesizes voices + teacher-forced id traces into a manifest:
+scripts/gen_kld_corpus.sh   # writes out/kldcorp/*.npy + out/kld.manifest
+zonos2-perplexity out/zonos2-f16.gguf --kl-divergence-base out/ref-multi.kld.bin --manifest out/kld.manifest --gpu
 # 2) score any quant against that base — prints PPL, KLD mean/median/p99, top-1, per-codebook
-zonos2-perplexity out/zonos2-q4_k-experts.gguf --kl-divergence out/ref.kld
+zonos2-perplexity out/zonos2-q4_k.gguf --kl-divergence out/ref-multi.kld.bin --gpu
 # plain perplexity, no reference needed
 zonos2-perplexity out/zonos2-f16.gguf --perplexity out/golden/input_ids.npy
 ```
 
-The corpus is any set of `[n, n_codebooks+1]` input-id `.npy` files (e.g. from
-`zonos2-cli --build-prompt`, or a real prompt's `input_ids.npy`); pass several to average over
-a longer corpus. The base file embeds the input ids and the reference log-probs, so pass 2 needs
-only the base and the quant model.
+The corpus is any set of `[n, n_codebooks+1]` input-id `.npy` files (from `zonos2-cli
+--build-prompt` or `--dump-ids`, or a real prompt's `input_ids.npy`) — pass them directly, or via
+a `--manifest` that also attaches a speaker `.npy` per trace to exercise the cloned-speaker routes.
+The base file embeds the input ids and the reference log-probs, so pass 2 needs only the base and
+the quant model.
 
 ## Notes
 
