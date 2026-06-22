@@ -14,6 +14,7 @@
 #include "imatrix.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -25,21 +26,28 @@
 namespace {
 
 // base-file magic + format version; bump version on any layout change.
-const char     KLD_MAGIC[8] = { 'Z', '2', 'K', 'L', 'D', 'I', 'V', '1' };
-const uint32_t KLD_VERSION  = 1;
+// v2: per-sequence conditioning (each seq carries its own speaker vector + spk_pos)
+// replaces v1's single global speaker block, so one base can cover multi-speaker /
+// multi-path corpora. Old v1 bases are rejected (regenerate).
+const char     KLD_MAGIC[8] = { 'Z', '2', 'K', 'L', 'D', 'I', 'V', '2' };
+const uint32_t KLD_VERSION  = 2;
 
 struct sequence {
-    std::vector<float> ids;  // flattened row-major [n, W] as floats (npy convention)
+    std::vector<float> ids;        // flattened row-major [n, W] as floats (npy convention)
     int                n = 0;
+    std::vector<float> spk;        // per-sequence speaker embedding [spk_dim]; empty => no speaker
+    int                spk_pos = -1;
+    const float * spk_ptr() const { return spk.empty() ? nullptr : spk.data(); }
 };
 
 void usage(const char * a0) {
     fprintf(stderr,
         "usage: %s <model.gguf> --perplexity <ids.npy> [more.npy ...] [--speaker s.npy] [--cpu|--gpu]\n"
-        "       %s <ref.gguf>   --kl-divergence-base <base.bin> <ids.npy> [more.npy ...] [--speaker s.npy] [--cpu|--gpu]\n"
+        "       %s <ref.gguf>   --kl-divergence-base <base.bin> {<ids.npy>... [--speaker s.npy] | --manifest m.txt} [--cpu|--gpu]\n"
         "       %s <quant.gguf> --kl-divergence <base.bin> [--cpu|--gpu]\n"
-        "       %s <f16.gguf>   --imatrix-out <imatrix.bin> <ids.npy> [more.npy ...] [--imatrix-min-hits N] [--cpu|--gpu]\n"
-        "  (ids.npy: row-major [n, n_codebooks+1] input_ids, e.g. from `zonos2-cli --build-prompt`)\n",
+        "       %s <f16.gguf>   --imatrix-out <imatrix.bin> {<ids.npy>... | --manifest m.txt} [--imatrix-min-hits N] [--cpu|--gpu]\n"
+        "  (ids.npy: row-major [n, n_codebooks+1] input_ids, e.g. from `zonos2-cli --build-prompt`)\n"
+        "  (--manifest: per-line `ids.npy [speaker.npy [spk_pos]]` -- per-sequence conditioning for multi-speaker/multi-path bases)\n",
         a0, a0, a0, a0);
 }
 
@@ -58,6 +66,56 @@ bool load_ids(const std::string & path, int W, sequence & s) {
     s.n = (int) shape[0];
     if (s.n < 2) fprintf(stderr, "perplexity: %s: %d rows, no scorable events\n", path.c_str(), s.n);
     return true;
+}
+
+// Load a per-sequence speaker .npy ([spk_dim] or [1, spk_dim]) into s.spk; validate dim.
+bool load_seq_speaker(const std::string & path, uint32_t spk_dim, int spk_pos, sequence & s) {
+    std::vector<int64_t> sshape;
+    if (!npy::load_f32(path, s.spk, sshape) || s.spk.size() != spk_dim) {
+        fprintf(stderr, "perplexity: bad speaker npy %s (want %u-d)\n", path.c_str(), spk_dim);
+        return false;
+    }
+    s.spk_pos = spk_pos;
+    return true;
+}
+
+// Manifest: one trace per line, whitespace-separated `ids.npy [speaker.npy [spk_pos]]`.
+// A bare ids path => no-speaker (plain TTS) sequence. '#' starts a comment; blank lines skipped.
+// This is the "any path" lever: each trace carries its own conditioning, so one base file
+// can mix no-speaker, multi-speaker, and any conditioning-bucket variants.
+bool load_manifest(const std::string & path, int W, uint32_t spk_dim, std::vector<sequence> & seqs) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) { fprintf(stderr, "perplexity: cannot read manifest %s\n", path.c_str()); return false; }
+    char line[4096];
+    int lineno = 0;
+    bool ok = true;
+    while (ok && fgets(line, sizeof(line), f)) {
+        ++lineno;
+        if (char * h = strchr(line, '#')) *h = '\0';
+        std::string ids_p, spk_p; int spk_pos = 0;
+        // tokenize on whitespace
+        const char * p = line;
+        auto next_tok = [&](std::string & out) {
+            while (*p && isspace((unsigned char) *p)) ++p;
+            const char * st = p;
+            while (*p && !isspace((unsigned char) *p)) ++p;
+            out.assign(st, p - st);
+            return !out.empty();
+        };
+        if (!next_tok(ids_p)) continue;       // blank/comment-only line
+        std::string tok;
+        if (next_tok(spk_p)) { if (next_tok(tok)) spk_pos = atoi(tok.c_str()); }
+
+        seqs.emplace_back();
+        sequence & s = seqs.back();
+        if (!load_ids(ids_p, W, s)) { ok = false; break; }
+        if (!spk_p.empty()) {
+            if (spk_dim == 0) { fprintf(stderr, "perplexity: manifest line %d names a speaker but model has spk_dim=0\n", lineno); ok = false; break; }
+            if (!load_seq_speaker(spk_p, spk_dim, spk_pos, s)) { ok = false; break; }
+        }
+    }
+    fclose(f);
+    return ok;
 }
 
 // numerically-stable log-softmax over `n` logits into `logp`; reports argmax.
@@ -129,7 +187,7 @@ int run_perplexity(const zonos2_model & m, const std::vector<sequence> & seqs,
 // --kl-divergence-base : write reference distributions to base.bin (+ print ref PPL)
 // ---------------------------------------------------------------------------
 int run_kl_base(const zonos2_model & m, const std::string & base_path,
-                const std::vector<sequence> & seqs, const float * spk, int spk_pos) {
+                const std::vector<sequence> & seqs) {
     const auto & hp = m.hp;
     const int ncb = (int) hp.n_codebooks, av = (int) hp.audio_vocab, W = ncb + 1;
     const int pad = (int) hp.audio_pad_id;
@@ -143,21 +201,24 @@ int run_kl_base(const zonos2_model & m, const std::string & base_path,
     wr<uint32_t>(f, (uint32_t) ncb);
     wr<uint32_t>(f, (uint32_t) av);
     wr<uint32_t>(f, (uint32_t) pad);
-    // speaker conditioning (reproduced verbatim in pass 2)
-    const uint32_t spk_dim = spk ? hp.spk_dim : 0;
-    wr<uint32_t>(f, spk_dim);
-    wr<int32_t>(f, spk ? spk_pos : -1);
-    if (spk_dim) fwrite(spk, sizeof(float), spk_dim, f);
-    // sequences: lengths then ids
+    // per-sequence metadata: n, spk_pos, spk_dim (0 => no speaker) -- then ids (+ speaker if any)
     wr<uint32_t>(f, (uint32_t) seqs.size());
-    for (const auto & s : seqs) wr<uint32_t>(f, (uint32_t) s.n);
-    for (const auto & s : seqs) fwrite(s.ids.data(), sizeof(float), s.ids.size(), f);
+    for (const auto & s : seqs) {
+        wr<uint32_t>(f, (uint32_t) s.n);
+        wr<int32_t>(f, s.spk.empty() ? -1 : s.spk_pos);
+        wr<uint32_t>(f, (uint32_t) s.spk.size());     // == hp.spk_dim or 0
+    }
+    for (const auto & s : seqs) {
+        fwrite(s.ids.data(), sizeof(float), s.ids.size(), f);
+        if (!s.spk.empty()) fwrite(s.spk.data(), sizeof(float), s.spk.size(), f);
+    }
 
     // event blocks (iteration order MUST match run_kl_divergence): seq, t, cb
-    double tot_nll = 0.0; int64_t tot_cnt = 0, skipped = 0;
+    double tot_nll = 0.0; int64_t tot_cnt = 0, skipped = 0; int n_spk = 0;
     std::vector<float> logits, logp;
     for (const auto & s : seqs) {
-        if (!zonos2_logits(m, s.ids.data(), s.n, logits, spk, spk_pos)) { fclose(f); return 1; }
+        if (!s.spk.empty()) ++n_spk;
+        if (!zonos2_logits(m, s.ids.data(), s.n, logits, s.spk_ptr(), s.spk_pos >= 0 ? s.spk_pos : 0)) { fclose(f); return 1; }
         for (int t = 0; t + 1 < s.n; ++t) {
             for (int cb = 0; cb < ncb; ++cb) {
                 const int L = (int) lroundf(s.ids[(size_t) (t + 1) * W + cb]);
@@ -174,8 +235,8 @@ int run_kl_base(const zonos2_model & m, const std::string & base_path,
 
     if (tot_cnt == 0) { fprintf(stderr, "perplexity: no events scored\n"); return 1; }
     printf("\n=== kl-divergence base ===\n");
-    printf("wrote %s : %lld events, ncb=%d, audio_vocab=%d%s\n", base_path.c_str(),
-           (long long) tot_cnt, ncb, av, spk_dim ? " (+speaker)" : "");
+    printf("wrote %s : %lld events, %zu seqs (%d w/ speaker), ncb=%d, audio_vocab=%d\n", base_path.c_str(),
+           (long long) tot_cnt, seqs.size(), n_spk, ncb, av);
     printf("PPL(ref) = %.6f   (skipped pad/oob: %lld)\n",
            std::exp(tot_nll / (double) tot_cnt), (long long) skipped);
     return 0;
@@ -192,43 +253,49 @@ int run_kl_divergence(const zonos2_model & m, const std::string & base_path) {
     if (!f) { fprintf(stderr, "perplexity: cannot read %s\n", base_path.c_str()); return 1; }
 
     char magic[8];
-    uint32_t version = 0, b_ncb = 0, b_av = 0, b_pad = 0, b_spk_dim = 0, n_seq = 0;
-    int32_t  b_spk_pos = -1;
+    uint32_t version = 0, b_ncb = 0, b_av = 0, b_pad = 0, n_seq = 0;
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, KLD_MAGIC, 8) != 0) {
         fprintf(stderr, "perplexity: %s: bad magic\n", base_path.c_str()); fclose(f); return 1;
     }
     if (!rd(f, version) || version != KLD_VERSION) {
-        fprintf(stderr, "perplexity: %s: version %u != %u\n", base_path.c_str(), version, KLD_VERSION);
+        fprintf(stderr, "perplexity: %s: version %u != %u (regenerate base)\n", base_path.c_str(), version, KLD_VERSION);
         fclose(f); return 1;
     }
-    rd(f, b_ncb); rd(f, b_av); rd(f, b_pad); rd(f, b_spk_dim); rd(f, b_spk_pos);
+    rd(f, b_ncb); rd(f, b_av); rd(f, b_pad);
     if ((int) b_ncb != ncb || (int) b_av != av) {
         fprintf(stderr, "perplexity: base/model mismatch: base ncb=%u av=%u, model ncb=%d av=%d\n",
                 b_ncb, b_av, ncb, av);
         fclose(f); return 1;
     }
-    std::vector<float> spk;
-    if (b_spk_dim) {
-        if (b_spk_dim != hp.spk_dim) {
-            fprintf(stderr, "perplexity: base speaker dim %u != model %u\n", b_spk_dim, hp.spk_dim);
-            fclose(f); return 1;
-        }
-        spk.resize(b_spk_dim);
-        if (fread(spk.data(), sizeof(float), b_spk_dim, f) != b_spk_dim) {
-            fprintf(stderr, "perplexity: %s: truncated speaker block\n", base_path.c_str());
+
+    // per-sequence metadata: n, spk_pos, spk_dim (0 => no speaker)
+    rd(f, n_seq);
+    std::vector<sequence> seqs(n_seq);
+    std::vector<uint32_t> seq_spk_dim(n_seq, 0);
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        uint32_t n = 0, sdim = 0; int32_t spos = -1;
+        rd(f, n); rd(f, spos); rd(f, sdim);
+        seqs[i].n = (int) n;
+        seqs[i].spk_pos = spos;
+        seq_spk_dim[i] = sdim;
+        if (sdim && sdim != hp.spk_dim) {
+            fprintf(stderr, "perplexity: base speaker dim %u != model %u\n", sdim, hp.spk_dim);
             fclose(f); return 1;
         }
     }
-    const float * spk_ptr = spk.empty() ? nullptr : spk.data();
-
-    rd(f, n_seq);
-    std::vector<sequence> seqs(n_seq);
-    for (auto & s : seqs) { uint32_t n = 0; rd(f, n); s.n = (int) n; }
-    for (auto & s : seqs) {
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        sequence & s = seqs[i];
         s.ids.resize((size_t) s.n * W);
         if (fread(s.ids.data(), sizeof(float), s.ids.size(), f) != s.ids.size()) {
             fprintf(stderr, "perplexity: %s: truncated ids block\n", base_path.c_str());
             fclose(f); return 1;
+        }
+        if (seq_spk_dim[i]) {
+            s.spk.resize(seq_spk_dim[i]);
+            if (fread(s.spk.data(), sizeof(float), s.spk.size(), f) != s.spk.size()) {
+                fprintf(stderr, "perplexity: %s: truncated speaker block\n", base_path.c_str());
+                fclose(f); return 1;
+            }
         }
     }
 
@@ -241,7 +308,7 @@ int run_kl_divergence(const zonos2_model & m, const std::string & base_path) {
 
     std::vector<float> ref_logp((size_t) av), logits, test_logp;
     for (const auto & s : seqs) {
-        if (!zonos2_logits(m, s.ids.data(), s.n, logits, spk_ptr, b_spk_pos)) { fclose(f); return 1; }
+        if (!zonos2_logits(m, s.ids.data(), s.n, logits, s.spk_ptr(), s.spk_pos >= 0 ? s.spk_pos : 0)) { fclose(f); return 1; }
         for (int t = 0; t + 1 < s.n; ++t) {
             for (int cb = 0; cb < ncb; ++cb) {
                 const int L = (int) lroundf(s.ids[(size_t) (t + 1) * W + cb]);
@@ -304,7 +371,7 @@ int run_kl_divergence(const zonos2_model & m, const std::string & base_path) {
 // --imatrix-out : collect per-expert importance (mean activation^2) over the corpus
 // ---------------------------------------------------------------------------
 int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
-                const float * spk, int spk_pos, const std::string & out_path, int min_hits) {
+                const std::string & out_path, int min_hits) {
     const int ne = (int) m.hp.n_expert;
     if (ne == 0) { fprintf(stderr, "imatrix: model has no experts\n"); return 1; }
 
@@ -315,7 +382,9 @@ int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
     size_t si = 0;
     for (const auto & s : seqs) {
         acts.clear();
-        if (!zonos2_moe_capture(m, s.ids.data(), s.n, acts, spk, spk_pos)) return 1;
+        // per-sequence speaker (from --manifest); falls back to the global --speaker that main()
+        // copies into every seq for the positional-ids path, or none.
+        if (!zonos2_moe_capture(m, s.ids.data(), s.n, acts, s.spk_ptr(), s.spk_pos >= 0 ? s.spk_pos : 0)) return 1;
         for (const auto & a : acts) {
             acc_t & A = acc[a.layer];
             if (A.gu.empty()) {
@@ -397,7 +466,7 @@ int main(int argc, char ** argv) {
 
     enum { NONE, PPL, KLBASE, KLDIV, IMATRIX } mode = NONE;
     bool use_gpu = false;
-    std::string base_path, spk_path;
+    std::string base_path, spk_path, manifest_path;
     std::vector<std::string> ids_paths;
     int spk_pos = 0;
     int imat_min_hits = 32;   // experts seen fewer than this many times fall back to RTN
@@ -411,14 +480,22 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--kl-divergence")      && i + 1 < argc) { mode = KLDIV;  base_path = argv[++i]; }
         else if (!strcmp(a, "--imatrix-out")        && i + 1 < argc) { mode = IMATRIX; base_path = argv[++i]; }
         else if (!strcmp(a, "--imatrix-min-hits")   && i + 1 < argc) imat_min_hits = atoi(argv[++i]);
+        else if (!strcmp(a, "--manifest")    && i + 1 < argc) manifest_path = argv[++i];
         else if (!strcmp(a, "--speaker")     && i + 1 < argc) spk_path = argv[++i];
         else if (!strcmp(a, "--speaker-pos") && i + 1 < argc) spk_pos  = atoi(argv[++i]);
         else if (a[0] != '-') ids_paths.push_back(a); // positional input_ids npy
         else { usage(argv[0]); return 1; }
     }
     if (mode == NONE) { usage(argv[0]); return 1; }
-    if ((mode == PPL || mode == KLBASE || mode == IMATRIX) && ids_paths.empty()) {
+    if (!manifest_path.empty() && mode != KLBASE && mode != IMATRIX) {
+        fprintf(stderr, "perplexity: --manifest is only supported with --kl-divergence-base / --imatrix-out\n"); return 1;
+    }
+    if (mode == PPL && ids_paths.empty()) {
         fprintf(stderr, "perplexity: need at least one <ids.npy>\n"); return 1;
+    }
+    if ((mode == KLBASE || mode == IMATRIX) && ids_paths.empty() && manifest_path.empty()) {
+        fprintf(stderr, "perplexity: %s needs <ids.npy>... or --manifest\n",
+                mode == KLBASE ? "--kl-divergence-base" : "--imatrix-out"); return 1;
     }
 
     zonos2_model model;
@@ -442,14 +519,24 @@ int main(int argc, char ** argv) {
     int rc = 1;
     if (mode == KLDIV) {
         rc = run_kl_divergence(model, base_path);
+    } else if (!manifest_path.empty()) {                 // KLBASE / IMATRIX with per-sequence conditioning
+        std::vector<sequence> seqs;
+        if (load_manifest(manifest_path, W, model.hp.spk_dim, seqs)) {
+            printf("manifest: %zu sequences from %s\n", seqs.size(), manifest_path.c_str());
+            rc = (mode == IMATRIX) ? run_imatrix(model, seqs, base_path, imat_min_hits)
+                                   : run_kl_base(model, base_path, seqs);
+        }
     } else {
         std::vector<sequence> seqs(ids_paths.size());
         bool ok = true;
-        for (size_t i = 0; i < ids_paths.size() && ok; ++i) ok = load_ids(ids_paths[i], W, seqs[i]);
+        for (size_t i = 0; i < ids_paths.size() && ok; ++i) {
+            ok = load_ids(ids_paths[i], W, seqs[i]);
+            if (ok && spk_ptr) { seqs[i].spk = spk; seqs[i].spk_pos = spk_pos; }  // global speaker -> every seq
+        }
         if (ok) {
             rc = (mode == PPL)     ? run_perplexity(model, seqs, spk_ptr, spk_pos)
-               : (mode == IMATRIX) ? run_imatrix(model, seqs, spk_ptr, spk_pos, base_path, imat_min_hits)
-                                   : run_kl_base(model, base_path, seqs, spk_ptr, spk_pos);
+               : (mode == IMATRIX) ? run_imatrix(model, seqs, base_path, imat_min_hits)
+                                   : run_kl_base(model, base_path, seqs);
         }
     }
 

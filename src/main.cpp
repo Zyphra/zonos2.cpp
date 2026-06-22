@@ -21,7 +21,8 @@ static void usage(const char * a0) {
         "       %s <model.gguf> --build-prompt \"<text>\" <out_ids.npy> [--speaker <spk.npy>]\n"
         "       %s <model.gguf> --batch-test \"<t1|t2|...>\" [--slots N] [--max N] [--greedy] [--dac <dac.gguf>] --gpu\n"
         "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n"
-        "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n",
+        "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n"
+        "  conditioning paths (--tts/--build-prompt): [--inaccurate] [--noisy-bg] [--speaking-rate N] [--quality f:b[,f:b...]]\n",
         a0, a0, a0, a0, a0, a0);
 }
 
@@ -257,6 +258,33 @@ static int run_batch_test(zonos2_model & model, const std::string & texts_joined
     return fails ? 1 : 0;
 }
 
+// Apply conditioning-path overrides (from --inaccurate/--noisy-bg/--speaking-rate/--quality)
+// onto an options struct. quality spec is "feat:bucket[,feat:bucket...]"; features default to -1
+// (skip) and are sized to the model's quality-feature count.
+static void apply_cond_opts(const zonos2_model & model, zonos2_prompt_options & opt,
+                            int inaccurate, int noisy_bg, int rate, const std::string & quality) {
+    if (inaccurate) opt.accurate_mode = false;
+    if (noisy_bg)   opt.clean_speaker_background = false;
+    if (rate >= 0)  opt.speaking_rate_bucket = rate;
+    if (!quality.empty()) {
+        const size_t nfeat = model.hp.cond_quality_bucket_counts.size();
+        opt.quality_buckets.assign(nfeat, -1);
+        size_t pos = 0;
+        while (pos < quality.size()) {
+            size_t comma = quality.find(',', pos);
+            const std::string tok = quality.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            const size_t colon = tok.find(':');
+            if (colon != std::string::npos) {
+                const int f = atoi(tok.substr(0, colon).c_str());
+                const int b = atoi(tok.substr(colon + 1).c_str());
+                if (f >= 0 && f < (int) nfeat) opt.quality_buckets[f] = b;
+            }
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     const std::string path = argv[1];
@@ -265,6 +293,9 @@ int main(int argc, char ** argv) {
     std::string ids_path, out_dir, out_codes, spk_path, text, prompt_out, dac_path, dump_ids_path;
     int n_layer_limit = -1, max_frames = 400, spk_pos = 0, n_slots = 1;
     bool use_kv = true;
+    // conditioning-path overrides (tri-state: <0 = leave prompt-builder default)
+    int  cond_inaccurate = 0, cond_noisy_bg = 0, cond_rate = -1;
+    std::string cond_quality;          // "feat:bucket[,feat:bucket...]"
     zonos2_sampling sp;
     for (int i = 2; i < argc; ++i) {
         if      (!strcmp(argv[i], "--gpu")) use_gpu = true;
@@ -297,6 +328,10 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--greedy")) sp.greedy = true;
         else if (!strcmp(argv[i], "--recompute")) use_kv = false;
         else if (!strcmp(argv[i], "--dump-ids") && i + 1 < argc) dump_ids_path = argv[++i];
+        else if (!strcmp(argv[i], "--inaccurate")) cond_inaccurate = 1;          // accurate_mode = false
+        else if (!strcmp(argv[i], "--noisy-bg"))   cond_noisy_bg = 1;            // clean_speaker_background = false
+        else if (!strcmp(argv[i], "--speaking-rate") && i + 1 < argc) cond_rate = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--quality") && i + 1 < argc) cond_quality = argv[++i];
         else { usage(argv[0]); return 1; }
     }
 
@@ -386,6 +421,7 @@ int main(int argc, char ** argv) {
     if (do_build_prompt) {
         zonos2_prompt_options opt;
         if (spk_ptr) opt.add_speaker_slot = true; // prepend speaker slot for cloning
+        apply_cond_opts(model, opt, cond_inaccurate, cond_noisy_bg, cond_rate, cond_quality);
         int n_rows = 0, sp_pos = -1;
         std::vector<int32_t> ids = zonos2_build_prompt(model, text, opt, n_rows, sp_pos);
         const int W = (int) model.hp.n_codebooks + 1;
@@ -400,6 +436,7 @@ int main(int argc, char ** argv) {
     if (do_tts) {
         zonos2_prompt_options opt;
         if (spk_ptr) opt.add_speaker_slot = true;
+        apply_cond_opts(model, opt, cond_inaccurate, cond_noisy_bg, cond_rate, cond_quality);
         int n0 = 0, sp_pos = -1;
         std::vector<int32_t> ids = zonos2_build_prompt(model, text, opt, n0, sp_pos);
         std::vector<float> idf(ids.begin(), ids.end());
