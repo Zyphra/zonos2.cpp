@@ -150,16 +150,19 @@ static ggml_tensor * build_attention(gctx & g, ggml_tensor * cur, const zonos2_l
         }
     }
     if (!kqv) {
-        // causal self-attention over the n tokens (prefill / validate / recompute) via flash
-        // attention. ggml_diag_mask_inf has no Metal kernel, so we mask through the same
-        // flash_attn_ext path the decode branch uses, with an F16 [n_kv, n_q] causal mask.
-        // Unpadded n_kv/n_q is fine: CUDA picks the ncols2==1 oob-checked kernel, Metal pads KV
-        // internally, CPU indexes mask rows directly. Output is [hd, nh, n] — no final permute.
-        ggml_tensor * qf = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3)); // [hd, n, nh]
-        ggml_tensor * kf = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, n, nkv]
-        ggml_tensor * vf = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3)); // [hd, n, nkv]
-        kqv = ggml_flash_attn_ext(ctx, qf, kf, vf, g.mask_causal, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
-        kqv = ggml_reshape_3d(ctx, kqv, hd, nh, n);                          // [hd, nh, n]
+        // manual causal self-attention over the n tokens (prefill / validate / recompute).
+        // ggml_diag_mask_inf has no Metal kernel, so causality comes from an additive F16
+        // [n_kv, n_q] mask folded into soft_max_ext (which also applies the 1/sqrt(hd) scale).
+        // Kept as mul_mat+soft_max rather than flash_attn_ext: for these short prefills Metal's
+        // mul_mm+soft_max is far cheaper than the F32 flash kernel + its pad/blk preprocessing,
+        // which dominated time-to-first-audio. soft_max_ext broadcasts the mask over the nh heads.
+        ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3)); // [hd, n, nh]
+        ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, n, nkv]
+        ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);                        // [n, n, nh]
+        kq = ggml_soft_max_ext(ctx, kq, g.mask_causal, 1.0f / sqrtf((float) hd), 0.0f);
+        ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3)); // [n, hd, nkv]
+        kqv = ggml_mul_mat(ctx, vp, kq);                                     // [hd, n, nh]
+        kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));            // [hd, nh, n]
     }
 
 
@@ -273,7 +276,7 @@ ggml_tensor * build_graph(gctx & g, int n_layer_limit) {
             ggml_set_input(g.pos_cache);
             ggml_set_name(g.pos_cache, "pos_cache");
         }
-        if (!g.decode) { // causal mask consumed by the prefill flash-attention branch
+        if (!g.decode) { // additive causal mask for the prefill soft_max_ext attention branch
             g.mask_causal = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, g.n, g.n);
             ggml_set_input(g.mask_causal);
             ggml_set_name(g.mask_causal, "mask_causal");
