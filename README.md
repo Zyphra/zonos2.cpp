@@ -392,7 +392,8 @@ Q8_0 spine.
 
 Two metric sets vs the F16 backbone, over a multispeaker free-run corpus (the golden prompt is
 useless for ranking — every quant scores ~100% top-1 on it). **KLD/Top-1** track per-frame
-logits (`zonos2-perplexity`); **WER** (Qwen3-ASR), **SpkSim**, and **UTMOS** are end-to-end audio:
+logits (`zonos2-perplexity`); **WER** (Qwen3-ASR), **SpkSim**, and **UTMOS** are end-to-end audio
+on the [`Zyphra/ZTT1-Eval`](https://github.com/Zyphra/ZTT1-Eval) Clean English set:
 
 | backbone | bpw | size | KLD ↓ | Top-1 ↑ | WER ↓ | SpkSim ↑ | UTMOS ↑ |
 |---|---|---|---|---|---|---|---|
