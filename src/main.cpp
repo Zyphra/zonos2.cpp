@@ -2,6 +2,7 @@
 #include "zonos2.h"
 #include "zonos2-sampler.h"
 #include "dac.h"
+#include "spk-encoder.h"
 #include "npy.h"
 #include "ggml.h"
 
@@ -22,7 +23,9 @@ static void usage(const char * a0) {
         "       %s <model.gguf> --batch-test \"<t1|t2|...>\" [--slots N] [--max N] [--greedy] [--dac <dac.gguf>] --gpu\n"
         "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n"
         "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n"
-        "  conditioning paths (--tts/--build-prompt): [--inaccurate] [--noisy-bg] [--speaking-rate N] [--quality f:b[,f:b...]]\n",
+        "  conditioning paths (--tts/--build-prompt): [--inaccurate] [--noisy-bg] [--speaking-rate N] [--quality f:b[,f:b...]]\n"
+        "  voice cloning: --speaker <spk.npy> (precomputed) OR --clone <ref_audio> --spk-encoder <spk-encoder.gguf>\n"
+        "                 (--clone encodes the reference in-process via ffmpeg+ECAPA; add --save-speaker <out.npy> to cache it)\n",
         a0, a0, a0, a0, a0, a0);
 }
 
@@ -291,6 +294,7 @@ int main(int argc, char ** argv) {
     bool use_gpu = false;
     bool validate = false, generate = false, do_tts = false, do_build_prompt = false, do_batch_test = false, do_decode_bench = false;
     std::string ids_path, out_dir, out_codes, spk_path, text, prompt_out, dac_path, dump_ids_path;
+    std::string clone_path, spk_encoder_path, save_spk_path; // one-command voice cloning
     int n_layer_limit = -1, max_frames = 400, spk_pos = 0, n_slots = 1;
     bool use_kv = true;
     // conditioning-path overrides (tri-state: <0 = leave prompt-builder default)
@@ -323,6 +327,9 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--max")    && i + 1 < argc) max_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dac") && i + 1 < argc) dac_path = argv[++i];
         else if (!strcmp(argv[i], "--speaker") && i + 1 < argc) spk_path = argv[++i];
+        else if (!strcmp(argv[i], "--clone") && i + 1 < argc) clone_path = argv[++i];
+        else if (!strcmp(argv[i], "--spk-encoder") && i + 1 < argc) spk_encoder_path = argv[++i];
+        else if (!strcmp(argv[i], "--save-speaker") && i + 1 < argc) save_spk_path = argv[++i];
         else if (!strcmp(argv[i], "--speaker-pos") && i + 1 < argc) spk_pos = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed")   && i + 1 < argc) sp.seed = (uint32_t) atoi(argv[++i]);
         else if (!strcmp(argv[i], "--greedy")) sp.greedy = true;
@@ -335,15 +342,52 @@ int main(int argc, char ** argv) {
         else { usage(argv[0]); return 1; }
     }
 
+    if (!clone_path.empty() && !spk_path.empty()) {
+        fprintf(stderr, "error: --clone and --speaker are mutually exclusive (pick reference audio OR a precomputed embedding)\n");
+        return 1;
+    }
+    if (!clone_path.empty() && spk_encoder_path.empty()) {
+        fprintf(stderr, "error: --clone <ref_audio> requires --spk-encoder <spk-encoder.gguf>\n");
+        return 1;
+    }
+    if (clone_path.empty() && (!spk_encoder_path.empty() || !save_spk_path.empty())) {
+        fprintf(stderr, "error: --spk-encoder/--save-speaker only apply with --clone <ref_audio>\n");
+        return 1;
+    }
+
     zonos2_model model;
     if (!zonos2_model_load(model, path.c_str(), use_gpu)) {
         fprintf(stderr, "load failed\n");
         return 1;
     }
 
-    // optional speaker embedding ([spk_dim] or [1, spk_dim] f32) for voice cloning
+    // optional speaker embedding ([spk_dim] or [1, spk_dim] f32) for voice cloning:
+    // either a precomputed --speaker npy, or --clone <ref_audio> encoded in-process
+    // through the ECAPA speaker encoder (one-command cloning).
     std::vector<float> spk;
-    if (!spk_path.empty()) {
+    if (!clone_path.empty()) {
+        spk_model sm;
+        if (!spk_load(sm, spk_encoder_path.c_str())) {
+            fprintf(stderr, "failed to load speaker encoder %s\n", spk_encoder_path.c_str());
+            zonos2_model_free(model); return 1;
+        }
+        spk = spk_embed_from_file(sm, clone_path.c_str());
+        spk_free(sm);
+        if (spk.empty()) {
+            fprintf(stderr, "clone: failed to encode %s (ffmpeg on PATH?)\n", clone_path.c_str());
+            zonos2_model_free(model); return 1;
+        }
+        if (spk.size() != model.hp.spk_dim) {
+            fprintf(stderr, "clone: speaker dim mismatch: encoder gave %zu, model wants %u\n", spk.size(), model.hp.spk_dim);
+            zonos2_model_free(model); return 1;
+        }
+        if (!save_spk_path.empty()) {
+            npy::save_f32(save_spk_path, spk.data(), { (int64_t) spk.size() });
+            printf("clone: cached embedding -> %s\n", save_spk_path.c_str());
+        }
+        printf("clone: %zu-d vector from %s via %s, pos=%d\n",
+               spk.size(), clone_path.c_str(), spk_encoder_path.c_str(), spk_pos);
+    } else if (!spk_path.empty()) {
         std::vector<int64_t> sshape;
         if (!npy::load_f32(spk_path, spk, sshape)) {
             fprintf(stderr, "failed to load speaker npy %s\n", spk_path.c_str());

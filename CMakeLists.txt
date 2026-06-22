@@ -59,8 +59,9 @@ add_library(zonos2 STATIC
 target_include_directories(zonos2 PUBLIC src ggml/include)
 target_link_libraries(zonos2 PUBLIC ggml)
 
-# --- CLI (links the DAC decoder so --tts/--generate can emit a wav directly) ---
-add_executable(zonos2-cli src/main.cpp src/dac.cpp)
+# --- CLI (links the DAC decoder so --tts/--generate can emit a wav directly,
+#     and the speaker encoder so --clone does one-command voice cloning) ---
+add_executable(zonos2-cli src/main.cpp src/dac.cpp src/spk-encoder.cpp)
 target_include_directories(zonos2-cli PRIVATE src ggml/include)
 target_link_libraries(zonos2-cli PRIVATE zonos2 ggml)
 

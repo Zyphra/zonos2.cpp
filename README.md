@@ -199,25 +199,22 @@ zonos2-cli out/zonos2-q8_0.gguf --tts "Hello, world." out.wav \
 With `--dac`, a `.wav` output is decoded directly; an `.npy` output writes the raw codes
 (plus a sibling `.eos.npy`) and, if `--dac` is given, a sibling `.wav`.
 
-> ⚠️ **Use sampling, not greedy.** A `--seed` (or omitting `--greedy`) lets the model emit
-> EOS and produce a finite clip. With `--greedy` the backbone never emits EOS, runs to
-> `--max`, and the audio comes out near-silent. This is a property of the original model,
-> not the port.
+### Voice cloning (one command)
 
-### Voice cloning (two commands)
+`zonos2-cli` links the speaker encoder, so `--clone <ref_audio>` encodes the reference in-process
+(ffmpeg → ECAPA → [2048] x-vector) and injects it — no separate step:
 
 ```bash
-# 1) Extract a [2048] speaker embedding from any audio file (--clone shells ffmpeg in-process).
-spk-encoder-cli out/spk-encoder.gguf --clone voice.mp3 emb.npy
-
-# 2) Synthesize in that voice.
 zonos2-cli out/zonos2-q8_0.gguf --tts "Cloned voice demo." out.wav \
-    --dac out/dac.gguf --speaker emb.npy --gpu --seed 1
+    --dac out/dac.gguf --clone voice.mp3 --spk-encoder out/spk-encoder.gguf --gpu --seed 1
 ```
 
-The repo's three bundled reference voices live in `ZONOS2/default_voices/*.mp3`. The speaker
-encoder also accepts `--wav <24kHz-mono.npy>`, `--raw <f32le>`, or a precomputed
-`--mel <[T,128].npy>`.
+Add `--save-speaker emb.npy` to cache the embedding; later runs can reuse it with `--speaker emb.npy`
+and skip re-encoding. `--clone` works the same on `--generate`/`--build-prompt`/`--validate`.
+
+The repo's three bundled reference voices live in `ZONOS2/default_voices/*.mp3`. To precompute an
+embedding standalone, `spk-encoder-cli out/spk-encoder.gguf --clone voice.mp3 emb.npy` also accepts
+`--wav <24kHz-mono.npy>`, `--raw <f32le>`, or a precomputed `--mel <[T,128].npy>`.
 
 ### HTTP server
 
@@ -294,7 +291,8 @@ zonos2-cli out/zonos2-q8_0.gguf --generate out/ids.npy out/codes.npy --gpu --see
 | `--seed N` | sampler seed (enables sampling) |
 | `--greedy` | greedy decode (deterministic; see EOS caveat) |
 | `--max N` | max frames (default 400) |
-| `--speaker emb.npy [--speaker-pos P]` | inject a voice embedding (default position 0) |
+| `--speaker emb.npy [--speaker-pos P]` | inject a precomputed voice embedding (default position 0) |
+| `--clone ref.{mp3,wav,…} --spk-encoder spk-encoder.gguf` | one-command clone: encode reference in-process (add `--save-speaker emb.npy` to cache) |
 | `--dac dac.gguf` | decode codes to a WAV in the same run |
 | `--recompute` | O(n²) reference decode instead of the KV cache (for checking) |
 
