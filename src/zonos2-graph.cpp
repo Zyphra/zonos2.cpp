@@ -567,6 +567,33 @@ static int generate_recompute(const zonos2_model & m, const float * prompt_ids, 
 
 static int round_up_256(int x) { return ((x + 255) / 256) * 256; }
 
+// Build one persistent decode graph of the given column width, viewing KV-cache bands [0,width).
+// All ladder widths share bc.k_cache/v_cache; slot index == column == cache band, so the formulas
+// in build_graph (cache row = slot*slot_cap + pos) are width-independent.
+static bool build_decode_graph(zonos2_batch_ctx & bc, const zonos2_model & m, int width,
+                               zonos2_batch_ctx::dec_graph & dg) {
+    dg.width = width;
+    struct ggml_init_params ipd = { (size_t) 24 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
+    dg.ctx = ggml_init(ipd);
+    gctx gd; gd.m = &m; gd.ctx = dg.ctx; gd.n = width; gd.capture = false;
+    gd.kc = &bc.k_cache; gd.vc = &bc.v_cache; gd.decode = true;
+    gd.n_slots = width; gd.slot_cap = bc.slot_cap;
+    dg.gf = ggml_new_graph_custom(dg.ctx, 16384, false); gd.gf = dg.gf;
+    ggml_tensor * logits = build_graph(gd, -1); ggml_set_output(logits);
+    ggml_build_forward_expand(dg.gf, logits);
+    dg.galloc = ggml_gallocr_new(m.buft);
+    if (!dg.galloc || !ggml_gallocr_alloc_graph(dg.galloc, dg.gf)) {
+        fprintf(stderr, "zonos2: decode graph alloc failed (width=%d)\n", width);
+        return false;
+    }
+    dg.ids       = gd.ids;
+    dg.pos_rope  = gd.pos_rope;
+    dg.pos_cache = gd.pos_cache;
+    dg.mask      = gd.mask;
+    dg.logits    = logits;
+    return true;
+}
+
 bool zonos2_batch_init(zonos2_batch_ctx & bc, const zonos2_model & m, int n_slots, int slot_cap_frames) {
     const zonos2_hparams & hp = m.hp;
     bc = zonos2_batch_ctx();
@@ -598,25 +625,17 @@ bool zonos2_batch_init(zonos2_batch_ctx & bc, const zonos2_model & m, int n_slot
     }
     ggml_backend_buffer_clear(bc.buf_kv, 0); // zero so idle / unwritten positions never NaN
 
-    // persistent decode graph: built + allocated once with g.n = n_slots, replayed every step.
-    struct ggml_init_params ipd = { (size_t) 64 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
-    bc.ctx_dec = ggml_init(ipd);
-    gctx gd; gd.m = &m; gd.ctx = bc.ctx_dec; gd.n = n_slots; gd.capture = false;
-    gd.kc = &bc.k_cache; gd.vc = &bc.v_cache; gd.decode = true;
-    gd.n_slots = n_slots; gd.slot_cap = bc.slot_cap;
-    bc.gfd = ggml_new_graph_custom(bc.ctx_dec, 16384, false); gd.gf = bc.gfd;
-    ggml_tensor * logits = build_graph(gd, -1); ggml_set_output(logits);
-    ggml_build_forward_expand(bc.gfd, logits);
-    bc.galloc_dec = ggml_gallocr_new(m.buft);
-    if (!bc.galloc_dec || !ggml_gallocr_alloc_graph(bc.galloc_dec, bc.gfd)) {
-        fprintf(stderr, "zonos2: batch decode graph alloc failed\n");
-        zonos2_batch_free(bc); return false;
+    // Decode-graph ladder over widths {1,2,4,...,n_slots}: each step runs the smallest width that
+    // covers the active slots, so a solo request pays 1-column compute instead of n_slots-column.
+    std::vector<int> widths;
+    for (int w = 1; w < n_slots; w *= 2) widths.push_back(w);
+    widths.push_back(n_slots);
+    bc.dec_ladder.resize(widths.size());
+    for (size_t i = 0; i < widths.size(); ++i) {
+        if (!build_decode_graph(bc, m, widths[i], bc.dec_ladder[i])) {
+            zonos2_batch_free(bc); return false;
+        }
     }
-    bc.dec_ids       = gd.ids;
-    bc.dec_pos_rope  = gd.pos_rope;
-    bc.dec_pos_cache = gd.pos_cache;
-    bc.dec_mask      = gd.mask;
-    bc.dec_logits    = logits;
 
     bc.galloc_prefill = ggml_gallocr_new(m.buft);
 
@@ -629,9 +648,11 @@ bool zonos2_batch_init(zonos2_batch_ctx & bc, const zonos2_model & m, int n_slot
 }
 
 void zonos2_batch_free(zonos2_batch_ctx & bc) {
-    if (bc.galloc_dec)     ggml_gallocr_free(bc.galloc_dec);
+    for (auto & dg : bc.dec_ladder) {
+        if (dg.galloc) ggml_gallocr_free(dg.galloc);
+        if (dg.ctx)    ggml_free(dg.ctx);
+    }
     if (bc.galloc_prefill) ggml_gallocr_free(bc.galloc_prefill);
-    if (bc.ctx_dec)        ggml_free(bc.ctx_dec);
     if (bc.buf_kv)         ggml_backend_buffer_free(bc.buf_kv);
     if (bc.ctx_kv)         ggml_free(bc.ctx_kv);
     bc = zonos2_batch_ctx();
@@ -697,8 +718,24 @@ void zonos2_batch_step(zonos2_batch_ctx & bc, const std::vector<zonos2_slot *> &
     const uint16_t M0   = ggml_fp32_to_fp16(0.0f);
     const uint16_t MINF = ggml_fp32_to_fp16(-INFINITY);
 
-    // default every column to idle: pad ids, position 0, mask exposing only this band's row 0.
-    for (int c = 0; c < N; ++c) {
+    static const bool prof_step = getenv("ZONOS2_PROFILE_STEP") != nullptr;
+    using sclk = std::chrono::steady_clock;
+    sclk::time_point t_start, ta, tb;
+    if (prof_step) t_start = sclk::now();
+
+    // Pick the narrowest ladder graph covering the active slots. Slots are allocated low-index
+    // first, so the needed column width is (highest active slot index + 1); a width-Wd graph views
+    // KV-cache bands [0,Wd) and is bit-identical to the full-width graph for those columns.
+    int eff = 0;
+    for (zonos2_slot * sp : active)
+        if (sp && sp->active && !sp->done) eff = std::max(eff, sp->index + 1);
+    if (eff <= 0) return;                                  // nothing active
+    const zonos2_batch_ctx::dec_graph * dg = &bc.dec_ladder.back();
+    for (const auto & cand : bc.dec_ladder) if (cand.width >= eff) { dg = &cand; break; }
+    const int Wd = dg->width;
+
+    // default every (covered) column to idle: pad ids, position 0, mask exposing only band row 0.
+    for (int c = 0; c < Wd; ++c) {
         for (int k = 0; k < W; ++k)
             bc.h_ids[(size_t) k * N + c] = (k < ncb) ? (int32_t) m.hp.audio_pad_id : (int32_t) m.hp.text_vocab;
         bc.h_pos_rope[c]  = 0;
@@ -718,15 +755,35 @@ void zonos2_batch_step(zonos2_batch_ctx & bc, const std::vector<zonos2_slot *> &
         for (int p = 0; p < S; ++p) mc[p] = (p <= sp->n_past) ? M0 : MINF;
     }
 
-    for (int k = 0; k < W; ++k)
-        ggml_backend_tensor_set(bc.dec_ids[k], &bc.h_ids[(size_t) k * N], 0, (size_t) N * sizeof(int32_t));
-    ggml_backend_tensor_set(bc.dec_pos_rope,  bc.h_pos_rope.data(),  0, (size_t) N * sizeof(int32_t));
-    ggml_backend_tensor_set(bc.dec_pos_cache, bc.h_pos_cache.data(), 0, (size_t) N * sizeof(int32_t));
-    ggml_backend_tensor_set(bc.dec_mask,      bc.h_mask.data(),      0, (size_t) S * N * sizeof(uint16_t));
+    if (prof_step) ta = sclk::now();
 
-    ggml_backend_graph_compute(m.backend, bc.gfd);
-    ggml_backend_tensor_get(bc.dec_logits, bc.h_logits.data(), 0,
-                            (size_t) N * av * ncb * sizeof(float));
+    // h_ids has stride N between codebooks; the first Wd columns of each are contiguous.
+    for (int k = 0; k < W; ++k)
+        ggml_backend_tensor_set(dg->ids[k], &bc.h_ids[(size_t) k * N], 0, (size_t) Wd * sizeof(int32_t));
+    ggml_backend_tensor_set(dg->pos_rope,  bc.h_pos_rope.data(),  0, (size_t) Wd * sizeof(int32_t));
+    ggml_backend_tensor_set(dg->pos_cache, bc.h_pos_cache.data(), 0, (size_t) Wd * sizeof(int32_t));
+    ggml_backend_tensor_set(dg->mask,      bc.h_mask.data(),      0, (size_t) S * Wd * sizeof(uint16_t));
+    if (prof_step) tb = sclk::now();
+
+    if (prof_step) {
+        auto sms = [](sclk::time_point a, sclk::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        ggml_backend_graph_compute_async(m.backend, dg->gf);
+        auto tc = sclk::now();
+        ggml_backend_synchronize(m.backend);
+        auto td = sclk::now();
+        ggml_backend_tensor_get(dg->logits, bc.h_logits.data(), 0,
+                                (size_t) Wd * av * ncb * sizeof(float));
+        auto te = sclk::now();
+        fprintf(stderr,
+            "step[prof]: active=%d width=%d nodes=%d  fill=%.2fms set=%.2fms encode=%.2fms gpu=%.2fms get=%.2fms\n",
+            eff, Wd, ggml_graph_n_nodes(dg->gf), sms(t_start, ta), sms(ta, tb), sms(tb, tc), sms(tc, td), sms(td, te));
+    } else {
+        ggml_backend_graph_compute(m.backend, dg->gf);
+        ggml_backend_tensor_get(dg->logits, bc.h_logits.data(), 0,
+                                (size_t) Wd * av * ncb * sizeof(float));
+    }
 
     for (zonos2_slot * sp : active)
         if (sp && sp->active && !sp->done) sp->n_past += 1;

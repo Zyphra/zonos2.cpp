@@ -76,6 +76,12 @@ bool zonos2_model_load(zonos2_model & m, const char * path, bool use_gpu) {
     if (use_gpu) dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (!dev)    dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!dev)    { fprintf(stderr, "zonos2: no backend device\n"); gguf_free(gguf); ggml_free(ctx_meta); return false; }
+    // Metal: encode the decode graph across 4 command buffers (default is 1). Single-token decode
+    // is a deep chain of ~1675 tiny kernels; with one command buffer the ~3 ms CPU encode runs
+    // almost serially before the GPU, but spreading it over 4 buffers lets the GPU start streaming
+    // through them as they're enqueued — ~10% faster decode (measured) at no quality cost. prefill
+    // (big GEMMs) is unaffected. Overridable: respect an explicit GGML_METAL_NCB from the caller.
+    if (use_gpu) setenv("GGML_METAL_NCB", "4", /*overwrite=*/0);
     m.backend = ggml_backend_dev_init(dev, nullptr);
     m.buft    = ggml_backend_dev_buffer_type(dev);
     m.is_gpu  = (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);

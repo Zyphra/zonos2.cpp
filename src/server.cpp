@@ -94,7 +94,10 @@ struct ServerState {
     int max_frames   = 2000;   // ~23s ceiling; per-request max_tokens clamps below this
     int stream_block = 40;     // frames per streamed PCM block (~0.46s)
     int stream_ctx   = 24;     // conv-context frames each side (>=16 is seam-free); see dac_decode_window
-    int batch_slots  = 4;      // continuous-batching width (concurrent in-flight syntheses)
+    int batch_slots  = 8;      // continuous-batching width (concurrent in-flight syntheses). The
+                               // decode-graph ladder runs the narrowest width covering the active
+                               // slots, so raising this no longer slows solo/low-concurrency
+                               // requests; only KV-cache memory (~0.18 GB/slot) scales with it.
     int dac_threads  = 4;      // DAC decode pool lanes (parallel decode across requests)
     bool prof = false;         // ZONOS2_PROFILE: emit per-request decode timing
     std::string ui_path = "web/tts_ui.html";
@@ -482,10 +485,11 @@ static void submit_finalize(ServerState & s, const std::shared_ptr<ReqJob> & job
     dac_lane_submit(s.dac_lanes[job->lane], std::move(t));
 }
 
-// Run a throwaway prefill + a couple of decode steps so every backbone graph pipeline is JIT-
-// compiled before the first real request. On Metal that compilation is ~0.5s of lazy kernel
-// builds that would otherwise land on the first user's time-to-first-audio. Slot 0's cache band
-// is left holding dummy K/V, but the first admitted request re-prefills its slot, overwriting it.
+// Run a throwaway prefill + a decode step at every ladder width so every backbone graph pipeline
+// is JIT-compiled before the first real request. On Metal that compilation is ~0.5s of lazy kernel
+// builds that would otherwise land on the first user's time-to-first-audio. The decode ladder runs
+// the narrowest graph covering the active slots, so each width has its own pipelines to warm. The
+// dummy K/V left in the touched cache bands is overwritten when a real request re-prefills its slot.
 static void warmup_backbone(zonos2_batch_ctx & bc) {
     if (getenv("ZONOS2_NO_WARMUP")) return;
     const int W = bc.W, n0 = 16;
@@ -493,13 +497,16 @@ static void warmup_backbone(zonos2_batch_ctx & bc) {
     std::vector<float> logits((size_t) bc.av * bc.ncb, 0.0f);
     const auto t0 = std::chrono::steady_clock::now();
     if (!zonos2_batch_slot_prefill(bc, 0, ids.data(), n0, nullptr, -1, logits.data())) return;
-    zonos2_slot slot;
-    slot.index = 0; slot.active = true; slot.n_past = n0;
-    slot.next_ids.assign(W, 0);
-    for (int i = 0; i < 2; ++i) zonos2_batch_step(bc, { &slot }); // n_past auto-advances
+    // Step a dummy slot at each ladder width's top column so all decode-graph widths get warmed.
+    for (const auto & dg : bc.dec_ladder) {
+        zonos2_slot slot;
+        slot.index = dg.width - 1; slot.active = true; slot.n_past = n0;
+        slot.next_ids.assign(W, 0);
+        zonos2_batch_step(bc, { &slot });                   // n_past auto-advances
+    }
     const auto t1 = std::chrono::steady_clock::now();
-    fprintf(stderr, "zonos2-server: backbone warmup in %.0f ms\n",
-            std::chrono::duration<double, std::milli>(t1 - t0).count());
+    fprintf(stderr, "zonos2-server: backbone warmup (%zu ladder widths) in %.0f ms\n",
+            bc.dec_ladder.size(), std::chrono::duration<double, std::milli>(t1 - t0).count());
 }
 
 static void worker_loop(ServerState & s) {
@@ -841,7 +848,10 @@ static void usage(const char * a0) {
         "                      backbone graph; makes streamed audio bit-exact; default on Metal)\n"
         "  --dac-gpu           force GPU DAC (overrides the Metal CPU-DAC default)\n"
         "  --max N             max frames per request (default 2000, ~23s)\n"
-        "  --batch N           continuous-batching width / concurrent syntheses (default 4)\n"
+        "  --batch N           continuous-batching width / concurrent syntheses (default 8). A\n"
+        "                      decode-graph ladder runs the narrowest width covering the active\n"
+        "                      slots, so solo requests stay fast at any N; KV cache is ~0.18 GB/slot.\n"
+        "                      N>=32 unlocks the expert GEMM kernel for peak aggregate throughput.\n"
         "  --dac-threads N     DAC decode pool lanes, parallel decode across requests (default 4)\n"
         "  --stream-block N    frames per streamed PCM block (default 40)\n"
         "  --stream-context N  conv-context frames each side, >=16 seam-free (default 24)\n"

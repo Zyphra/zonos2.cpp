@@ -208,15 +208,22 @@ struct zonos2_batch_ctx {
     ggml_backend_buffer_t      buf_kv = nullptr;
     std::vector<struct ggml_tensor *> k_cache, v_cache;
 
-    // persistent decode graph (built once, replayed); input/output tensor handles
-    struct ggml_context * ctx_dec    = nullptr;
-    struct ggml_cgraph  * gfd        = nullptr;
-    ggml_gallocr_t        galloc_dec = nullptr;
-    std::vector<struct ggml_tensor *> dec_ids;          // [W], each [n_slots] I32
-    struct ggml_tensor *  dec_pos_rope  = nullptr;      // [n_slots] I32
-    struct ggml_tensor *  dec_pos_cache = nullptr;      // [n_slots] I32
-    struct ggml_tensor *  dec_mask      = nullptr;      // [slot_cap,1,1,n_slots] F16
-    struct ggml_tensor *  dec_logits    = nullptr;      // [av, ncb, n_slots]
+    // Decode-graph ladder: one persistent graph per width in {1,2,4,...,n_slots}, all sharing the
+    // same KV cache (a width-W graph views cache bands [0,W); slot index == column == cache band).
+    // Each step picks the smallest width covering the active slots, so a solo request pays 1-column
+    // compute instead of n_slots-column compute. The caller allocates slot indices low-first.
+    struct dec_graph {
+        int width = 0;
+        struct ggml_context * ctx    = nullptr;
+        struct ggml_cgraph  * gf     = nullptr;
+        ggml_gallocr_t        galloc = nullptr;
+        std::vector<struct ggml_tensor *> ids;          // [W], each [width] I32
+        struct ggml_tensor *  pos_rope  = nullptr;      // [width] I32
+        struct ggml_tensor *  pos_cache = nullptr;      // [width] I32
+        struct ggml_tensor *  mask      = nullptr;      // [slot_cap,1,1,width] F16
+        struct ggml_tensor *  logits    = nullptr;      // [av, ncb, width]
+    };
+    std::vector<dec_graph> dec_ladder;                  // ascending width
 
     ggml_gallocr_t galloc_prefill = nullptr;            // reused for per-slot prefill graphs
 
