@@ -1,0 +1,16 @@
+diff --git a/src/ggml-metal/ggml-metal.cpp b/src/ggml-metal/ggml-metal.cpp
+index a1003b3a..3c0f367e 100644
+--- a/src/ggml-metal/ggml-metal.cpp
++++ b/src/ggml-metal/ggml-metal.cpp
+@@ -702,7 +702,10 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t
+         /* .context   = */ ctx,
+     };
+ 
+-    ggml_backend_metal_set_n_cb(backend, 1);
++    {
++        const char * ncb_env = getenv("GGML_METAL_NCB");
++        ggml_backend_metal_set_n_cb(backend, ncb_env ? atoi(ncb_env) : 1);
++    }
+ 
+     return backend;
+ 
