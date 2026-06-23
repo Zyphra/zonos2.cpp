@@ -335,6 +335,27 @@ Measured on one H100 with `zonos2-q8_0.gguf` (decode is the dominant cost):
   CUDA graphs** (Q8_0 experts keep `mul_mat_id` capturable). Prefill/validate use the manual
   F32 attention path.
 
+### Apple Silicon (Metal)
+
+End-to-end real-time on Metal is **memory-bandwidth gated**, so it scales with the chip tier.
+The single-token backbone is memory/compute-balanced (a roofline microbenchmark puts it at the
+M3 ridge), so its rate tracks both bandwidth and GPU-core count; the DAC vocoder's
+`conv_transpose` is implemented as `mul_mat` + overlap-add fold (the stock Metal kernel was the
+GPU-DAC bottleneck), bringing GPU DAC to RTF ≈ 0.4 on M3 base.
+
+| tier | mem BW | backbone RTF | GPU DAC RTF | end-to-end | recommended model |
+|------|--------|--------------|-------------|------------|-------------------|
+| **M3 base** (measured) | ~100 GB/s | ~1.0 | ~0.41 | ~1.4 | `q2_k-experts` (q8 spine) — most aggressive that stays real-time-ish |
+| **M3 Pro** (projected)  | ~150 GB/s | ~0.62 | ~0.26 | **<1** | `q4_k-experts` — bandwidth headroom buys back quality |
+| **M3 Max** (projected)  | ~300–400 GB/s | ~0.30 | ~0.12 | **~0.4–0.5** | F16-spine / `q4_k` — quality-first, still real-time |
+
+M3-base rows are measured; Pro/Max rows are roofline projections (verify on the target with the
+CLI `generate(kv)` RTF line plus a buffered `/v1/audio/speech` request). Notes for Metal:
+`GGML_METAL_NCB` defaults to 4 for the backbone (overlaps graph-encode with GPU compute, ~10%);
+the server runs a decode-graph ladder so a lone request never pays full-batch-width compute, and
+`--batch >= 32` engages the expert GEMM kernel for peak aggregate throughput (~14× real-time
+aggregate across concurrent streams); the DAC defaults to CPU on Metal (`--dac-gpu` to override).
+
 ## Numerical validation
 
 | stage | result vs PyTorch reference |
