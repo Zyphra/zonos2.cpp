@@ -96,6 +96,7 @@ struct ServerState {
     int stream_ctx   = 24;     // conv-context frames each side (>=16 is seam-free); see dac_decode_window
     int batch_slots  = 4;      // continuous-batching width (concurrent in-flight syntheses)
     int dac_threads  = 4;      // DAC decode pool lanes (parallel decode across requests)
+    bool prof = false;         // ZONOS2_PROFILE: emit per-request decode timing
     std::string ui_path = "web/tts_ui.html";
 
     // continuous-batching scheduler: one worker thread owns the backbone + batch context and only
@@ -231,6 +232,10 @@ struct ReqJob {
     int eos_frame = -1;
     int emitted = 0;                     // frames already handed to the DAC pool (streaming)
     int lane = 0;                        // assigned DAC pool lane (decodes this job's blocks in order)
+
+    // decode profiling (ZONOS2_PROFILE): admission->done wall and summed batch_step compute
+    std::chrono::steady_clock::time_point t_decode0;
+    double decode_step_ms = 0.0;         // summed zonos2_batch_step ms feeding this slot (exact at batch=1)
 
     // channel: DAC pool -> handler
     std::mutex m;
@@ -527,6 +532,7 @@ static void worker_loop(ServerState & s) {
                 job_finish(*job, /*failed=*/true);
                 continue;                                   // leave slot free
             }
+            job->t_decode0 = std::chrono::steady_clock::now();
             slot_job[i] = job;
         }
 
@@ -557,6 +563,14 @@ static void worker_loop(ServerState & s) {
         for (int i = 0; i < B; ++i) {
             auto & job = slot_job[i];
             if (!job || !job->slot.done) continue;
+            if (s.prof) {
+                const double wall_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - job->t_decode0).count();
+                const int f = job->slot.step;
+                fprintf(stderr, "decode[prof]: %d frames  batch_step=%.0fms (%.1f fps)  wall=%.0fms (%.1f fps)\n",
+                        f, job->decode_step_ms, f ? f * 1000.0 / job->decode_step_ms : 0.0,
+                        wall_ms, f ? f * 1000.0 / wall_ms : 0.0);
+            }
             bool dropped; { std::lock_guard<std::mutex> lk(job->m); dropped = job->client_dropped; }
             submit_finalize(s, job, dropped);
             slot_job[i].reset();
@@ -567,10 +581,15 @@ static void worker_loop(ServerState & s) {
         for (int i = 0; i < B; ++i)
             if (slot_job[i] && !slot_job[i]->slot.done) step_list.push_back(&slot_job[i]->slot);
         if (!step_list.empty()) {
+            const auto st0 = std::chrono::steady_clock::now();
             zonos2_batch_step(bc, step_list);
-            for (zonos2_slot * sp : step_list)
+            const double step_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - st0).count();
+            for (zonos2_slot * sp : step_list) {
                 memcpy(slot_job[sp->index]->logits.data(), zonos2_batch_slot_logits(bc, sp->index),
                        (size_t) av * ncb * sizeof(float));
+                slot_job[sp->index]->decode_step_ms += step_ms; // exact at batch=1; upper bound when batched
+            }
         }
     }
 
@@ -819,7 +838,8 @@ static void usage(const char * a0) {
         "  --port P            port (default 1919)\n"
         "  --gpu | --cpu       backend (default cpu)\n"
         "  --dac-cpu           run the DAC decoder on CPU even with --gpu (isolates the\n"
-        "                      backbone CUDA graph; makes streamed audio bit-exact)\n"
+        "                      backbone graph; makes streamed audio bit-exact; default on Metal)\n"
+        "  --dac-gpu           force GPU DAC (overrides the Metal CPU-DAC default)\n"
         "  --max N             max frames per request (default 2000, ~23s)\n"
         "  --batch N           continuous-batching width / concurrent syntheses (default 4)\n"
         "  --dac-threads N     DAC decode pool lanes, parallel decode across requests (default 4)\n"
@@ -834,7 +854,7 @@ int main(int argc, char ** argv) {
     ServerState s;
     std::string model_path = argv[1], dac_path, spk_path, host = "127.0.0.1";
     int port = 1919;
-    bool dac_cpu = false;
+    bool dac_cpu = false, dac_place_set = false;   // dac_place_set: user pinned DAC placement explicitly
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if      (a == "--dac" && i + 1 < argc) dac_path = argv[++i];
@@ -843,7 +863,8 @@ int main(int argc, char ** argv) {
         else if (a == "--port" && i + 1 < argc) port = atoi(argv[++i]);
         else if (a == "--gpu") s.use_gpu = true;
         else if (a == "--cpu") s.use_gpu = false;
-        else if (a == "--dac-cpu") dac_cpu = true;
+        else if (a == "--dac-cpu") { dac_cpu = true;  dac_place_set = true; }
+        else if (a == "--dac-gpu") { dac_cpu = false; dac_place_set = true; }
         else if (a == "--max" && i + 1 < argc) s.max_frames = atoi(argv[++i]);
         else if (a == "--batch" && i + 1 < argc) s.batch_slots = std::max(1, atoi(argv[++i]));
         else if (a == "--dac-threads" && i + 1 < argc) s.dac_threads = std::max(1, atoi(argv[++i]));
@@ -853,8 +874,21 @@ int main(int argc, char ** argv) {
         else { usage(argv[0]); return 1; }
     }
     if (dac_path.empty()) { fprintf(stderr, "error: --dac <dac.gguf> is required\n"); return 1; }
+    s.prof = getenv("ZONOS2_PROFILE") != nullptr;
 
     if (!zonos2_model_load(s.model, model_path.c_str(), s.use_gpu)) { fprintf(stderr, "failed to load model\n"); return 1; }
+
+    // On Metal the backbone and DAC share one GPU; running DAC there starves the backbone decode
+    // (measured ~2.5x slower end-to-end on M3). Default DAC to CPU when on a Metal GPU unless the
+    // user pinned placement with --dac-cpu/--dac-gpu. (For high-concurrency --batch loads GPU DAC
+    // may still win on throughput; override with --dac-gpu then.)
+    if (s.use_gpu && !dac_place_set) {
+        const char * bname = ggml_backend_name(s.model.backend);
+        if (bname && (strstr(bname, "Metal") || strstr(bname, "MTL"))) {
+            dac_cpu = true;
+            fprintf(stderr, "zonos2-server: Metal GPU -> DAC defaults to CPU (avoids backbone contention; --dac-gpu to override)\n");
+        }
+    }
     if (!dac_load(s.dac, dac_path.c_str(), s.use_gpu && !dac_cpu)) { fprintf(stderr, "failed to load dac\n"); return 1; }
     if (!spk_path.empty()) {
         if (!spk_load(s.spk, spk_path.c_str())) { fprintf(stderr, "failed to load speaker encoder\n"); return 1; }
