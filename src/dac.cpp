@@ -6,6 +6,7 @@
 
 #include "compat.h"
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -53,6 +54,10 @@ bool dac_load(dac_model & m, const char * path, bool use_gpu) {
     m.backend = ggml_backend_dev_init(dev, nullptr);
     m.buft    = ggml_backend_dev_buffer_type(dev);
     m.is_gpu  = (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!m.is_gpu) {
+        const char * th = getenv("DAC_THREADS");
+        if (th) ggml_backend_cpu_set_n_threads(m.backend, std::max(1, atoi(th)));
+    }
     m.ctx_w   = ctx_meta;
     m.buf_w   = ggml_backend_alloc_ctx_tensors(ctx_meta, m.backend);
 
@@ -86,11 +91,19 @@ void dac_free(dac_model & m) {
 
 // ---- graph helpers; activations are TIME-major [T, C] (ne0=time), as ggml convs want ----
 
-// Conv1d via im2col(F32) + mul_mat, full precision. w ne=[K,IC,OC], bias ne=[1,OC] (or null).
-// x:[L,IC] -> [OL,OC].
+// Conv1d via im2col + mul_mat. w ne=[K,IC,OC], bias ne=[1,OC] (or null). x:[L,IC] -> [OL,OC].
+// The im2col patch buffer is the heaviest tensor in DAC decode (K*IC * OL; e.g. ~1.1 GB at the
+// final upsampled resolution) and the convs are bandwidth-bound on it, so it is materialized as
+// F16: that halves the dominant memory traffic and routes mul_mat through the F16 path (src0=F16
+// patches, src1=F32 weights). Output is F32; audio is bit-close to the all-F32 path.
 static ggml_tensor * conv1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * bias,
                             ggml_tensor * x, int s, int p, int d) {
-    ggml_tensor * ic = ggml_im2col(ctx, w, x, s, 0, p, 0, d, 0, false, GGML_TYPE_F32);  // [K*IC, OL, 1]
+    // im2col (F16 patches, F32 weights). A direct shifted-matmul conv1d was tried to avoid the
+    // patch-buffer materialization, but it was slower on CPU (7 small matmuls + a channel-major
+    // transpose lost to im2col's single large matmul — the F16 patch buffer is already cheap) and
+    // unsupported on Metal (needs the PAD op). im2col stays.
+    ggml_tensor * w16 = ggml_cast(ctx, w, GGML_TYPE_F16);
+    ggml_tensor * ic = ggml_im2col(ctx, w16, x, s, 0, p, 0, d, 0, false, GGML_TYPE_F16);  // [K*IC, OL, 1]
     ggml_tensor * r = ggml_mul_mat(ctx,
         ggml_reshape_2d(ctx, ic, ic->ne[0], ic->ne[1] * ic->ne[2]),   // src0 = im2col [K*IC, OL]
         ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));      // src1 = w      [K*IC, OC]
@@ -102,11 +115,50 @@ static ggml_tensor * conv1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b
 // match PyTorch padding=ceil(stride/2) (exact for even strides). w ne=[K,OC,IC], bias [1,OC].
 static ggml_tensor * convt1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * bias,
                              ggml_tensor * x, int stride) {
-    ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);  // [(L+1)*stride, OC]
-    const int crop = stride / 2;
-    const int64_t outL = x->ne[0] * stride;
-    ggml_tensor * v = ggml_view_2d(ctx, y, outL, y->ne[1], y->nb[1], (size_t) crop * y->nb[0]);
-    v = ggml_cont(ctx, v);                  // [L*stride, OC]
+    // ConvTranspose1d (kernel K = 2*stride) reimplemented as GEMM + overlap-add fold instead of
+    // ggml_conv_transpose_1d. The stock Metal conv_transpose kernel is one thread per output sample
+    // looping over IC with poor reuse — it dominates GPU DAC time (RTF ~4). Here the per-input-frame
+    // kernel response is a single mul_mat (efficient mul_mm on GPU), then folded:
+    //   yk[i,k,oc] = sum_ic x[i,ic]*w[k,oc,ic];  K=2s, output block b = lower(yk[b]) + upper(yk[b-1]).
+    // x:[L,IC] -> [L*stride, OC], matching the old crop (drop stride/2 each side of the (L+1)*s field).
+    const int s = stride, K = (int) w->ne[0], OC = (int) w->ne[1], IC = (int) w->ne[2], L = (int) x->ne[0];
+    if (getenv("DAC_OLD_CONVT") || K != 2 * s) {                          // reference path for A/B
+        ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
+        const int crop = stride / 2;
+        ggml_tensor * v = ggml_cont(ctx, ggml_view_2d(ctx, y, (int64_t) L * stride, y->ne[1],
+                                                      y->nb[1], (size_t) crop * y->nb[0]));
+        if (bias) v = ggml_add(ctx, v, bias);
+        return v;
+    }
+    GGML_ASSERT(K == 2 * s);
+    // w[K,OC,IC] -> [IC, K*OC] so mul_mat sums over IC; pair with xT[IC,L].
+    ggml_tensor * wp = ggml_cont(ctx, ggml_permute(ctx, w, 1, 2, 0, 3));   // [IC, K, OC]
+    wp = ggml_reshape_2d(ctx, wp, IC, (int64_t) K * OC);                   // [IC, K*OC] (ko = k + K*oc)
+    ggml_tensor * xT = ggml_cont(ctx, ggml_transpose(ctx, x));            // [IC, L]
+    ggml_tensor * yk = ggml_mul_mat(ctx, wp, xT);                          // [K*OC, L]  yk[k+K*oc, i]
+    // reshape to [K, OC, L] then split lower (k<s) / upper (k>=s) halves -> each [s, OC, L]
+    yk = ggml_reshape_3d(ctx, yk, K, OC, L);                              // [K, OC, L]
+    ggml_tensor * lower = ggml_cont(ctx, ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], 0));
+    ggml_tensor * upper = ggml_cont(ctx, ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], (size_t) s * yk->nb[0]));
+    // time-major [L*s, OC]: index t = b*s + p. lower contributes to block b, upper(b) to block b+1.
+    // lower -> [s,OC,L] -> permute to [s,L,OC] -> reshape [L*s, OC]; same for upper.
+    auto to_time_major = [&](ggml_tensor * h) {                           // [s,OC,L] -> [L*s, OC]
+        h = ggml_cont(ctx, ggml_permute(ctx, h, 0, 2, 1, 3));            // [s, L, OC]
+        return ggml_reshape_2d(ctx, h, (int64_t) s * L, OC);              // [L*s, OC]
+    };
+    ggml_tensor * lo = to_time_major(lower);                              // aligned at block b
+    ggml_tensor * up = to_time_major(upper);                             // belongs at block b+1 (shift +s)
+    // O (length (L+1)*s) = lo placed at [0, L*s) + up placed at [s, (L+1)*s). Final crop [s/2, s/2+L*s).
+    // final[t'] = lo[t'+s/2]  (t'+s/2 < L*s)  +  up[t'-s/2]  (t' >= s/2).
+    const int h = s / 2;
+    // term A: lo[h : L*s], length L*s-h, then pad h zeros at end -> [L*s, OC]
+    ggml_tensor * A = ggml_cont(ctx, ggml_view_2d(ctx, lo, (int64_t) s * L - h, OC, lo->nb[1], (size_t) h * lo->nb[0]));
+    A = ggml_pad(ctx, A, h, 0, 0, 0);                                    // [L*s, OC]
+    // term B: up[0 : L*s-h], shifted right by h -> prepend h zeros. Build via pad at front using concat.
+    ggml_tensor * Bhead = ggml_cont(ctx, ggml_view_2d(ctx, up, (int64_t) s * L - h, OC, up->nb[1], 0)); // [L*s-h, OC]
+    ggml_tensor * zeros = ggml_scale(ctx, ggml_cont(ctx, ggml_view_2d(ctx, up, h, OC, up->nb[1], 0)), 0.0f); // [h,OC]
+    ggml_tensor * B = ggml_concat(ctx, zeros, Bhead, 0); // [L*s, OC]
+    ggml_tensor * v = ggml_add(ctx, A, B);                               // [L*s, OC]
     if (bias) v = ggml_add(ctx, v, bias);
     return v;
 }
@@ -201,8 +253,16 @@ static bool dac_run_decoder(const dac_model & m, const std::vector<std::vector<i
     for (int i = 0; i < m.n_codebooks; ++i)
         ggml_backend_tensor_set(code_in[i], idx[i].data(), 0, (size_t) L * sizeof(int32_t));
 
+    const bool dac_prof = getenv("DAC_PROFILE") != nullptr;
+    auto t_c0 = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "dac: compute failed\n"); ggml_gallocr_free(galloc); ggml_free(ctx); return false;
+    }
+    if (dac_prof) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_c0).count();
+        const double sec = (double) out->ne[0] / (double) m.sample_rate;
+        fprintf(stderr, "dac[prof]: L=%d nodes=%d compute=%.1fms audio=%.2fs RTF=%.2f\n",
+                L, ggml_graph_n_nodes(gf), ms, sec, (ms / 1000.0) / sec);
     }
 
     const int64_t ns = out->ne[0];
