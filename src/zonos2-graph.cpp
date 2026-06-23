@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -634,10 +635,21 @@ bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * pr
     gctx g; g.m = &m; g.ctx = ctx; g.n = n0; g.capture = false;
     g.spk_pos = spk ? spk_pos : -1;
     g.kc = &bc.k_cache; g.vc = &bc.v_cache; g.decode = false; g.n_slots = 1; g.slot_cap = S;
+    // Optional profiling: ZONOS2_PREFILL_NLAYERS=N runs only the first N transformer layers
+    // (logits are then garbage) so first-audio latency can be attributed across the layer stack.
+    const char * nl_env = getenv("ZONOS2_PREFILL_NLAYERS");
+    const int prefill_nl = nl_env ? atoi(nl_env) : -1;
+    const bool prof = getenv("ZONOS2_PROFILE") != nullptr;
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = clk::now();
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false); g.gf = gf;
-    ggml_tensor * logits = build_graph(g, -1); ggml_set_output(logits);
+    ggml_tensor * logits = build_graph(g, prefill_nl); ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
     bool ok = ggml_gallocr_alloc_graph(bc.galloc_prefill, gf);
+    auto t1 = clk::now();
     if (ok) {
         std::vector<int32_t> col(n0);
         for (int k = 0; k < W; ++k) {
@@ -650,7 +662,12 @@ bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * pr
         ggml_backend_tensor_set(g.pos_cache, col.data(), 0, (size_t) n0 * sizeof(int32_t));
         if (g.mask_causal) set_causal_mask(g.mask_causal, n0);
         if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
+        auto t2 = clk::now();
         ok = ggml_backend_graph_compute(m.backend, gf) == GGML_STATUS_SUCCESS;
+        auto t3 = clk::now();
+        if (prof) fprintf(stderr,
+            "prefill[prof]: n0=%d nlayers=%d nodes=%d  build+alloc=%.1fms set=%.1fms compute=%.1fms\n",
+            n0, prefill_nl, ggml_graph_n_nodes(gf), ms(t0, t1), ms(t1, t2), ms(t2, t3));
         if (ok) ggml_backend_tensor_get(logits, out_logits, (size_t) (n0 - 1) * av * ncb * sizeof(float),
                                         (size_t) av * ncb * sizeof(float));
     }
