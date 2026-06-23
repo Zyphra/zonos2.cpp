@@ -18,6 +18,13 @@ in sorted filename order.
   sequences this dominated runtime (>470s for a 2048-frame clip). The fix computes
   the contributing tap range directly (O(L·K)). Bit-identical output, ~240× faster.
   Worth upstreaming.
+- `metal-ncb-env.patch` — let the Metal backend read the command-buffer count from
+  `GGML_METAL_NCB` (upstream hard-codes 1). Single-token decode is a chain of ~1675
+  tiny kernels; with one command buffer the ~3 ms CPU encode runs nearly serially
+  ahead of the GPU, but spreading it over a few buffers lets the GPU stream through
+  them as they enqueue — ~10% faster decode at no quality cost. `zonos2_model_load`
+  defaults it to 4 for the GPU backbone (overridable); prefill's big GEMMs are
+  unaffected. Behavior is identical to upstream when the env var is unset.
 
 ## Caveats
 
