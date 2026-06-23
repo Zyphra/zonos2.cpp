@@ -258,8 +258,24 @@ ggml_tensor * build_graph(gctx & g, int n_layer_limit) {
         ggml_tensor * sl = ggml_add(ctx, ggml_mul_mat(ctx, m.spk_lda_w,  g.spk), m.spk_lda_b);
         ggml_tensor * sp = ggml_add(ctx, ggml_mul_mat(ctx, m.spk_proj_w, sl),    m.spk_proj_b);
         g.cap("spk_proj", sp); // [n_embd]
-        emb = ggml_set_1d(ctx, emb, ggml_reshape_1d(ctx, sp, hp.n_embd),
-                          (size_t) g.spk_pos * hp.n_embd * ggml_element_size(emb));
+        // Replace column spk_pos of emb with sp, built as a concat of contiguous column
+        // views rather than ggml_set_1d. GGML_OP_SET's non-inplace path on the Metal backend
+        // corrupts the columns it should be copying through unchanged (only the written slice
+        // is correct), which silently destroyed the speaker conditioning and made the model
+        // emit EOS on the first frame. concat is correct on every backend; emb is contiguous
+        // [n_embd, n], so each column slice below is itself a contiguous block.
+        const int ne = (int) hp.n_embd, n = g.n, p = g.spk_pos;
+        ggml_tensor * out = ggml_reshape_2d(ctx, sp, ne, 1);            // speaker column [n_embd, 1]
+        if (p > 0) {
+            ggml_tensor * head = ggml_view_2d(ctx, emb, ne, p, emb->nb[1], 0);
+            out = ggml_concat(ctx, head, out, 1);                      // [n_embd, p+1]
+        }
+        if (p < n - 1) {
+            ggml_tensor * tail = ggml_view_2d(ctx, emb, ne, n - 1 - p, emb->nb[1],
+                                              (size_t) (p + 1) * emb->nb[1]);
+            out = ggml_concat(ctx, out, tail, 1);                      // [n_embd, n]
+        }
+        emb = ggml_cont(ctx, out);
         g.cap("emb_after_spk", emb);
     }
 
