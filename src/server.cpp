@@ -404,6 +404,15 @@ static void dac_lane_submit(DacLane & lane, DacTask && t) {
 // one lane, so its blocks stay ordered; FINALIZE tasks carry `finish` to close the channel last.
 static void dac_lane_loop(ServerState & s, DacLane & lane) {
     const int ncb = lane.dac.n_codebooks, sr = lane.dac.sample_rate;
+    // Warm this lane's DAC pipelines (conv_transpose/im2col, etc.) before serving so the first
+    // streamed/finalized block doesn't JIT-compile them on the request's critical path.
+    if (!getenv("ZONOS2_NO_WARMUP")) {
+        const int H = 32;
+        std::vector<int32_t> codes((size_t) H * ncb, 0);
+        std::vector<float> pcm;
+        dac_decode(lane.dac, codes.data(), H, ncb, /*eos=*/-1, pcm);                 // buffered path
+        dac_decode_window(lane.dac, codes.data(), H, 0, 16, s.stream_ctx, 0, pcm); // streaming path
+    }
     for (;;) {
         DacTask t;
         {
@@ -468,6 +477,26 @@ static void submit_finalize(ServerState & s, const std::shared_ptr<ReqJob> & job
     dac_lane_submit(s.dac_lanes[job->lane], std::move(t));
 }
 
+// Run a throwaway prefill + a couple of decode steps so every backbone graph pipeline is JIT-
+// compiled before the first real request. On Metal that compilation is ~0.5s of lazy kernel
+// builds that would otherwise land on the first user's time-to-first-audio. Slot 0's cache band
+// is left holding dummy K/V, but the first admitted request re-prefills its slot, overwriting it.
+static void warmup_backbone(zonos2_batch_ctx & bc) {
+    if (getenv("ZONOS2_NO_WARMUP")) return;
+    const int W = bc.W, n0 = 16;
+    std::vector<float> ids((size_t) n0 * W, 0.0f);          // all-zero codes are valid token ids
+    std::vector<float> logits((size_t) bc.av * bc.ncb, 0.0f);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!zonos2_batch_slot_prefill(bc, 0, ids.data(), n0, nullptr, -1, logits.data())) return;
+    zonos2_slot slot;
+    slot.index = 0; slot.active = true; slot.n_past = n0;
+    slot.next_ids.assign(W, 0);
+    for (int i = 0; i < 2; ++i) zonos2_batch_step(bc, { &slot }); // n_past auto-advances
+    const auto t1 = std::chrono::steady_clock::now();
+    fprintf(stderr, "zonos2-server: backbone warmup in %.0f ms\n",
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
+}
+
 static void worker_loop(ServerState & s) {
     const int ncb = (int) s.model.hp.n_codebooks, av = (int) s.model.hp.audio_vocab;
     const int B = s.batch_slots;
@@ -477,6 +506,7 @@ static void worker_loop(ServerState & s) {
         fprintf(stderr, "worker: batch init failed; synthesis disabled\n");
         return;
     }
+    warmup_backbone(bc);
     std::vector<std::shared_ptr<ReqJob>> slot_job(B);
 
     while (!s.stop.load()) {
