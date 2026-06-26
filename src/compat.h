@@ -11,8 +11,16 @@
 
 #ifdef _WIN32
 #include <stdio.h>
+#include <stdlib.h>
 #define fseeko(stream, offset, whence) _fseeki64((stream), (long long) (offset), (whence))
 #define ftello(stream)                 _ftelli64(stream)
 #define popen                          _popen
 #define pclose                         _pclose
+
+// MSVC's CRT has no POSIX setenv; _putenv_s always overwrites, so emulate the
+// overwrite flag by checking for an existing value first.
+static inline int setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite && getenv(name) != NULL) return 0;
+    return _putenv_s(name, value);
+}
 #endif
