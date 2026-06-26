@@ -144,7 +144,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # Ninja needs cl.exe on PATH (the VS generator found it implicitly).
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Resolve ggml submodule rev
+        id: ggml
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+      - name: Cache Vulkan SDK
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK\1.4.313.2
+          key: vulkan-sdk-1.4.313.2
       - name: Install Vulkan SDK (LunarG)
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           # 1.4.313.2 bundles the SPIRV-Headers CMake config that ggml-vulkan
@@ -155,12 +170,33 @@ jobs:
           curl.exe -L -o VulkanSDK.exe "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
           if ((Get-Item VulkanSDK.exe).Length -lt 50MB) { throw "Vulkan SDK download failed: got $((Get-Item VulkanSDK.exe).Length) bytes" }
           .\VulkanSDK.exe --accept-licenses --default-answer --confirm-command install
+      - name: Set Vulkan SDK env
+        shell: pwsh
+        run: |
+          $ver = "1.4.313.2"
           echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
           echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: windows-vulkan
+      # The generated SPIR-V shaders (the build's long pole) depend only on the ggml
+      # submodule, so key the build tree on its rev. restore-keys lets a src-only
+      # change reuse the cached shaders + unchanged objects and rebuild just the
+      # changed C++; the restored .spv are newer than the checked-out .comp, so the
+      # shader-gen step is a no-op.
+      - name: Cache build tree
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: win-vulkan-build-${{ steps.ggml.outputs.sha }}-${{ hashFiles('src/**', 'CMakeLists.txt') }}
+          restore-keys: |
+            win-vulkan-build-${{ steps.ggml.outputs.sha }}-
       - name: Configure
-        run: cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
+        run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
-        run: cmake --build build --config Release -j
+        run: cmake --build build -j
       - name: Smoke test
         shell: bash
         run: |
