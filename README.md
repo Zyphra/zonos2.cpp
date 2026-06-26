@@ -1,7 +1,7 @@
 # zonos2.cpp
 
 <p align="center">
-  <img src="https://huggingface.co/Zyphra/ZONOS2/resolve/main/assets/ZONOS2BlogThumbnail.png" alt="ZONOS2" width="750" />
+  <img src="./assets/ZONOS2BlogThumbnail.png" alt="ZONOS2" width="750" />
 </p>
 
 <div align="center">
@@ -23,7 +23,7 @@ quality within eval noise of F16.
 An inference overview can be seen below.
 
 <p align="center">
-  <img src="https://huggingface.co/Zyphra/ZONOS2/resolve/main/assets/zonos2_arlooop_animated.gif" alt="ZONOS2 inference overview" width="750" />
+  <img src="./assets/zonos2_arlooop_animated.gif" alt="ZONOS2 inference overview" width="750" />
 </p>
 
 zonos2.cpp ships a high-performance HTTP server (`zonos2-server`) that mirrors the reference
