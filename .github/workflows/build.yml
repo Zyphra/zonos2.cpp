@@ -45,6 +45,13 @@ jobs:
           if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
           echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
           test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
+      # Run the documented README / docs/INTERNALS.md commands against the committed
+      # dummy fixtures (backbone + DAC): the CLI codes/WAV paths on every platform,
+      # plus the zonos2-server HTTP routes on Linux/macOS (the script self-skips the
+      # server on Windows and when curl is absent).
+      - name: README command tests
+        shell: bash
+        run: bash tests/readme-commands.sh
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -111,6 +118,13 @@ jobs:
           if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
           echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
           test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
+      # Run the documented README / docs/INTERNALS.md commands against the committed
+      # dummy fixtures (backbone + DAC): the CLI codes/WAV paths on every platform,
+      # plus the zonos2-server HTTP routes on Linux/macOS (the script self-skips the
+      # server on Windows and when curl is absent).
+      - name: README command tests
+        shell: bash
+        run: bash tests/readme-commands.sh
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -159,6 +173,13 @@ jobs:
           if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
           echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
           test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
+      # Run the documented README / docs/INTERNALS.md commands against the committed
+      # dummy fixtures (backbone + DAC): the CLI codes/WAV paths on every platform,
+      # plus the zonos2-server HTTP routes on Linux/macOS (the script self-skips the
+      # server on Windows and when curl is absent).
+      - name: README command tests
+        shell: bash
+        run: bash tests/readme-commands.sh
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -251,6 +272,13 @@ jobs:
           if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
           echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
           test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
+      # Run the documented README / docs/INTERNALS.md commands against the committed
+      # dummy fixtures (backbone + DAC): the CLI codes/WAV paths on every platform,
+      # plus the zonos2-server HTTP routes on Linux/macOS (the script self-skips the
+      # server on Windows and when curl is absent).
+      - name: README command tests
+        shell: bash
+        run: bash tests/readme-commands.sh
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
