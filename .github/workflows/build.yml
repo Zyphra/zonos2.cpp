@@ -64,9 +64,22 @@ jobs:
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
           sudo apt-get install -y vulkan-sdk
+      - name: Resolve ggml submodule rev
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: linux-vulkan
+      # Shader gen (glslc) is the build's long pole and ccache does not cover it;
+      # the generated SPIR-V depends only on the ggml submodule. Same approach as
+      # the windows-vulkan job.
+      - name: Cache build tree
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: linux-vulkan-build-${{ steps.ggml.outputs.sha }}-${{ hashFiles('src/**', 'CMakeLists.txt') }}
+          restore-keys: |
+            linux-vulkan-build-${{ steps.ggml.outputs.sha }}-
       - name: Configure
         run: >
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
