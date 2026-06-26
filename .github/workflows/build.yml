@@ -37,6 +37,14 @@ jobs:
           srv=$(find build \( -name zonos2-server -o -name zonos2-server.exe \) -type f | head -1)
           out=$("$srv" 2>&1 || true)
           echo "$out" | grep -q "usage:" || { echo "server smoke failed:"; echo "$out"; exit 1; }
+          # End-to-end forward pass on a tiny committed model (random weights, ~1.5 MB,
+          # see scripts/make-dummy-model.py): exercises prompt build -> backbone graph ->
+          # sampler on the CPU backend, the path the usage check never reaches. Audio is
+          # gibberish by design — we only assert the decode loop runs and emits codes.
+          out=$("$bin" tests/fixtures/dummy-zonos2.gguf --tts "ci smoke test" gen.npy --max 8 --greedy 2>&1); rc=$?
+          if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
+          echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
+          test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -95,6 +103,14 @@ jobs:
           srv=$(find build \( -name zonos2-server -o -name zonos2-server.exe \) -type f | head -1)
           out=$("$srv" 2>&1 || true)
           echo "$out" | grep -q "usage:" || { echo "server smoke failed:"; echo "$out"; exit 1; }
+          # End-to-end forward pass on a tiny committed model (random weights, ~1.5 MB,
+          # see scripts/make-dummy-model.py): exercises prompt build -> backbone graph ->
+          # sampler on the CPU backend, the path the usage check never reaches. Audio is
+          # gibberish by design — we only assert the decode loop runs and emits codes.
+          out=$("$bin" tests/fixtures/dummy-zonos2.gguf --tts "ci smoke test" gen.npy --max 8 --greedy 2>&1); rc=$?
+          if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
+          echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
+          test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -135,6 +151,14 @@ jobs:
           srv=$(find build \( -name zonos2-server -o -name zonos2-server.exe \) -type f | head -1)
           out=$("$srv" 2>&1 || true)
           echo "$out" | grep -q "usage:" || { echo "server smoke failed:"; echo "$out"; exit 1; }
+          # End-to-end forward pass on a tiny committed model (random weights, ~1.5 MB,
+          # see scripts/make-dummy-model.py): exercises prompt build -> backbone graph ->
+          # sampler on the CPU backend, the path the usage check never reaches. Audio is
+          # gibberish by design — we only assert the decode loop runs and emits codes.
+          out=$("$bin" tests/fixtures/dummy-zonos2.gguf --tts "ci smoke test" gen.npy --max 8 --greedy 2>&1); rc=$?
+          if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
+          echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
+          test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -219,6 +243,14 @@ jobs:
           srv=$(find build -name zonos2-server.exe -type f | head -1)
           out=$("$srv" 2>&1 || true)
           echo "$out" | grep -q "usage:" || { echo "server smoke failed:"; echo "$out"; exit 1; }
+          # End-to-end forward pass on a tiny committed model (random weights, ~1.5 MB,
+          # see scripts/make-dummy-model.py): exercises prompt build -> backbone graph ->
+          # sampler on the CPU backend, the path the usage check never reaches. Audio is
+          # gibberish by design — we only assert the decode loop runs and emits codes.
+          out=$("$bin" tests/fixtures/dummy-zonos2.gguf --tts "ci smoke test" gen.npy --max 8 --greedy 2>&1); rc=$?
+          if [ "$rc" -ne 0 ]; then echo "dummy-model run failed (rc=$rc):"; echo "$out"; exit 1; fi
+          echo "$out" | grep -qE "tts: [0-9]+ frames, eos_frame=" || { echo "dummy-model: no generation output"; echo "$out"; exit 1; }
+          test -f gen.npy || { echo "dummy-model: no output file written"; exit 1; }
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash

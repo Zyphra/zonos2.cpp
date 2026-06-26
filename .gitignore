@@ -4,6 +4,7 @@
 # generated model + validation data (large; regenerable)
 /out/
 *.gguf
+!tests/fixtures/*.gguf
 *.npy
 *.npz
 *.wav
