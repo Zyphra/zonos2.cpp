@@ -4,6 +4,7 @@
 #include "gguf.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -185,10 +186,56 @@ bool zonos2_model_load(zonos2_model & m, const char * path, bool use_gpu) {
 }
 
 void zonos2_model_free(zonos2_model & m) {
+    if (m.buf_mask) ggml_backend_buffer_free(m.buf_mask);
+    if (m.ctx_mask) ggml_free(m.ctx_mask);
     if (m.buf_w)   ggml_backend_buffer_free(m.buf_w);
     if (m.ctx_w)   ggml_free(m.ctx_w);
     if (m.backend) ggml_backend_free(m.backend);
     m = zonos2_model();
+}
+
+// Runtime expert mask — the dynamic equivalent of prune-cli. For each MoE layer in `keep` we
+// build an additive [n_expert] vector (0 for kept experts, -inf for dropped) and hang it on the
+// layer; build_moe adds it to the router logits before softmax (so the surviving experts'
+// probabilities renormalize) and to the top-k selection scores (so dropped experts are never
+// routed). The keep-set is identical to what prune-cli would bake, so a mask sweep predicts the
+// pruned model's quality without writing any GGUF.
+bool zonos2_set_expert_mask(zonos2_model & m, const std::map<int, std::vector<int>> & keep) {
+    // Clear any previous mask first.
+    if (m.buf_mask) { ggml_backend_buffer_free(m.buf_mask); m.buf_mask = nullptr; }
+    if (m.ctx_mask) { ggml_free(m.ctx_mask); m.ctx_mask = nullptr; }
+    for (auto & ly : m.layers) ly.router_mask = nullptr;
+
+    // Collect the layers we will actually mask (MoE, in range, present in keep).
+    std::vector<int> mlayers;
+    for (const auto & kv : keep) {
+        const int L = kv.first;
+        if (L >= 0 && L < (int) m.layers.size() && m.layers[L].is_moe) mlayers.push_back(L);
+    }
+    if (mlayers.empty()) return true;
+
+    ggml_init_params ip = { (size_t) (mlayers.size() + 1) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+    m.ctx_mask = ggml_init(ip);
+    if (!m.ctx_mask) { fprintf(stderr, "zonos2: expert-mask ctx alloc failed\n"); return false; }
+    for (int L : mlayers) {
+        const int ne = (int) m.layers[L].ffn_up_exps->ne[2];
+        ggml_tensor * t = ggml_new_tensor_1d(m.ctx_mask, GGML_TYPE_F32, ne);
+        ggml_set_name(t, ("router_mask." + std::to_string(L)).c_str());
+        m.layers[L].router_mask = t;
+    }
+    m.buf_mask = ggml_backend_alloc_ctx_tensors(m.ctx_mask, m.backend);
+    if (!m.buf_mask) { fprintf(stderr, "zonos2: expert-mask buffer alloc failed\n"); return false; }
+
+    int total_dropped = 0;
+    for (int L : mlayers) {
+        const int ne = (int) m.layers[L].ffn_up_exps->ne[2];
+        std::vector<float> h(ne, -INFINITY);
+        for (int e : keep.at(L)) if (e >= 0 && e < ne) h[e] = 0.0f;
+        for (int e = 0; e < ne; ++e) if (h[e] != 0.0f) ++total_dropped;
+        ggml_backend_tensor_set(m.layers[L].router_mask, h.data(), 0, h.size() * sizeof(float));
+    }
+    fprintf(stderr, "zonos2: expert mask on %zu MoE layers, %d experts dropped\n", mlayers.size(), total_dropped);
+    return true;
 }
 
 int zonos2_router_dim(const zonos2_model & m) {

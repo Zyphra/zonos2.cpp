@@ -81,6 +81,11 @@ add_executable(quantize-cli src/quantize.cpp)
 target_include_directories(quantize-cli PRIVATE src ggml/include)
 target_link_libraries(quantize-cli PRIVATE ggml)
 
+# --- gguf -> gguf MoE expert pruner (drops low-MSAN experts per layer) ---
+add_executable(prune-cli src/prune.cpp)
+target_include_directories(prune-cli PRIVATE src ggml/include)
+target_link_libraries(prune-cli PRIVATE ggml)
+
 # --- perplexity / KL-divergence eval for quantized backbones (scoring only, no DAC) ---
 add_executable(zonos2-perplexity src/perplexity.cpp)
 target_include_directories(zonos2-perplexity PRIVATE src ggml/include)

@@ -6,6 +6,8 @@
 #include "spk-encoder.h"
 #include "npy.h"
 #include "ggml.h"
+#include "prune-stats.h"
+#include "prune-policy.h"
 
 #include <chrono>
 #include <cstdio>
@@ -25,6 +27,7 @@ static void usage(const char * a0) {
         "       %s <model.gguf> --batch-test \"<t1|t2|...>\" [--slots N] [--max N] [--greedy] [--dac <dac.gguf>] --gpu\n"
         "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n"
         "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n"
+        "  (--prune-mask <stats.bin> (--keep N | --mass-eps E | --drop-below-hits H): audition a pruned recipe by ear before baking with prune-cli)\n"
         "  conditioning paths (--tts/--build-prompt): [--inaccurate] [--noisy-bg] [--speaking-rate N] [--quality f:b[,f:b...]]\n"
         "  emotion control (--tts/--generate): [--emotion happy=1[,sad=-0.5]] [--emotion-valence X] [--emotion-arousal X]\n"
         "                                      [--emotion-strength X] [--emotion-cfg-scale X] [--emotion-dir DIR]\n"
@@ -313,6 +316,9 @@ int main(int argc, char ** argv) {
     bool validate = false, generate = false, do_tts = false, do_build_prompt = false, do_batch_test = false, do_decode_bench = false;
     std::string ids_path, out_dir, out_codes, spk_path, text, prompt_out, dac_path, dump_ids_path;
     std::string clone_path, spk_encoder_path, save_spk_path; // one-command voice cloning
+    std::string prune_mask_path;                             // --prune-mask: runtime expert pruning
+    int mask_keep = -1, mask_drop_hits = -1;
+    double mask_mass_eps = -1.0;
     int n_layer_limit = -1, max_frames = 400, spk_pos = 0, n_slots = 1;
     bool use_kv = true;
     // conditioning-path overrides (tri-state: <0 = leave prompt-builder default)
@@ -356,6 +362,10 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--greedy")) sp.greedy = true;
         else if (!strcmp(argv[i], "--recompute")) use_kv = false;
         else if (!strcmp(argv[i], "--dump-ids") && i + 1 < argc) dump_ids_path = argv[++i];
+        else if (!strcmp(argv[i], "--prune-mask")      && i + 1 < argc) prune_mask_path = argv[++i];
+        else if (!strcmp(argv[i], "--keep")            && i + 1 < argc) mask_keep      = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--drop-below-hits") && i + 1 < argc) mask_drop_hits = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mass-eps")        && i + 1 < argc) mask_mass_eps  = atof(argv[++i]);
         else if (!strcmp(argv[i], "--inaccurate")) cond_inaccurate = 1;          // accurate_mode = false
         else if (!strcmp(argv[i], "--noisy-bg"))   cond_noisy_bg = 1;            // clean_speaker_background = false
         else if (!strcmp(argv[i], "--speaking-rate") && i + 1 < argc) cond_rate = atoi(argv[++i]);
@@ -388,6 +398,19 @@ int main(int argc, char ** argv) {
     if (!zonos2_model_load(model, path.c_str(), use_gpu)) {
         fprintf(stderr, "load failed\n");
         return 1;
+    }
+
+    // --prune-mask: dynamically drop low-MSAN experts (runtime equivalent of prune-cli) so a
+    // pruned recipe can be auditioned by ear before baking it into a GGUF.
+    if (!prune_mask_path.empty()) {
+        if (mask_keep < 0 && mask_drop_hits < 0 && mask_mass_eps < 0.0) {
+            fprintf(stderr, "error: --prune-mask needs --keep N, --mass-eps E, or --drop-below-hits H\n");
+            zonos2_model_free(model); return 1;
+        }
+        std::map<int, prune_stats::layer> st;
+        if (!prune_stats::load(prune_mask_path, st)) { zonos2_model_free(model); return 1; }
+        const auto keep = prune_policy::select(st, { mask_keep, mask_drop_hits, mask_mass_eps });
+        if (!zonos2_set_expert_mask(model, keep)) { zonos2_model_free(model); return 1; }
     }
 
     // optional speaker embedding ([spk_dim] or [1, spk_dim] f32) for voice cloning:
