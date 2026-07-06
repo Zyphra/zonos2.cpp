@@ -1,5 +1,6 @@
 // zonos2-cli — load a ZONOS2 GGUF; print summary or run prefill validation.
 #include "zonos2.h"
+#include "zonos2-emotion.h"
 #include "zonos2-sampler.h"
 #include "dac.h"
 #include "spk-encoder.h"
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -24,6 +26,8 @@ static void usage(const char * a0) {
         "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n"
         "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n"
         "  conditioning paths (--tts/--build-prompt): [--inaccurate] [--noisy-bg] [--speaking-rate N] [--quality f:b[,f:b...]]\n"
+        "  emotion control (--tts/--generate): [--emotion happy=1[,sad=-0.5]] [--emotion-valence X] [--emotion-arousal X]\n"
+        "                                      [--emotion-strength X] [--emotion-cfg-scale X] [--emotion-dir DIR]\n"
         "  voice cloning: --speaker <spk.npy> (precomputed) OR --clone <ref_audio> --spk-encoder <spk-encoder.gguf>\n"
         "                 (--clone encodes the reference in-process via ffmpeg+ECAPA; add --save-speaker <out.npy> to cache it)\n",
         a0, a0, a0, a0, a0, a0);
@@ -79,6 +83,20 @@ static std::vector<std::string> split_pipe(const std::string & s) {
         start = p + 1;
     }
     return out;
+}
+
+static bool parse_emotion_spec(const std::string & s, std::map<std::string, float> & out) {
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t comma = s.find(',', pos);
+        const std::string tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        const size_t eq = tok.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 >= tok.size()) return false;
+        out[tok.substr(0, eq)] = (float) atof(tok.substr(eq + 1).c_str());
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return true;
 }
 
 // Raw decode-throughput probe: prefill `n_slots` identical sequences, warm up the CUDA graph, then
@@ -300,6 +318,9 @@ int main(int argc, char ** argv) {
     // conditioning-path overrides (tri-state: <0 = leave prompt-builder default)
     int  cond_inaccurate = 0, cond_noisy_bg = 0, cond_rate = -1;
     std::string cond_quality;          // "feat:bucket[,feat:bucket...]"
+    std::string emotion_dir = "emotion_directions";
+    std::map<std::string, float> emotion_sliders;
+    float emotion_valence = 0.0f, emotion_arousal = 0.0f, emotion_strength = 1.0f;
     zonos2_sampling sp;
     for (int i = 2; i < argc; ++i) {
         if      (!strcmp(argv[i], "--gpu")) use_gpu = true;
@@ -339,6 +360,14 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--noisy-bg"))   cond_noisy_bg = 1;            // clean_speaker_background = false
         else if (!strcmp(argv[i], "--speaking-rate") && i + 1 < argc) cond_rate = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quality") && i + 1 < argc) cond_quality = argv[++i];
+        else if (!strcmp(argv[i], "--emotion") && i + 1 < argc) {
+            if (!parse_emotion_spec(argv[++i], emotion_sliders)) { fprintf(stderr, "bad --emotion spec\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--emotion-valence") && i + 1 < argc) emotion_valence = (float) atof(argv[++i]);
+        else if (!strcmp(argv[i], "--emotion-arousal") && i + 1 < argc) emotion_arousal = (float) atof(argv[++i]);
+        else if (!strcmp(argv[i], "--emotion-strength") && i + 1 < argc) emotion_strength = (float) atof(argv[++i]);
+        else if (!strcmp(argv[i], "--emotion-cfg-scale") && i + 1 < argc) sp.emotion_cfg_scale = (float) atof(argv[++i]);
+        else if (!strcmp(argv[i], "--emotion-dir") && i + 1 < argc) emotion_dir = argv[++i];
         else { usage(argv[0]); return 1; }
     }
 
@@ -399,7 +428,40 @@ int main(int argc, char ** argv) {
         }
         printf("speaker: %zu-d vector from %s, pos=%d\n", spk.size(), spk_path.c_str(), spk_pos);
     }
+    std::vector<float> spk_emotion_delta;
+    const bool emotion_requested = !emotion_sliders.empty() || emotion_valence != 0.0f || emotion_arousal != 0.0f;
+    if (emotion_requested) {
+        if (spk.empty()) {
+            fprintf(stderr, "error: emotion control requires --speaker <spk.npy> or --clone <ref_audio>\n");
+            zonos2_model_free(model); return 1;
+        }
+        zonos2_emotion_directions emotion;
+        std::string err;
+        if (!zonos2_emotion_load(emotion, emotion_dir, err)) {
+            fprintf(stderr, "error: failed to load emotion directions from %s: %s\n", emotion_dir.c_str(), err.c_str());
+            zonos2_model_free(model); return 1;
+        }
+        zonos2_emotion_request ereq;
+        ereq.sliders = emotion_sliders;
+        ereq.valence = emotion_valence;
+        ereq.arousal = emotion_arousal;
+        ereq.strength = emotion_strength;
+        if (!zonos2_emotion_apply(emotion, ereq, spk, spk_emotion_delta, err)) {
+            fprintf(stderr, "error: %s\n", err.c_str());
+            zonos2_model_free(model); return 1;
+        }
+        if (!spk_emotion_delta.empty() && spk_emotion_delta.size() != model.hp.n_embd) {
+            fprintf(stderr, "error: emotion hidden delta dim mismatch: got %zu, want %u\n",
+                    spk_emotion_delta.size(), model.hp.n_embd);
+            zonos2_model_free(model); return 1;
+        }
+        if (spk_emotion_delta.empty()) sp.emotion_cfg_scale = 1.0f;
+        printf("emotion: space=%s names=%zu axes=%zu strength=%.2f cfg=%.2f\n",
+               emotion.space.c_str(), emotion.named.size(), emotion.axes.size(),
+               emotion_strength, sp.emotion_cfg_scale);
+    }
     const float * spk_ptr = spk.empty() ? nullptr : spk.data();
+    const float * spk_delta_ptr = spk_emotion_delta.empty() ? nullptr : spk_emotion_delta.data();
 
     if (do_batch_test) {
         const int rc = run_batch_test(model, text, n_slots, max_frames, sp, dac_path, use_gpu);
@@ -423,7 +485,8 @@ int main(int argc, char ** argv) {
         const int n_tokens = (int) shape[0];
         printf("validate: input_ids [%lld, %lld], n_tokens=%d\n",
                (long long) shape[0], (long long) shape[1], n_tokens);
-        const bool okv = zonos2_validate(model, ids.data(), n_tokens, out_dir.c_str(), n_layer_limit, spk_ptr, spk_pos);
+        const bool okv = zonos2_validate(model, ids.data(), n_tokens, out_dir.c_str(), n_layer_limit,
+                                         spk_ptr, spk_pos, spk_delta_ptr);
         zonos2_model_free(model);
         return okv ? 0 : 1;
     }
@@ -443,7 +506,8 @@ int main(int argc, char ** argv) {
         int eos_frame = -1;
         const int n_frames = zonos2_generate(model, ids.data(), n0, max_frames, sp, codes, eos_frame,
                                              use_kv, spk_ptr, spk_pos,
-                                             dump_ids_path.empty() ? nullptr : &full_ids);
+                                             dump_ids_path.empty() ? nullptr : &full_ids,
+                                             {}, spk_delta_ptr);
         const int ncb = (int) model.hp.n_codebooks;
         if (!dump_ids_path.empty()) {
             const int W = ncb + 1;
@@ -492,7 +556,8 @@ int main(int argc, char ** argv) {
         int eos_frame = -1;
         const int n_frames = zonos2_generate(model, idf.data(), n0, max_frames, sp, codes,
                                              eos_frame, use_kv, spk_ptr, sp_pos >= 0 ? sp_pos : 0,
-                                             dump_ids_path.empty() ? nullptr : &full_ids);
+                                             dump_ids_path.empty() ? nullptr : &full_ids,
+                                             {}, spk_delta_ptr);
         if (!dump_ids_path.empty()) {
             const int W = ncb + 1;
             std::vector<float> ff(full_ids.begin(), full_ids.end());

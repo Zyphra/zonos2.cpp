@@ -118,7 +118,9 @@ zonos2-server out/zonos2-q8_0.gguf --dac out/dac.gguf --spk out/spk-encoder.gguf
 The server starts on `http://localhost:1919` by default. It loads the backbone + DAC (+ speaker
 encoder) once and serves the reference TTS API: streaming float32 PCM, the OpenAI-compatible
 `/v1/audio/speech` route, and audio-upload voice cloning. `--spk` enables cloning from uploaded
-reference audio; drop `--gpu` for CPU.
+reference audio; drop `--gpu` for CPU. Emotion direction files in `./emotion_directions/` are
+autoloaded when present; use `--tts-emotion-directions-dir <dir>` to point elsewhere or pass an
+empty directory string to disable emotion controls.
 
 ### 4. Generate Speech
 
@@ -141,6 +143,31 @@ curl -s http://localhost:1919/tts/generate \
 
 **Web UI:** Open `http://localhost:1919/` in your browser.
 
+## Emotion Control
+
+Emotion control nudges a cloned speaker voice with shipped direction vectors: named sliders
+(`happy`, `sad`, `angry`, `surprised`) plus `valence` and `arousal` axes. It requires a speaker
+embedding from an uploaded/cached voice or CLI `--speaker` / `--clone`.
+
+```bash
+curl -X POST http://localhost:1919/tts/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+        "text": "I cannot believe you did that!",
+        "speaker_embedding_id": "spk_...",
+        "emotion_enabled": true,
+        "emotion_sliders": {"happy": 1.0},
+        "accurate_mode": false,
+        "emotion_cfg_scale": 1.5,
+        "stream": true
+      }' \
+  --output happy.pcm
+```
+
+`GET /tts/capabilities` reports `emotion_enabled`, `emotion_names`, `emotion_axes`, and
+`emotion_calibrated`. `emotion_strength` is a multiplier on the loaded calibration when
+`calibration.json` is present.
+
 ## CLI (offline inference)
 
 You can also synthesize directly from the command line, without starting a server. One command
@@ -156,6 +183,14 @@ Clone a voice in-process by pointing `--clone` at any reference audio:
 ```bash
 zonos2-cli out/zonos2-q8_0.gguf --tts "Cloned voice demo." out.wav \
     --dac out/dac.gguf --clone voice.mp3 --spk-encoder out/spk-encoder.gguf --gpu --seed 1
+```
+
+CLI emotion example:
+
+```bash
+zonos2-cli out/zonos2-q8_0.gguf --tts "That was incredible." out.wav \
+    --dac out/dac.gguf --speaker voice.npy --emotion happy=1 \
+    --emotion-strength 1 --emotion-cfg-scale 1.5 --gpu --seed 1
 ```
 
 ## Under the Hood

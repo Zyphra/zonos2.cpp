@@ -36,7 +36,9 @@ struct gctx {
     // speaker conditioning: overwrite the embedding at column spk_pos with the
     // projected speaker vector (before emb_norm). spk_pos < 0 => no speaker.
     ggml_tensor * spk = nullptr; // input speaker embedding [spk_dim]
+    ggml_tensor * spk_emotion_delta = nullptr; // optional hidden delta [n_embd]
     int spk_pos = -1;
+    bool use_spk_emotion_delta = false;
     bool capture = true;                   // false during generation (lean graph)
     bool cap_moe = false;                   // capture per-MoE-layer inputs for imatrix collection
     std::vector<std::pair<std::string, ggml_tensor *>> caps;
@@ -257,6 +259,12 @@ ggml_tensor * build_graph(gctx & g, int n_layer_limit) {
         ggml_set_name(g.spk, "spk");
         ggml_tensor * sl = ggml_add(ctx, ggml_mul_mat(ctx, m.spk_lda_w,  g.spk), m.spk_lda_b);
         ggml_tensor * sp = ggml_add(ctx, ggml_mul_mat(ctx, m.spk_proj_w, sl),    m.spk_proj_b);
+        if (g.use_spk_emotion_delta) {
+            g.spk_emotion_delta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+            ggml_set_input(g.spk_emotion_delta);
+            ggml_set_name(g.spk_emotion_delta, "spk_emotion_delta");
+            sp = ggml_add(ctx, sp, g.spk_emotion_delta);
+        }
         g.cap("spk_proj", sp); // [n_embd]
         // Replace column spk_pos of emb with sp, built as a concat of contiguous column
         // views rather than ggml_set_1d. GGML_OP_SET's non-inplace path on the Metal backend
@@ -357,12 +365,14 @@ void save_tensor(const std::string & dir, const std::string & name, ggml_tensor 
 // freeing *ctx_out / *galloc_out. Returns nullptr on failure (ctx/galloc still owned by caller).
 static ggml_tensor * prefill_run(const zonos2_model & m, const float * ids, int n_tokens,
                                  bool capture, int n_layer_limit, const float * spk, int spk_pos,
+                                 const float * spk_emotion_delta,
                                  gctx & g, ggml_context *& ctx, ggml_gallocr_t & galloc) {
     struct ggml_init_params ip = { (size_t) 256 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
     ctx = ggml_init(ip);
 
     g.m = &m; g.ctx = ctx; g.n = n_tokens; g.capture = capture;
     g.spk_pos = spk ? spk_pos : -1;
+    g.use_spk_emotion_delta = spk && spk_emotion_delta;
     ggml_tensor * out = build_graph(g, n_layer_limit);
     ggml_set_output(out);
 
@@ -391,6 +401,10 @@ static ggml_tensor * prefill_run(const zonos2_model & m, const float * ids, int 
     if (g.spk) {
         ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
     }
+    if (g.spk_emotion_delta) {
+        ggml_backend_tensor_set(g.spk_emotion_delta, spk_emotion_delta, 0,
+                                (size_t) m.hp.n_embd * sizeof(float));
+    }
 
     fprintf(stderr, "prefill: computing graph (%d nodes) ...\n", ggml_graph_n_nodes(gf));
     if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
@@ -404,11 +418,13 @@ static ggml_tensor * prefill_run(const zonos2_model & m, const float * ids, int 
 
 bool zonos2_validate(const zonos2_model & m, const float * ids, int n_tokens,
                      const char * out_dir, int n_layer_limit,
-                     const float * spk, int spk_pos) {
+                     const float * spk, int spk_pos,
+                     const float * spk_emotion_delta) {
     gctx g;
     ggml_context * ctx = nullptr;
     ggml_gallocr_t galloc = nullptr;
-    ggml_tensor * out = prefill_run(m, ids, n_tokens, /*capture=*/true, n_layer_limit, spk, spk_pos, g, ctx, galloc);
+    ggml_tensor * out = prefill_run(m, ids, n_tokens, /*capture=*/true, n_layer_limit,
+                                    spk, spk_pos, spk_emotion_delta, g, ctx, galloc);
     const bool ok = out != nullptr;
     if (ok) {
         for (auto & c : g.caps) save_tensor(out_dir, c.first, c.second);
@@ -420,12 +436,13 @@ bool zonos2_validate(const zonos2_model & m, const float * ids, int n_tokens,
 }
 
 bool zonos2_logits(const zonos2_model & m, const float * ids, int n_tokens,
-                   std::vector<float> & out_logits, const float * spk, int spk_pos) {
+                   std::vector<float> & out_logits, const float * spk, int spk_pos,
+                   const float * spk_emotion_delta) {
     gctx g;
     ggml_context * ctx = nullptr;
     ggml_gallocr_t galloc = nullptr;
     ggml_tensor * logits = prefill_run(m, ids, n_tokens, /*capture=*/false, /*n_layer_limit=*/-1,
-                                       spk, spk_pos, g, ctx, galloc);
+                                       spk, spk_pos, spk_emotion_delta, g, ctx, galloc);
     const bool ok = logits != nullptr;
     if (ok) {
         out_logits.resize((size_t) m.hp.audio_vocab * m.hp.n_codebooks * n_tokens);
@@ -437,13 +454,14 @@ bool zonos2_logits(const zonos2_model & m, const float * ids, int n_tokens,
 }
 
 bool zonos2_moe_capture(const zonos2_model & m, const float * ids, int n_tokens,
-                        std::vector<zonos2_moe_act> & out, const float * spk, int spk_pos) {
+                        std::vector<zonos2_moe_act> & out, const float * spk, int spk_pos,
+                        const float * spk_emotion_delta) {
     gctx g;
     g.cap_moe = true;
     ggml_context * ctx = nullptr;
     ggml_gallocr_t galloc = nullptr;
     ggml_tensor * res = prefill_run(m, ids, n_tokens, /*capture=*/false, /*n_layer_limit=*/-1,
-                                    spk, spk_pos, g, ctx, galloc);
+                                    spk, spk_pos, spk_emotion_delta, g, ctx, galloc);
     const bool ok = res != nullptr;
     if (ok) {
         std::map<int, zonos2_moe_act> by_layer;            // keyed by layer index, ordered
@@ -478,7 +496,8 @@ bool zonos2_moe_capture(const zonos2_model & m, const float * ids, int n_tokens,
 static int generate_recompute(const zonos2_model & m, const float * prompt_ids, int n0,
                               int max_frames, const zonos2_sampling & sp,
                               std::vector<int32_t> & out_codes, int & eos_frame,
-                              const float * spk, int spk_pos, const zonos2_frame_cb & on_frame) {
+                              const float * spk, int spk_pos, const zonos2_frame_cb & on_frame,
+                              const float * spk_emotion_delta) {
     const zonos2_hparams & hp = m.hp;
     const int W = (int) hp.n_codebooks + 1;
     const int ncb = (int) hp.n_codebooks;
@@ -501,6 +520,7 @@ static int generate_recompute(const zonos2_model & m, const float * prompt_ids, 
         ggml_context * ctx = ggml_init(ip);
         gctx g; g.m = &m; g.ctx = ctx; g.n = n; g.capture = false;
         g.spk_pos = spk ? spk_pos : -1;
+        g.use_spk_emotion_delta = spk && spk_emotion_delta;
         ggml_tensor * logits = build_graph(g, -1); // [audio_vocab, n_codebooks, n]
         ggml_set_output(logits);
 
@@ -517,6 +537,9 @@ static int generate_recompute(const zonos2_model & m, const float * prompt_ids, 
         ggml_backend_tensor_set(g.pos_rope, col.data(), 0, (size_t) n * sizeof(int32_t));
         if (g.mask_causal) set_causal_mask(g.mask_causal, n);
         if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) hp.spk_dim * sizeof(float));
+        if (g.spk_emotion_delta)
+            ggml_backend_tensor_set(g.spk_emotion_delta, spk_emotion_delta, 0,
+                                    (size_t) hp.n_embd * sizeof(float));
 
         if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "generate: compute failed at step %d\n", step);
@@ -659,7 +682,8 @@ void zonos2_batch_free(zonos2_batch_ctx & bc) {
 }
 
 bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * prompt_ids, int n0,
-                               const float * spk, int spk_pos, float * out_logits) {
+                               const float * spk, int spk_pos, float * out_logits,
+                               const float * spk_emotion_delta) {
     const zonos2_model & m = *bc.model;
     const int W = bc.W, S = bc.slot_cap, av = bc.av, ncb = bc.ncb;
     if (n0 <= 0 || n0 > S) {
@@ -671,6 +695,7 @@ bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * pr
     ggml_context * ctx = ggml_init(ip);
     gctx g; g.m = &m; g.ctx = ctx; g.n = n0; g.capture = false;
     g.spk_pos = spk ? spk_pos : -1;
+    g.use_spk_emotion_delta = spk && spk_emotion_delta;
     g.kc = &bc.k_cache; g.vc = &bc.v_cache; g.decode = false; g.n_slots = 1; g.slot_cap = S;
     // Optional profiling: ZONOS2_PREFILL_NLAYERS=N runs only the first N transformer layers
     // (logits are then garbage) so first-audio latency can be attributed across the layer stack.
@@ -699,6 +724,9 @@ bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * pr
         ggml_backend_tensor_set(g.pos_cache, col.data(), 0, (size_t) n0 * sizeof(int32_t));
         if (g.mask_causal) set_causal_mask(g.mask_causal, n0);
         if (g.spk) ggml_backend_tensor_set(g.spk, spk, 0, (size_t) m.hp.spk_dim * sizeof(float));
+        if (g.spk_emotion_delta)
+            ggml_backend_tensor_set(g.spk_emotion_delta, spk_emotion_delta, 0,
+                                    (size_t) m.hp.n_embd * sizeof(float));
         auto t2 = clk::now();
         ok = ggml_backend_graph_compute(m.backend, gf) == GGML_STATUS_SUCCESS;
         auto t3 = clk::now();
@@ -830,31 +858,64 @@ bool zonos2_slot_sample(const zonos2_model & m, zonos2_slot & s, zonos2_sampler 
 static int generate_kv(const zonos2_model & m, const float * prompt_ids, int n0,
                        int max_frames, const zonos2_sampling & sp,
                        std::vector<int32_t> & out_codes, int & eos_frame,
-                       const float * spk, int spk_pos, const zonos2_frame_cb & on_frame) {
+                       const float * spk, int spk_pos, const zonos2_frame_cb & on_frame,
+                       const float * spk_emotion_delta) {
     const int ncb = (int) m.hp.n_codebooks, av = (int) m.hp.audio_vocab;
     eos_frame = -1;
+    const bool use_cfg = spk && spk_emotion_delta && sp.emotion_cfg_scale != 1.0f;
 
     zonos2_batch_ctx bc;
-    if (!zonos2_batch_init(bc, m, /*n_slots=*/1, /*slot_cap_frames=*/n0 + max_frames + 8)) return 0;
+    if (!zonos2_batch_init(bc, m, use_cfg ? 2 : 1, /*slot_cap_frames=*/n0 + max_frames + 8)) return 0;
 
     zonos2_sampler smp(sp, ncb, av);
     zonos2_slot slot;
     slot.index = 0; slot.active = true; slot.n_past = n0;
+    zonos2_slot cfg_twin;
+    if (use_cfg) {
+        cfg_twin.index = 1;
+        cfg_twin.active = true;
+        cfg_twin.n_past = n0;
+    }
 
     std::vector<float> logits((size_t) av * ncb);
-    if (!zonos2_batch_slot_prefill(bc, 0, prompt_ids, n0, spk, spk_pos, logits.data())) {
+    std::vector<float> uncond_logits(use_cfg ? (size_t) av * ncb : 0);
+    std::vector<float> guided_logits(use_cfg ? (size_t) av * ncb : 0);
+    if (!zonos2_batch_slot_prefill(bc, 0, prompt_ids, n0, spk, spk_pos, logits.data(),
+                                   spk_emotion_delta)) {
+        zonos2_batch_free(bc); return 0;
+    }
+    if (use_cfg && !zonos2_batch_slot_prefill(bc, 1, prompt_ids, n0, spk, spk_pos,
+                                              uncond_logits.data(), nullptr)) {
         zonos2_batch_free(bc); return 0;
     }
 
-    const std::vector<zonos2_slot *> active = { &slot };
     int n_frames = 0, decode_steps = 0;
     auto t0 = std::chrono::steady_clock::now();
     for (;;) {
-        zonos2_slot_sample(m, slot, smp, logits.data(), out_codes, max_frames, on_frame);
+        const float * sample_logits = logits.data();
+        if (use_cfg) {
+            const float scale = sp.emotion_cfg_scale;
+            for (size_t i = 0; i < guided_logits.size(); ++i)
+                guided_logits[i] = uncond_logits[i] + scale * (logits[i] - uncond_logits[i]);
+            sample_logits = guided_logits.data();
+        }
+        zonos2_slot_sample(m, slot, smp, sample_logits, out_codes, max_frames, on_frame);
         ++n_frames;
+        if (use_cfg) {
+            cfg_twin.next_ids = slot.next_ids;
+            cfg_twin.step = slot.step;
+            cfg_twin.eos_frame = slot.eos_frame;
+            cfg_twin.countdown = slot.countdown;
+            cfg_twin.done = slot.done;
+        }
         if (slot.done) break;
+        std::vector<zonos2_slot *> active = use_cfg
+            ? std::vector<zonos2_slot *>{ &slot, &cfg_twin }
+            : std::vector<zonos2_slot *>{ &slot };
         zonos2_batch_step(bc, active);
         memcpy(logits.data(), zonos2_batch_slot_logits(bc, 0), (size_t) av * ncb * sizeof(float));
+        if (use_cfg)
+            memcpy(uncond_logits.data(), zonos2_batch_slot_logits(bc, 1), (size_t) av * ncb * sizeof(float));
         ++decode_steps;
     }
     eos_frame = slot.eos_frame;
@@ -874,11 +935,14 @@ int zonos2_generate(const zonos2_model & m, const float * prompt_ids, int n0,
                     int max_frames, const zonos2_sampling & sp,
                     std::vector<int32_t> & out_codes, int & eos_frame, bool use_kv,
                     const float * spk, int spk_pos, std::vector<int32_t> * out_full_ids,
-                    const zonos2_frame_cb & on_frame) {
+                    const zonos2_frame_cb & on_frame,
+                    const float * spk_emotion_delta) {
     const size_t codes0 = out_codes.size();
     const int nf = use_kv
-        ? generate_kv       (m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos, on_frame)
-        : generate_recompute(m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos, on_frame);
+        ? generate_kv       (m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos, on_frame,
+                             spk_emotion_delta)
+        : generate_recompute(m, prompt_ids, n0, max_frames, sp, out_codes, eos_frame, spk, spk_pos, on_frame,
+                             spk_emotion_delta);
 
     if (out_full_ids) {
         // Rebuild the exact input sequence the model saw: prompt rows, then each generated

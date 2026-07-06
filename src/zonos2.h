@@ -119,10 +119,12 @@ int zonos2_router_dim(const zonos2_model & model);
 // as floats), capturing named intermediate tensors as <out_dir>/<name>.npy for numeric
 // validation against the PyTorch golden dump. `n_layer_limit` < 0 builds all layers.
 // `spk` (optional, [spk_dim] f32) injects a speaker embedding: the column at `spk_pos`
-// is overwritten by spk_proj(spk_lda(spk)) before emb_norm. spk == nullptr disables it.
+// is overwritten by spk_proj(spk_lda(spk)) before emb_norm. `spk_emotion_delta` (optional,
+// [n_embd] f32) is added after speaker projection. spk == nullptr disables both.
 bool zonos2_validate(const zonos2_model & model, const float * ids, int n_tokens,
                      const char * out_dir, int n_layer_limit,
-                     const float * spk = nullptr, int spk_pos = 0);
+                     const float * spk = nullptr, int spk_pos = 0,
+                     const float * spk_emotion_delta = nullptr);
 
 // Run a single prefill forward over `ids` (row-major [n_tokens, n_codebooks+1], values as
 // floats) and copy the full post-softcap logits into `out_logits`, resized to
@@ -133,7 +135,8 @@ bool zonos2_validate(const zonos2_model & model, const float * ids, int n_tokens
 // long corpora into multiple sequences rather than one giant prefill.
 bool zonos2_logits(const zonos2_model & model, const float * ids, int n_tokens,
                    std::vector<float> & out_logits,
-                   const float * spk = nullptr, int spk_pos = 0);
+                   const float * spk = nullptr, int spk_pos = 0,
+                   const float * spk_emotion_delta = nullptr);
 
 // One MoE layer's captured prefill activations, for per-expert importance-matrix collection.
 // Memory order matches ggml (ne0 fastest): moe_in[t*n_embd + c], moe_y[(t*k + j)*n_ff + c],
@@ -150,7 +153,8 @@ struct zonos2_moe_act {
 // zonos2_moe_act per MoE layer (in layer order) to `out`. spk/spk_pos as in zonos2_validate.
 bool zonos2_moe_capture(const zonos2_model & model, const float * ids, int n_tokens,
                         std::vector<zonos2_moe_act> & out,
-                        const float * spk = nullptr, int spk_pos = 0);
+                        const float * spk = nullptr, int spk_pos = 0,
+                        const float * spk_emotion_delta = nullptr);
 
 // Options for building a TTS prompt from text (mirrors zonos2/tts/prompt.py +
 // scheduler speaker frames). Defaults reproduce the reference offline prompt.
@@ -180,6 +184,7 @@ struct zonos2_sampling {
     int      rep_codebooks = 8;
     uint32_t seed          = 0;
     bool     greedy        = false;
+    float    emotion_cfg_scale = 1.0f; // >1: cond/uncond emotion guidance, if a delta is present
 };
 
 struct zonos2_sampler; // defined in zonos2-sampler.h
@@ -259,7 +264,8 @@ void zonos2_batch_free(zonos2_batch_ctx & bc);
 // n_codebooks] (C-order [n_codebooks, audio_vocab]), i.e. the seed for sampling frame 0. spk as in
 // zonos2_generate. Returns false if n0 > slot_cap or on compute failure.
 bool zonos2_batch_slot_prefill(zonos2_batch_ctx & bc, int slot, const float * prompt_ids, int n0,
-                               const float * spk, int spk_pos, float * out_logits);
+                               const float * spk, int spk_pos, float * out_logits,
+                               const float * spk_emotion_delta = nullptr);
 
 // One batched decode step. `active` lists the currently-active (non-done) slots; their `index`
 // selects the decode column. Each active slot's next_ids is written at its n_past, the graph is
@@ -285,6 +291,7 @@ bool zonos2_slot_sample(const zonos2_model & model, zonos2_slot & slot, zonos2_s
 // audio codes to out_codes (flattened [n_frames * n_codebooks]); sets eos_frame. Returns n_frames.
 // `spk` (optional, [spk_dim] f32) clones a voice: during prefill the embedding column at
 // `spk_pos` (default 0, the prompt's speaker slot) is overwritten by spk_proj(spk_lda(spk)).
+// `spk_emotion_delta` optionally adds a [n_embd] hidden-space emotion delta after projection.
 // If `out_full_ids` is non-null, it receives the exact teacher-forcing sequence the model
 // consumed — row-major [n0 + n_frames, n_codebooks+1] (prompt rows followed by each generated
 // frame's codes + the text-pad column, pre-shear) — suitable as an imatrix calibration corpus.
@@ -294,4 +301,5 @@ int zonos2_generate(const zonos2_model & model, const float * prompt_ids, int n0
                     std::vector<int32_t> & out_codes, int & eos_frame, bool use_kv = true,
                     const float * spk = nullptr, int spk_pos = 0,
                     std::vector<int32_t> * out_full_ids = nullptr,
-                    const zonos2_frame_cb & on_frame = {});
+                    const zonos2_frame_cb & on_frame = {},
+                    const float * spk_emotion_delta = nullptr);

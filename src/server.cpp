@@ -15,6 +15,7 @@
 #include "compat.h"
 
 #include "zonos2.h"
+#include "zonos2-emotion.h"
 #include "dac.h"
 #include "spk-encoder.h"
 #include "npy.h"
@@ -101,6 +102,9 @@ struct ServerState {
     int dac_threads  = 4;      // DAC decode pool lanes (parallel decode across requests)
     bool prof = false;         // ZONOS2_PROFILE: emit per-request decode timing
     std::string ui_path = "web/tts_ui.html";
+    std::string emotion_dir = "emotion_directions";
+    zonos2_emotion_directions emotion;
+    bool have_emotion = false;
 
     // continuous-batching scheduler: one worker thread owns the backbone + batch context and only
     // produces codes; DAC decode is offloaded to the pool so the worker never blocks on it. HTTP
@@ -210,6 +214,7 @@ struct GenReq {
     int max_frames = 0;                 // resolved against server cap
     zonos2_prompt_options opt;
     std::vector<float> spk;             // empty => no speaker
+    std::vector<float> spk_emotion_delta; // space="proj" delta [n_embd], empty => none
     int spk_pos = 0;
     double fade_out_ms = 0;
     bool stream = true;
@@ -229,8 +234,11 @@ struct ReqJob {
 
     // runtime (worker-owned)
     zonos2_slot slot;
+    zonos2_slot cfg_slot;
+    int cfg_slot_index = -1;
     std::unique_ptr<zonos2_sampler> smp;
     std::vector<float> logits;           // [av*ncb] current sampling source
+    std::vector<float> cfg_logits;       // unconditioned logits for emotion CFG
     std::vector<int32_t> codes;
     int eos_frame = -1;
     int emitted = 0;                     // frames already handed to the DAC pool (streaming)
@@ -331,6 +339,60 @@ static std::vector<int> parse_quality(const json & j, int n_feat) {
     return q;
 }
 
+static bool parse_emotion_sliders(const json & j, std::map<std::string, float> & sliders,
+                                  std::string & err) {
+    sliders.clear();
+    if (!j.contains("emotion_sliders") || j["emotion_sliders"].is_null()) return true;
+    if (!j["emotion_sliders"].is_object()) {
+        err = "emotion_sliders must be an object";
+        return false;
+    }
+    for (auto it = j["emotion_sliders"].begin(); it != j["emotion_sliders"].end(); ++it) {
+        if (!it.value().is_number()) {
+            err = "emotion_sliders." + it.key() + " must be numeric";
+            return false;
+        }
+        sliders[it.key()] = it.value().get<float>();
+    }
+    return true;
+}
+
+static bool apply_request_emotion(ServerState & s, const json & j, GenReq & out,
+                                  std::string & err) {
+    out.sp.emotion_cfg_scale = (float) jnum(j, "emotion_cfg_scale", 1.0);
+    if (!jbool(j, "emotion_enabled", false)) return true;
+
+    zonos2_emotion_request req;
+    if (!parse_emotion_sliders(j, req.sliders, err)) return false;
+    req.valence = (float) jnum(j, "emotion_valence", 0.0);
+    req.arousal = (float) jnum(j, "emotion_arousal", 0.0);
+    req.strength = (float) jnum(j, "emotion_strength", 1.0);
+    req.speaker_key = jstr(j, "speaker_embedding_id");
+
+    const bool requested = !req.sliders.empty() || req.valence != 0.0f || req.arousal != 0.0f;
+    if (!requested) return true;
+
+    // Mirrors the Python server: emotion control is a no-op without a speaker embedding.
+    if (out.spk.empty()) {
+        out.sp.emotion_cfg_scale = 1.0f;
+        return true;
+    }
+    if (!s.have_emotion) {
+        err = "emotion control requested but no emotion directions are configured";
+        return false;
+    }
+
+    if (!zonos2_emotion_apply(s.emotion, req, out.spk, out.spk_emotion_delta, err)) return false;
+    if (!out.spk_emotion_delta.empty() && (int) out.spk_emotion_delta.size() != (int) s.model.hp.n_embd) {
+        err = "emotion hidden delta dim mismatch: got " + std::to_string(out.spk_emotion_delta.size()) +
+              ", want " + std::to_string(s.model.hp.n_embd);
+        out.spk_emotion_delta.clear();
+        return false;
+    }
+    if (out.spk_emotion_delta.empty()) out.sp.emotion_cfg_scale = 1.0f;
+    return true;
+}
+
 // Parse a /tts/generate-style JSON body into a GenReq. Returns false (with err) on bad input.
 static bool parse_gen_req(ServerState & s, const json & j, const std::string & session,
                           GenReq & out, std::string & err) {
@@ -375,6 +437,7 @@ static bool parse_gen_req(ServerState & s, const json & j, const std::string & s
         if (!err.empty()) return false;     // requested but failed
     }
     if (!out.spk.empty()) out.opt.add_speaker_slot = true;
+    if (!apply_request_emotion(s, j, out, err)) return false;
     return true;
 }
 
@@ -521,26 +584,63 @@ static void worker_loop(ServerState & s) {
     warmup_backbone(bc);
     std::vector<std::shared_ptr<ReqJob>> slot_job(B);
 
-    while (!s.stop.load()) {
-        // 1. admit waiting jobs into free slots (prefill into the slot's cache band)
+    auto find_free_slots = [&](int needed, int & primary, int & twin) {
+        primary = -1;
+        twin = -1;
         for (int i = 0; i < B; ++i) {
             if (slot_job[i]) continue;
+            if (primary < 0) primary = i;
+            else { twin = i; break; }
+        }
+        return needed == 1 ? primary >= 0 : (primary >= 0 && twin >= 0);
+    };
+
+    while (!s.stop.load()) {
+        // 1. admit waiting jobs into free slots (prefill into the slot's cache band)
+        for (;;) {
             std::shared_ptr<ReqJob> job;
             { std::lock_guard<std::mutex> lk(s.sched_mtx);
-              if (!s.incoming.empty()) { job = s.incoming.front(); s.incoming.pop_front(); } }
+              if (!s.incoming.empty()) job = s.incoming.front(); }
             if (!job) break;
+            const bool use_cfg = !job->gr.spk_emotion_delta.empty() && job->gr.sp.emotion_cfg_scale != 1.0f;
+            const int needed_slots = use_cfg ? 2 : 1;
+            if (needed_slots > B) {
+                { std::lock_guard<std::mutex> lk(s.sched_mtx); s.incoming.pop_front(); }
+                job_finish(*job, /*failed=*/true);
+                continue;
+            }
+            int primary = -1, twin = -1;
+            if (!find_free_slots(needed_slots, primary, twin)) break;
+            { std::lock_guard<std::mutex> lk(s.sched_mtx); s.incoming.pop_front(); }
+
             job->slot = zonos2_slot{};
-            job->slot.index = i; job->slot.active = true; job->slot.n_past = job->n0;
+            job->slot.index = primary; job->slot.active = true; job->slot.n_past = job->n0;
+            job->cfg_slot_index = use_cfg ? twin : -1;
+            if (use_cfg) {
+                job->cfg_slot = zonos2_slot{};
+                job->cfg_slot.index = twin;
+                job->cfg_slot.active = true;
+                job->cfg_slot.n_past = job->n0;
+            }
             job->lane = (int) (s.next_lane++ % s.dac_lanes.size()); // round-robin DAC lane
             job->smp = std::make_unique<zonos2_sampler>(job->gr.sp, ncb, av);
             job->logits.assign((size_t) av * ncb, 0.0f);
+            job->cfg_logits.assign(use_cfg ? (size_t) av * ncb : 0, 0.0f);
             const float * spk = job->gr.spk.empty() ? nullptr : job->gr.spk.data();
-            if (!zonos2_batch_slot_prefill(bc, i, job->idf.data(), job->n0, spk, job->spk_pos, job->logits.data())) {
+            const float * delta = job->gr.spk_emotion_delta.empty() ? nullptr : job->gr.spk_emotion_delta.data();
+            if (!zonos2_batch_slot_prefill(bc, primary, job->idf.data(), job->n0, spk, job->spk_pos,
+                                           job->logits.data(), delta)) {
                 job_finish(*job, /*failed=*/true);
                 continue;                                   // leave slot free
             }
+            if (use_cfg && !zonos2_batch_slot_prefill(bc, twin, job->idf.data(), job->n0, spk, job->spk_pos,
+                                                      job->cfg_logits.data(), nullptr)) {
+                job_finish(*job, /*failed=*/true);
+                continue;
+            }
             job->t_decode0 = std::chrono::steady_clock::now();
-            slot_job[i] = job;
+            slot_job[primary] = job;
+            if (use_cfg) slot_job[twin] = job;
         }
 
         // 2. nothing in flight -> block until a job arrives (or shutdown)
@@ -556,11 +656,31 @@ static void worker_loop(ServerState & s) {
         // 3. sample one frame per active slot from its current logits
         for (int i = 0; i < B; ++i) {
             auto & job = slot_job[i];
-            if (!job || job->slot.done) continue;
+            if (!job || job->slot.index != i || job->slot.done) continue;
             { std::lock_guard<std::mutex> lk(job->m);
-              if (job->client_dropped) { job->slot.done = true; continue; } }
-            zonos2_slot_sample(s.model, job->slot, *job->smp, job->logits.data(),
+              if (job->client_dropped) {
+                  job->slot.done = true;
+                  if (job->cfg_slot_index >= 0) job->cfg_slot.done = true;
+                  continue;
+              } }
+            std::vector<float> guided;
+            const float * sample_logits = job->logits.data();
+            if (job->cfg_slot_index >= 0) {
+                guided.resize((size_t) av * ncb);
+                const float scale = job->gr.sp.emotion_cfg_scale;
+                for (size_t k = 0; k < guided.size(); ++k)
+                    guided[k] = job->cfg_logits[k] + scale * (job->logits[k] - job->cfg_logits[k]);
+                sample_logits = guided.data();
+            }
+            zonos2_slot_sample(s.model, job->slot, *job->smp, sample_logits,
                                job->codes, job->gr.max_frames, {});
+            if (job->cfg_slot_index >= 0) {
+                job->cfg_slot.next_ids = job->slot.next_ids;
+                job->cfg_slot.step = job->slot.step;
+                job->cfg_slot.eos_frame = job->slot.eos_frame;
+                job->cfg_slot.countdown = job->slot.countdown;
+                job->cfg_slot.done = job->slot.done;
+            }
             job->eos_frame = job->slot.eos_frame;
             if (job->stream) stream_submit_ready(s, job);
         }
@@ -569,7 +689,7 @@ static void worker_loop(ServerState & s) {
         //    after it drains), then free the slot immediately so the backbone keeps going.
         for (int i = 0; i < B; ++i) {
             auto & job = slot_job[i];
-            if (!job || !job->slot.done) continue;
+            if (!job || job->slot.index != i || !job->slot.done) continue;
             if (s.prof) {
                 const double wall_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - job->t_decode0).count();
@@ -580,22 +700,32 @@ static void worker_loop(ServerState & s) {
             }
             bool dropped; { std::lock_guard<std::mutex> lk(job->m); dropped = job->client_dropped; }
             submit_finalize(s, job, dropped);
+            if (job->cfg_slot_index >= 0) slot_job[job->cfg_slot_index].reset();
             slot_job[i].reset();
         }
 
         // 5. one batched decode step over the still-active slots, refill their logits
         std::vector<zonos2_slot *> step_list;
         for (int i = 0; i < B; ++i)
-            if (slot_job[i] && !slot_job[i]->slot.done) step_list.push_back(&slot_job[i]->slot);
+            if (slot_job[i] && slot_job[i]->slot.index == i && !slot_job[i]->slot.done) {
+                step_list.push_back(&slot_job[i]->slot);
+                if (slot_job[i]->cfg_slot_index >= 0 && !slot_job[i]->cfg_slot.done)
+                    step_list.push_back(&slot_job[i]->cfg_slot);
+            }
         if (!step_list.empty()) {
             const auto st0 = std::chrono::steady_clock::now();
             zonos2_batch_step(bc, step_list);
             const double step_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - st0).count();
-            for (zonos2_slot * sp : step_list) {
-                memcpy(slot_job[sp->index]->logits.data(), zonos2_batch_slot_logits(bc, sp->index),
+            for (int i = 0; i < B; ++i) {
+                auto & job = slot_job[i];
+                if (!job || job->slot.index != i || job->slot.done) continue;
+                memcpy(job->logits.data(), zonos2_batch_slot_logits(bc, job->slot.index),
                        (size_t) av * ncb * sizeof(float));
-                slot_job[sp->index]->decode_step_ms += step_ms; // exact at batch=1; upper bound when batched
+                if (job->cfg_slot_index >= 0)
+                    memcpy(job->cfg_logits.data(), zonos2_batch_slot_logits(bc, job->cfg_slot.index),
+                           (size_t) av * ncb * sizeof(float));
+                job->decode_step_ms += step_ms; // exact at batch=1; upper bound when batched
             }
         }
     }
@@ -616,6 +746,10 @@ static void handle_generate(ServerState & s, const httplib::Request & req, httpl
     const std::string session = req.get_header_value("X-TTS-Session-ID");
     GenReq gr; std::string err;
     if (!parse_gen_req(s, j, session, gr, err)) { set_json(res, {{"error", err}}, 400); return; }
+    if (!gr.spk_emotion_delta.empty() && gr.sp.emotion_cfg_scale != 1.0f && s.batch_slots < 2) {
+        set_json(res, {{"error", "emotion_cfg_scale requires --batch 2 or higher"}}, 400);
+        return;
+    }
 
     auto job = std::make_shared<ReqJob>();
     job->gr = gr;
@@ -799,6 +933,12 @@ static void handle_capabilities(ServerState & s, httplib::Response & res) {
     } else {
         for (int b = 0; b < (int) hp.cond_speaking_rate_buckets; ++b) sr_labels.push_back(std::to_string(b));
     }
+    json emotion_names = json::array();
+    json emotion_axes = json::array();
+    if (s.have_emotion && hp.spk_dim > 0) {
+        for (const auto & name : zonos2_emotion_names(s.emotion)) emotion_names.push_back(name);
+        for (const auto & name : zonos2_emotion_axes(s.emotion)) emotion_axes.push_back(name);
+    }
     json caps = {
         {"text_normalization_enabled", false},          // byte-level tokenizer: no NeMo normalizer
         {"text_norm_languages", json::array()},
@@ -822,6 +962,10 @@ static void handle_capabilities(ServerState & s, httplib::Response & res) {
         {"speaker_embedding_cache", true},
         {"speaker_embedding_blend", false},             // SLERP blend: not in this port
         {"default_voices_enabled", false},
+        {"emotion_enabled", s.have_emotion && hp.spk_dim > 0},
+        {"emotion_names", emotion_names},
+        {"emotion_axes", emotion_axes},
+        {"emotion_calibrated", s.have_emotion && s.emotion.has_calibration},
     };
     set_json(res, caps);
 }
@@ -855,6 +999,8 @@ static void usage(const char * a0) {
         "  --dac-threads N     DAC decode pool lanes, parallel decode across requests (default 4)\n"
         "  --stream-block N    frames per streamed PCM block (default 40)\n"
         "  --stream-context N  conv-context frames each side, >=16 seam-free (default 24)\n"
+        "  --tts-emotion-directions-dir DIR\n"
+        "                      load emotion direction .npy files (default emotion_directions; empty disables)\n"
         "  --ui PATH           web UI html to serve at / (default web/tts_ui.html)\n", a0);
 }
 
@@ -880,6 +1026,7 @@ int main(int argc, char ** argv) {
         else if (a == "--dac-threads" && i + 1 < argc) s.dac_threads = std::max(1, atoi(argv[++i]));
         else if (a == "--stream-block" && i + 1 < argc) s.stream_block = atoi(argv[++i]);
         else if (a == "--stream-context" && i + 1 < argc) s.stream_ctx = atoi(argv[++i]);
+        else if (a == "--tts-emotion-directions-dir" && i + 1 < argc) s.emotion_dir = argv[++i];
         else if (a == "--ui" && i + 1 < argc) s.ui_path = argv[++i];
         else { usage(argv[0]); return 1; }
     }
@@ -887,6 +1034,17 @@ int main(int argc, char ** argv) {
     s.prof = getenv("ZONOS2_PROFILE") != nullptr;
 
     if (!zonos2_model_load(s.model, model_path.c_str(), s.use_gpu)) { fprintf(stderr, "failed to load model\n"); return 1; }
+    {
+        std::string err;
+        s.have_emotion = zonos2_emotion_load(s.emotion, s.emotion_dir, err);
+        if (s.have_emotion) {
+            fprintf(stderr, "zonos2-server: emotion directions=%s space=%s names=%zu axes=%zu calibrated=%s\n",
+                    s.emotion_dir.c_str(), s.emotion.space.c_str(), s.emotion.named.size(), s.emotion.axes.size(),
+                    s.emotion.has_calibration ? "yes" : "no");
+        } else if (!s.emotion_dir.empty()) {
+            fprintf(stderr, "zonos2-server: emotion disabled (%s)\n", err.c_str());
+        }
+    }
 
     // On Metal the backbone and DAC share one GPU; running DAC there starves the backbone decode
     // (measured ~2.5x slower end-to-end on M3). Default DAC to CPU when on a Metal GPU unless the

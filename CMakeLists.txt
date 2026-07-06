@@ -55,8 +55,9 @@ add_library(zonos2 STATIC
     src/zonos2-graph.cpp
     src/zonos2-sampler.cpp
     src/zonos2-prompt.cpp
+    src/zonos2-emotion.cpp
 )
-target_include_directories(zonos2 PUBLIC src ggml/include)
+target_include_directories(zonos2 PUBLIC src ggml/include PRIVATE vendor)
 target_link_libraries(zonos2 PUBLIC ggml)
 
 # --- CLI (links the DAC decoder so --tts/--generate can emit a wav directly,
