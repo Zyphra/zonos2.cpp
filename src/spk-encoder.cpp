@@ -285,11 +285,27 @@ std::vector<float> spk_embed_from_pcm24k(const spk_model & m, const float * wav,
     return out;
 }
 
+static std::string shell_quote_path(const char * path) {
+#ifdef _WIN32
+    return "\"" + std::string(path) + "\"";
+#else
+    std::string q = "'";
+    for (const char * p = path; *p; ++p) q += (*p == '\'') ? "'\\''" : std::string(1, *p);
+    return q + "'";
+#endif
+}
+
 std::vector<float> spk_decode_audio_file(const spk_model & m, const char * path) {
     // decode any audio via ffmpeg -> 24 kHz mono f32
-    std::string cmd = "ffmpeg -v error -i '" + std::string(path) +
-                      "' -ac 1 -ar " + std::to_string(m.sr) + " -f f32le -";
+    std::string cmd = "ffmpeg -v error -i " + shell_quote_path(path) +
+                      " -ac 1 -ar " + std::to_string(m.sr) + " -f f32le -";
+#ifdef _WIN32
+    // binary mode: text mode eats 0x1A as EOF and mangles CRLF in the raw f32
+    // stream. POSIX popen rejects "rb" (EINVAL on macOS/BSD), so Windows-only.
+    FILE * pp = popen(cmd.c_str(), "rb");
+#else
     FILE * pp = popen(cmd.c_str(), "r");
+#endif
     if (!pp) { fprintf(stderr, "spk: cannot run ffmpeg\n"); return {}; }
     std::vector<float> wav;
     float buf[8192]; size_t n;

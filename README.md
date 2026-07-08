@@ -94,7 +94,22 @@ cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build b
 
 </details>
 
-### 2. Get the Models
+### 2. Install ffmpeg (required for voice cloning)
+
+Voice cloning decodes reference audio by shelling out to `ffmpeg` — the server's `--spk`
+upload route, `zonos2-cli --clone`, and `spk-encoder-cli --clone` all need it on your `PATH`.
+Plain TTS works without it.
+
+```bash
+# macOS
+brew install ffmpeg
+# Debian / Ubuntu
+sudo apt install ffmpeg
+# Windows
+winget install ffmpeg    # or: choco install ffmpeg / scoop install ffmpeg
+```
+
+### 3. Get the Models
 
 Pull the ready-made GGUFs from [`Zyphra/ZONOS2-GGUF`](https://huggingface.co/Zyphra/ZONOS2-GGUF):
 
@@ -108,7 +123,7 @@ hf download Zyphra/ZONOS2-GGUF zonos2-q4_k.gguf --local-dir out   # 4.9 GB
 (You can also convert the original checkpoints and make any quant yourself — see
 [docs/INTERNALS.md](docs/INTERNALS.md).)
 
-### 3. Launch the TTS Server
+### 4. Launch the TTS Server
 
 ```bash
 zonos2-server out/zonos2-q8_0.gguf --dac out/dac.gguf --spk out/spk-encoder.gguf \
@@ -122,7 +137,7 @@ reference audio; drop `--gpu` for CPU. Emotion direction files in `./emotion_dir
 autoloaded when present; use `--tts-emotion-directions-dir <dir>` to point elsewhere or pass an
 empty directory string to disable emotion controls.
 
-### 4. Generate Speech
+### 5. Generate Speech
 
 **curl:**
 
