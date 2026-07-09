@@ -127,15 +127,28 @@ hf download Zyphra/ZONOS2-GGUF zonos2-q4_k.gguf --local-dir out   # 4.9 GB
 
 ```bash
 zonos2-server out/zonos2-q8_0.gguf --dac out/dac.gguf --spk out/spk-encoder.gguf \
-    --host 0.0.0.0 --port 1919 --gpu
+    --host 0.0.0.0 --port 1919 --gpu --tts-default-voices-dir default_voices
 ```
 
 The server starts on `http://localhost:1919` by default. It loads the backbone + DAC (+ speaker
 encoder) once and serves the reference TTS API: streaming float32 PCM, the OpenAI-compatible
-`/v1/audio/speech` route, and audio-upload voice cloning. `--spk` enables cloning from uploaded
-reference audio; drop `--gpu` for CPU. Emotion direction files in `./emotion_directions/` are
-autoloaded when present; use `--tts-emotion-directions-dir <dir>` to point elsewhere or pass an
-empty directory string to disable emotion controls.
+`/v1/audio/speech` route, audio-upload voice cloning, cached/default speakers, and SLERP speaker
+blending. `--spk` enables cloning from uploaded reference audio and default voice audio files;
+drop `--gpu` for CPU. Emotion direction files in `./emotion_directions/` are autoloaded when
+present; use `--tts-emotion-directions-dir <dir>` to point elsewhere or pass an empty directory
+string to disable emotion controls. Default voices are scanned from `default_voices/` by default;
+use `--tts-default-voices-dir <dir>` to point elsewhere or pass an empty string to disable them.
+
+Text normalization is available through the reference NeMo/Pynini helper when launched with a
+Python environment that has `pynini` installed:
+
+```bash
+zonos2-server out/zonos2-q8_0.gguf --dac out/dac.gguf --spk out/spk-encoder.gguf \
+    --gpu --text-normalizer-python .venv-tts-norm/bin/python
+```
+
+Without `--text-normalizer-python`, the server keeps the pure byte-level tokenizer path and reports
+`text_normalization_enabled:false`.
 
 ### 5. Generate Speech
 

@@ -6,12 +6,14 @@
 *.gguf
 !tests/fixtures/*.gguf
 *.npy
+!emotion_directions/*.npy
 *.npz
 *.wav
 # python
 __pycache__/
 *.pyc
 .venv/
+.venv-tts-norm/
 _pydeps/
 
 # Personal Claude Code instructions (private)

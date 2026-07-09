@@ -161,7 +161,7 @@ server, including **low-latency streaming** and **in-process voice cloning**:
 
 ```bash
 zonos2-server out/zonos2-f16.gguf --dac out/dac.gguf --spk out/spk-encoder.gguf \
-    --host 0.0.0.0 --port 1919 --gpu
+    --host 0.0.0.0 --port 1919 --gpu --tts-default-voices-dir default_voices
 # then open http://localhost:1919/  for the browser UI
 ```
 
@@ -170,8 +170,8 @@ zonos2-server out/zonos2-f16.gguf --dac out/dac.gguf --spk out/spk-encoder.gguf 
 | `/tts/generate` | POST | JSON → **streaming float32 PCM** (`stream:true`, default) or buffered (`format:"wav"`) |
 | `/v1/audio/speech` | POST | OpenAI-compatible (`input`, `response_format` = `pcm` streams / `wav` buffers) |
 | `/tts/capabilities` | GET | feature flags for the loaded model |
-| `/tts/speakers` | GET/POST | list / cache a session speaker (audio upload or `.npy` embedding) |
-| `/tts/speakers/{id}/preview` | GET | cached reference audio (WAV) |
+| `/tts/speakers` | GET/POST | list default speakers and cache a session speaker (audio upload or `.npy` embedding) |
+| `/tts/speakers/{id}/preview` | GET | default/cached reference audio (WAV) |
 | `/v1/models`, `/v1`, `/health` | GET | status / model list |
 | `/` | GET | bundled `web/tts_ui.html` |
 
@@ -195,13 +195,14 @@ The JSON body accepts the reference fields: `text`, sampling (`temperature`, `to
 Server flags: `--gpu`/`--cpu`, `--spk <encoder.gguf>` (enables audio-upload cloning),
 `--max N` (frame ceiling, default 2000 ≈ 23 s), `--stream-block`/`--stream-context` (streaming
 granularity / conv-context frames, ≥16 is seam-free), `--dac-cpu` (run the DAC on CPU under
-`--gpu`), `--ui <path>`. One synthesis runs at a time (the model isn't thread-safe); concurrent
-requests queue.
+`--gpu`), `--tts-default-voices-dir <dir>`, `--tts-emotion-directions-dir <dir>`,
+`--text-normalizer-python <python>`, `--ui <path>`.
+One synthesis runs at a time (the model isn't thread-safe); concurrent requests queue.
 
 > **Differences from the Python server (documented honestly via `/tts/capabilities`):**
-> the C++ tokenizer is **byte-level**, so `language` is accepted-but-ignored and
-> `text_normalization` is unsupported (`text_normalization_enabled:false`); speaker **blending**
-> and a default-voices directory are not implemented. `/tts/generate` (buffered) is **bit-identical
+> the native C++ tokenizer is **byte-level** unless the optional NeMo/Pynini helper is enabled with
+> `--text-normalizer-python`. Without that helper, `text_normalization_enabled:false`; with it,
+> text is normalized before prompt building. `/tts/generate` (buffered) is **bit-identical
 > to `zonos2-cli --tts`** for matching params; streamed audio matches the buffered decode to
 > ≈−82 dB on GPU (block-vs-full-decode float variance — bit-identical on CPU or with `--dac-cpu`).
 > Output is deterministic for fixed `(text, seed, sampling, max_tokens)`; changing `max_tokens`

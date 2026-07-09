@@ -28,15 +28,19 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,9 +53,12 @@ using json = nlohmann::json;
 
 struct CachedSpeaker {
     std::string id, label, source_type, original_name;
+    std::string path;
     std::vector<float> emb;     // [spk_dim]
     std::vector<float> pcm24k;  // reference audio for preview (empty for embedding-only)
     double created = 0;
+    double mtime = 0;
+    bool is_default = false;
 };
 
 struct ReqJob;  // continuous-batching work item (defined after GenReq)
@@ -102,7 +109,12 @@ struct ServerState {
     int dac_threads  = 4;      // DAC decode pool lanes (parallel decode across requests)
     bool prof = false;         // ZONOS2_PROFILE: emit per-request decode timing
     std::string ui_path = "web/tts_ui.html";
+    std::string default_voice_dir = "default_voices";
     std::string emotion_dir = "emotion_directions";
+    std::string text_norm_python;
+    std::string text_norm_script = "scripts/normalize-text.py";
+    std::string text_norm_cache = "out/tts-norm-cache";
+    std::string text_norm_zonos2_python = "../ZONOS2/python";
     zonos2_emotion_directions emotion;
     bool have_emotion = false;
 
@@ -121,6 +133,7 @@ struct ServerState {
     std::mutex spk_mtx;          // guards `sessions`
     std::mutex spk_compute_mtx;  // serialize ECAPA encoder compute (shared spk ggml backend, not reentrant)
     std::map<std::string, std::map<std::string, CachedSpeaker>> sessions; // session -> id -> speaker
+    std::map<std::string, CachedSpeaker> default_speakers;                 // id -> disk speaker
     std::atomic<uint64_t> id_ctr{0};
 };
 
@@ -134,6 +147,9 @@ static const char * QFEATS[6] = {
 // strings (so a model with a different conditioning layout still renders, just unlabeled).
 static const std::vector<std::string> SPEAKING_RATE_LABELS = {
     "0-8", "8-11", "11-14", "14-17", "17-21", "21-28", "28-40", "40+"
+};
+static const std::vector<std::string> TEXT_NORM_LANGUAGES = {
+    "en_us", "en_gb", "fr_fr", "de", "es", "it", "pt_br", "ja", "cmn", "ko"
 };
 static const std::map<std::string, std::vector<std::string>> QUALITY_LABELS = {
     {"lufs",                   {"-1000--50","-50--45.5","-45.5--41","-41--36.5","-36.5--32","-32--27.5","-27.5--23","-23--18.5","-18.5--14","-14--9.5","-9.5--5","-5+"}},
@@ -158,9 +174,272 @@ static std::string make_id(ServerState & s, const char * prefix) {
     return buf;
 }
 
+static std::string lower_ascii(std::string s) {
+    for (char & c : s) c = (char) std::tolower((unsigned char) c);
+    return s;
+}
+
+static std::string stem_label(const std::filesystem::path & path) {
+    std::string label = path.stem().string();
+    for (char & c : label) if (c == '_' || c == '-') c = ' ';
+    while (!label.empty() && std::isspace((unsigned char) label.front())) label.erase(label.begin());
+    while (!label.empty() && std::isspace((unsigned char) label.back())) label.pop_back();
+    return label.empty() ? path.filename().string() : label;
+}
+
+static bool is_audio_ext(const std::string & ext) {
+    static const std::vector<std::string> exts = {
+        ".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".webm"
+    };
+    return std::find(exts.begin(), exts.end(), lower_ascii(ext)) != exts.end();
+}
+
+static bool is_embedding_ext(const std::string & ext) {
+    return lower_ascii(ext) == ".npy"; // .npz is a zip container; the native reader accepts .npy.
+}
+
+static uint64_t fnv1a64(const std::string & s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+static std::string hex16(uint64_t v) {
+    const char * d = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i) { out[i] = d[v & 0x0f]; v >>= 4; }
+    return out;
+}
+
+static double file_mtime_seconds(const std::filesystem::path & p) {
+    std::error_code ec;
+    auto ft = std::filesystem::last_write_time(p, ec);
+    if (ec) return 0.0;
+    return (double) std::chrono::duration_cast<std::chrono::milliseconds>(
+        ft.time_since_epoch()).count() / 1000.0;
+}
+
+static void refresh_default_speakers_locked(ServerState & s) {
+    std::map<std::string, CachedSpeaker> current;
+    if (s.default_voice_dir.empty()) { s.default_speakers.clear(); return; }
+
+    const std::filesystem::path root = std::filesystem::path(s.default_voice_dir);
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+        s.default_speakers.clear();
+        return;
+    }
+
+    const auto abs_root = std::filesystem::weakly_canonical(root, ec);
+    const std::filesystem::path scan_root = ec ? root : abs_root;
+    for (std::filesystem::recursive_directory_iterator it(scan_root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (ec || !it->is_regular_file(ec)) continue;
+        const auto path = it->path();
+        const std::string ext = path.extension().string();
+        const bool audio = is_audio_ext(ext), emb = is_embedding_ext(ext);
+        if (!audio && !emb) continue;
+
+        std::error_code rel_ec;
+        std::string rel = std::filesystem::relative(path, scan_root, rel_ec).generic_string();
+        if (rel_ec || rel.empty()) rel = path.filename().generic_string();
+        CachedSpeaker sp;
+        sp.id = "default_" + hex16(fnv1a64(rel));
+        sp.label = stem_label(path);
+        sp.source_type = audio ? "audio" : "embedding_file";
+        sp.original_name = path.filename().string();
+        sp.path = path.string();
+        sp.created = file_mtime_seconds(path);
+        sp.mtime = sp.created;
+        sp.is_default = true;
+
+        auto old = s.default_speakers.find(sp.id);
+        if (old != s.default_speakers.end() && old->second.path == sp.path &&
+            old->second.mtime == sp.mtime && old->second.source_type == sp.source_type) {
+            current[sp.id] = old->second;
+        } else {
+            current[sp.id] = std::move(sp);
+        }
+    }
+    s.default_speakers.swap(current);
+}
+
+static bool load_embedding_npy(const std::string & path, int spk_dim,
+                               std::vector<float> & out, std::string & err) {
+    std::vector<float> data; std::vector<int64_t> shape;
+    if (!npy::load_f32(path, data, shape)) {
+        err = "speaker embedding file is not a valid <f4 .npy";
+        return false;
+    }
+    if (shape.size() == 1 && (int) data.size() == spk_dim) {
+        out = std::move(data);
+        return true;
+    }
+    if (shape.size() == 2 && (int) shape[1] == spk_dim && shape[0] > 0) {
+        out.assign(spk_dim, 0.0f);
+        for (int r = 0; r < (int) shape[0]; ++r)
+            for (int c = 0; c < spk_dim; ++c) out[c] += data[(size_t) r * spk_dim + c];
+        for (float & x : out) x /= (float) shape[0];
+        return true;
+    }
+    err = "speaker embedding shape mismatch (want [" + std::to_string(spk_dim) + "] or [N," +
+          std::to_string(spk_dim) + "])";
+    return false;
+}
+
+static bool slerp_embeddings(const std::vector<float> & a, const std::vector<float> & b,
+                             float t, std::vector<float> & out, std::string & err) {
+    if (a.size() != b.size()) {
+        err = "cannot blend speaker embeddings with different dimensions";
+        return false;
+    }
+    if (t < 0.0f || t > 1.0f) {
+        err = "speaker_blend_t must be between 0.0 and 1.0";
+        return false;
+    }
+    double na = 1e-8, nb = 1e-8, dot = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        na += (double) a[i] * a[i];
+        nb += (double) b[i] * b[i];
+    }
+    na = std::sqrt(na); nb = std::sqrt(nb);
+    for (size_t i = 0; i < a.size(); ++i) dot += ((double) a[i] / na) * ((double) b[i] / nb);
+    dot = std::max(-1.0, std::min(1.0, dot));
+    const double omega = std::acos(dot);
+    out.resize(a.size());
+    if (omega < 1e-6) {
+        for (size_t i = 0; i < a.size(); ++i) out[i] = (1.0f - t) * a[i] + t * b[i];
+        return true;
+    }
+    const double so = std::sin(omega);
+    const double wa = std::sin((1.0 - (double) t) * omega) / so;
+    const double wb = std::sin((double) t * omega) / so;
+    for (size_t i = 0; i < a.size(); ++i) out[i] = (float) (wa * a[i] + wb * b[i]);
+    return true;
+}
+
+struct RangeSpec {
+    bool exact = false;
+    float lo = 0.0f;
+    float hi = 0.0f;
+    bool open_hi = false;
+};
+
+static bool parse_range_spec(const std::string & spec, RangeSpec & out) {
+    const char * p = spec.c_str();
+    char * e = nullptr;
+    const double first = std::strtod(p, &e);
+    if (e == p || !std::isfinite(first)) return false;
+    while (*e && std::isspace((unsigned char) *e)) ++e;
+    if (*e == '\0') {
+        out = {true, (float) first, 0.0f, false};
+        return true;
+    }
+    if (*e == '+') {
+        ++e;
+        while (*e && std::isspace((unsigned char) *e)) ++e;
+        if (*e != '\0') return false;
+        out = {false, (float) first, 0.0f, true};
+        return true;
+    }
+    if (*e != '-') return false;
+    ++e;
+    char * e2 = nullptr;
+    const double second = std::strtod(e, &e2);
+    if (e2 == e || !std::isfinite(second)) return false;
+    while (*e2 && std::isspace((unsigned char) *e2)) ++e2;
+    if (*e2 != '\0' || second <= first) return false;
+    out = {false, (float) first, (float) second, false};
+    return true;
+}
+
+static int bucket_for_value(float value, const std::vector<std::string> & labels) {
+    std::vector<RangeSpec> specs;
+    specs.reserve(labels.size());
+    for (const auto & label : labels) {
+        RangeSpec s;
+        if (!parse_range_spec(label, s)) return -1;
+        specs.push_back(s);
+    }
+    for (int i = 0; i < (int) specs.size(); ++i)
+        if (specs[i].exact && std::fabs(value - specs[i].lo) <= 1e-6f) return i;
+    std::vector<int> ranges;
+    for (int i = 0; i < (int) specs.size(); ++i) if (!specs[i].exact) ranges.push_back(i);
+    if (ranges.empty()) return -1;
+    for (int pos = 0; pos < (int) ranges.size(); ++pos) {
+        const int i = ranges[pos];
+        const auto & s = specs[i];
+        if (s.open_hi) { if (value >= s.lo) return i; }
+        else if (pos + 1 == (int) ranges.size()) { if (value >= s.lo && value <= s.hi) return i; }
+        else if (value >= s.lo && value < s.hi) return i;
+    }
+    return (value < specs[ranges.front()].lo) ? ranges.front() : ranges.back();
+}
+
+static bool text_norm_language_supported(const std::string & lang) {
+    return std::find(TEXT_NORM_LANGUAGES.begin(), TEXT_NORM_LANGUAGES.end(), lang) != TEXT_NORM_LANGUAGES.end();
+}
+
+static std::string shell_quote(const std::string & s) {
+#ifdef _WIN32
+    std::string q = "\"";
+    for (char c : s) q += (c == '"') ? "\\\"" : std::string(1, c);
+    return q + "\"";
+#else
+    std::string q = "'";
+    for (char c : s) q += (c == '\'') ? "'\\''" : std::string(1, c);
+    return q + "'";
+#endif
+}
+
 static std::filesystem::path temp_path(ServerState & s, const char * suffix) {
     auto dir = std::filesystem::temp_directory_path();
     return dir / ("zonos2-" + std::to_string((unsigned long long) (s.id_ctr++)) + suffix);
+}
+
+static std::string run_text_normalizer(ServerState & s, const std::string & text,
+                                       const std::string & language) {
+    if (s.text_norm_python.empty() || text.empty()) return text;
+
+    const auto tmp = temp_path(s, ".txt");
+    FILE * f = fopen(tmp.string().c_str(), "wb");
+    if (!f) return text;
+    fwrite(text.data(), 1, text.size(), f);
+    fclose(f);
+
+    std::string cmd = shell_quote(s.text_norm_python) + " " +
+                      shell_quote(s.text_norm_script) +
+                      " --language " + shell_quote(language) +
+                      " --input " + shell_quote(tmp.string()) +
+                      " --cache-dir " + shell_quote(s.text_norm_cache);
+    if (!s.text_norm_zonos2_python.empty())
+        cmd += " --zonos2-python " + shell_quote(s.text_norm_zonos2_python);
+#ifdef _WIN32
+    cmd += " 2>NUL";
+#else
+    cmd += " 2>/dev/null";
+#endif
+
+    std::string out;
+    FILE * pp = popen(cmd.c_str(), "r");
+    if (pp) {
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), pp)) > 0) out.append(buf, n);
+        const int rc = pclose(pp);
+        if (rc != 0 || out.empty()) out = text;
+    } else {
+        out = text;
+    }
+    std::error_code ec; std::filesystem::remove(tmp, ec);
+    return out;
+}
+
+static std::string normalize_language_code(std::string lang) {
+    for (char & c : lang) {
+        if (c == '-') c = '_';
+        else c = (char) std::tolower((unsigned char) c);
+    }
+    return lang;
 }
 
 // Base64 decode (tolerates whitespace and a leading "data:...;base64," prefix).
@@ -257,26 +536,107 @@ struct ReqJob {
     bool client_dropped = false;         // set by the handler when the socket drops
 };
 
+static bool compute_default_speaker_embedding(ServerState & s, CachedSpeaker & sp,
+                                              std::vector<float> & out, std::string & err) {
+    const int spk_dim = (int) s.model.hp.spk_dim;
+    if ((int) sp.emb.size() == spk_dim) { out = sp.emb; return true; }
+
+    if (sp.source_type == "embedding_file") {
+        if (!load_embedding_npy(sp.path, spk_dim, sp.emb, err)) return false;
+    } else {
+        if (!s.have_spk) { err = "default audio speaker requires --spk <encoder.gguf>"; return false; }
+        if (sp.pcm24k.empty()) sp.pcm24k = spk_decode_audio_file(s.spk, sp.path.c_str());
+        if (sp.pcm24k.empty()) { err = "ffmpeg failed to decode default speaker audio"; return false; }
+        { std::lock_guard<std::mutex> lk(s.spk_compute_mtx);
+          sp.emb = spk_embed_from_pcm24k(s.spk, sp.pcm24k.data(), (int) sp.pcm24k.size()); }
+        if ((int) sp.emb.size() != spk_dim) {
+            err = "speaker encoding failed (got " + std::to_string(sp.emb.size()) +
+                  ", want " + std::to_string(spk_dim) + ")";
+            sp.emb.clear();
+            return false;
+        }
+    }
+    out = sp.emb;
+    return true;
+}
+
+static bool resolve_cached_speaker(ServerState & s, const std::string & session,
+                                   const std::string & id, std::vector<float> & out,
+                                   std::string & err) {
+    CachedSpeaker default_sp;
+    bool is_default = false;
+    {
+        std::lock_guard<std::mutex> lk(s.spk_mtx);
+        refresh_default_speakers_locked(s);
+        auto dit = s.default_speakers.find(id);
+        if (dit != s.default_speakers.end()) {
+            default_sp = dit->second;
+            is_default = true;
+        }
+    }
+    if (is_default) {
+        if (!compute_default_speaker_embedding(s, default_sp, out, err)) return false;
+        std::lock_guard<std::mutex> lk(s.spk_mtx);
+        auto it = s.default_speakers.find(default_sp.id);
+        if (it != s.default_speakers.end() && it->second.path == default_sp.path &&
+            it->second.mtime == default_sp.mtime) {
+            it->second.emb = default_sp.emb;
+            it->second.pcm24k = default_sp.pcm24k;
+        }
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(s.spk_mtx);
+        auto sit = s.sessions.find(session);
+        if (sit != s.sessions.end()) {
+            auto it = sit->second.find(id);
+            if (it != sit->second.end()) { out = it->second.emb; return true; }
+        }
+    }
+    err = "unknown speaker_embedding_id '" + id + "'";
+    return false;
+}
+
 // Resolve a speaker vector from a request's speaker_* fields. Returns true if one was set,
 // false if none requested. On error sets `err` and returns false.
 static bool resolve_speaker(ServerState & s, const json & j, const std::string & session,
                             std::vector<float> & out, std::string & err) {
     const int spk_dim = (int) s.model.hp.spk_dim;
 
-    const std::string emb_id = jstr(j, "speaker_embedding_id");
-    if (!emb_id.empty()) {
-        std::lock_guard<std::mutex> lk(s.spk_mtx);
-        auto sit = s.sessions.find(session);
-        if (sit != s.sessions.end()) {
-            auto it = sit->second.find(emb_id);
-            if (it != sit->second.end()) { out = it->second.emb; return true; }
-        }
-        err = "unknown speaker_embedding_id '" + emb_id + "'";
-        return false;
-    }
-
     std::string audio_b64 = jstr(j, "speaker_audio_base64");
     if (audio_b64.empty()) audio_b64 = jstr(j, "speaker_wav_base64");   // legacy alias
+    const std::string emb_b64 = jstr(j, "speaker_embedding_base64");
+    const std::string emb_id = jstr(j, "speaker_embedding_id");
+    const std::string blend_a = jstr(j, "speaker_blend_embedding_id_a");
+    const std::string blend_b = jstr(j, "speaker_blend_embedding_id_b");
+
+    const int direct = (!audio_b64.empty() ? 1 : 0) + (!emb_b64.empty() ? 1 : 0);
+    const bool cached = !emb_id.empty();
+    const bool blended = !blend_a.empty() || !blend_b.empty();
+    const int modes = (direct > 0 ? 1 : 0) + (cached ? 1 : 0) + (blended ? 1 : 0);
+    if (direct > 1) {
+        err = "provide either a reference audio file or a saved embedding file, not both";
+        return false;
+    }
+    if (modes == 0) return false;
+    if (modes > 1) {
+        err = "provide speaker conditioning via upload, one cached speaker id, or two cached ids for blending";
+        return false;
+    }
+    if (blended) {
+        if (blend_a.empty() || blend_b.empty()) {
+            err = "provide both cached speaker ids to blend between two speakers";
+            return false;
+        }
+        std::vector<float> a, b;
+        if (!resolve_cached_speaker(s, session, blend_a, a, err)) return false;
+        if (!resolve_cached_speaker(s, session, blend_b, b, err)) return false;
+        const float t = (float) jnum(j, "speaker_blend_t", 0.5);
+        return slerp_embeddings(a, b, t, out, err);
+    }
+    if (cached) return resolve_cached_speaker(s, session, emb_id, out, err);
+
     if (!audio_b64.empty()) {
         if (!s.have_spk) { err = "speaker audio upload requires --spk <encoder.gguf>"; return false; }
         std::vector<uint8_t> bytes;
@@ -294,7 +654,6 @@ static bool resolve_speaker(ServerState & s, const json & j, const std::string &
         return true;
     }
 
-    const std::string emb_b64 = jstr(j, "speaker_embedding_base64");
     if (!emb_b64.empty()) {
         std::vector<uint8_t> bytes;
         if (!b64_decode(emb_b64, bytes)) { err = "invalid speaker_embedding_base64"; return false; }
@@ -302,41 +661,131 @@ static bool resolve_speaker(ServerState & s, const json & j, const std::string &
         FILE * f = fopen(tmp.string().c_str(), "wb");
         if (!f) { err = "cannot write temp embedding"; return false; }
         fwrite(bytes.data(), 1, bytes.size(), f); fclose(f);
-        std::vector<float> data; std::vector<int64_t> shape;
-        const bool ok = npy::load_f32(tmp.string(), data, shape);
+        const bool ok = load_embedding_npy(tmp.string(), spk_dim, out, err);
         std::error_code ec; std::filesystem::remove(tmp, ec);
-        if (!ok) { err = "speaker_embedding_base64 is not a valid <f4 .npy"; return false; }
-        if (shape.size() == 1 && (int) data.size() == spk_dim) {
-            out = data;
-        } else if (shape.size() == 2 && (int) shape[1] == spk_dim) {   // average rows
-            out.assign(spk_dim, 0.0f);
-            for (int r = 0; r < (int) shape[0]; ++r)
-                for (int c = 0; c < spk_dim; ++c) out[c] += data[(size_t) r * spk_dim + c];
-            for (int c = 0; c < spk_dim; ++c) out[c] /= (float) shape[0];
-        } else {
-            err = "speaker embedding shape mismatch (want [" + std::to_string(spk_dim) + "])";
-            return false;
-        }
-        return true;
+        return ok;
     }
     return false; // no speaker requested
 }
 
-// Map quality_buckets (array or {feature:bucket} object) to a per-feature vector (-1 = skip).
-static std::vector<int> parse_quality(const json & j, int n_feat) {
-    std::vector<int> q;
-    if (!j.contains("quality_buckets")) return q;             // empty => caller uses model default
-    const json & qb = j["quality_buckets"];
-    if (qb.is_array()) {
-        q.assign(n_feat, -1);
-        for (int i = 0; i < n_feat && i < (int) qb.size(); ++i)
-            if (qb[i].is_number()) q[i] = (int) qb[i].get<double>();
-    } else if (qb.is_object()) {
-        q.assign(n_feat, -1);
-        for (int i = 0; i < n_feat; ++i)
-            if (qb.contains(QFEATS[i]) && qb[QFEATS[i]].is_number()) q[i] = (int) qb[QFEATS[i]].get<double>();
+static bool resolve_speaking_rate_bucket(const ServerState & s, const json & j,
+                                         int & bucket, std::string & err) {
+    bucket = -1;
+    if (!jbool(j, "speaking_rate_enabled", false)) return true;
+
+    const bool has_bucket = j.contains("speaking_rate_bucket") && !j["speaking_rate_bucket"].is_null();
+    const bool has_rate   = j.contains("speaking_rate") && !j["speaking_rate"].is_null();
+    const bool has_speed  = j.contains("speed") && !j["speed"].is_null();
+    const int supplied = (has_bucket ? 1 : 0) + (has_rate ? 1 : 0) + (has_speed ? 1 : 0);
+    if (supplied == 0) return true;
+    if (supplied > 1) { err = "provide only one of speaking_rate_bucket, speaking_rate, or speed"; return false; }
+
+    const int n = (int) s.model.hp.cond_speaking_rate_buckets;
+    if (n <= 0) { err = "current model does not support speaking-rate conditioning"; return false; }
+
+    if (has_bucket) {
+        if (!j["speaking_rate_bucket"].is_number()) { err = "speaking_rate_bucket must be numeric"; return false; }
+        bucket = (int) j["speaking_rate_bucket"].get<double>();
+        if (bucket < 0 || bucket >= n) {
+            err = "speaking_rate_bucket must be in [0, " + std::to_string(n - 1) + "]";
+            return false;
+        }
+        return true;
     }
-    return q;
+
+    double rate = 0.0;
+    std::vector<RangeSpec> ranges;
+    if ((int) SPEAKING_RATE_LABELS.size() == n) {
+        for (const auto & label : SPEAKING_RATE_LABELS) {
+            RangeSpec r;
+            if (!parse_range_spec(label, r) || r.exact) { ranges.clear(); break; }
+            ranges.push_back(r);
+        }
+    }
+    if (has_rate) {
+        if (!j["speaking_rate"].is_number()) { err = "speaking_rate must be numeric"; return false; }
+        rate = j["speaking_rate"].get<double>();
+    } else {
+        if (!j["speed"].is_number()) { err = "speed must be numeric"; return false; }
+        const double speed = j["speed"].get<double>();
+        if (speed <= 0.0) { err = "speed must be positive"; return false; }
+        if (!ranges.empty()) {
+            const RangeSpec & mid = ranges[(size_t) ranges.size() / 2];
+            const double neutral = mid.open_hi ? std::max<double>(mid.lo, 15.0) : (mid.lo + mid.hi) * 0.5;
+            rate = neutral * speed;
+        } else {
+            rate = 15.0 * speed;
+        }
+    }
+    if (rate <= 0.0) { err = "speaking_rate must be positive"; return false; }
+
+    if (!ranges.empty()) {
+        for (int i = 0; i < (int) ranges.size(); ++i) {
+            if (ranges[i].open_hi || rate < ranges[i].hi) { bucket = i; return true; }
+        }
+        bucket = n - 1;
+        return true;
+    }
+    const double fps = 86.0 * (44070.0 / 44000.0);
+    bucket = std::min(std::max((int) ((rate / fps) * n), 0), n - 1);
+    return true;
+}
+
+// Map quality_buckets or quality_values to a per-feature vector (-1 = skip).
+static bool resolve_quality_buckets(const json & j, const zonos2_hparams & hp,
+                                    std::vector<int> & out, std::string & err) {
+    const int n_feat = (int) hp.cond_quality_bucket_counts.size();
+    out.clear();
+    if (!jbool(j, "quality_enabled", true)) { out.assign(n_feat, -1); return true; }
+
+    const bool has_buckets = j.contains("quality_buckets") && !j["quality_buckets"].is_null();
+    const bool has_values  = j.contains("quality_values") && !j["quality_values"].is_null();
+    if (!has_buckets && !has_values) return true;  // empty => model default
+    if (has_buckets && has_values) { err = "provide only one of quality_buckets or quality_values"; return false; }
+    if (n_feat <= 0) { err = "current model does not support quality conditioning"; return false; }
+
+    out.assign(n_feat, -1);
+    const json & q = has_buckets ? j["quality_buckets"] : j["quality_values"];
+    auto get_item = [&](int i) -> const json * {
+        if (q.is_array()) return i < (int) q.size() ? &q[(size_t) i] : nullptr;
+        if (q.is_object()) return q.contains(QFEATS[i]) ? &q[QFEATS[i]] : nullptr;
+        return nullptr;
+    };
+    if (!q.is_array() && !q.is_object()) {
+        err = "quality_buckets and quality_values must be a list or feature-name object";
+        return false;
+    }
+
+    for (int i = 0; i < n_feat && i < 6; ++i) {
+        const json * item = get_item(i);
+        if (!item || item->is_null()) continue;
+        if (!item->is_number()) {
+            err = std::string(has_buckets ? "quality_buckets." : "quality_values.") + QFEATS[i] + " must be numeric";
+            return false;
+        }
+        const int count = hp.cond_quality_bucket_counts[i];
+        if (count <= 0) continue;
+        if (has_buckets) {
+            const int bucket = (int) item->get<double>();
+            if (bucket < 0 || bucket >= count) {
+                err = std::string("quality_buckets.") + QFEATS[i] + " must be in [0, " + std::to_string(count - 1) + "]";
+                return false;
+            }
+            out[i] = bucket;
+        } else {
+            auto lit = QUALITY_LABELS.find(QFEATS[i]);
+            if (lit == QUALITY_LABELS.end() || (int) lit->second.size() != count) {
+                err = std::string("quality_values.") + QFEATS[i] + " cannot be mapped for this model";
+                return false;
+            }
+            out[i] = bucket_for_value((float) item->get<double>(), lit->second);
+            if (out[i] < 0) {
+                err = std::string("quality_values.") + QFEATS[i] + " could not be mapped to a bucket";
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static bool parse_emotion_sliders(const json & j, std::map<std::string, float> & sliders,
@@ -399,6 +848,15 @@ static bool parse_gen_req(ServerState & s, const json & j, const std::string & s
     out.text = jstr(j, "text");
     if (out.text.empty()) out.text = jstr(j, "input");          // OpenAI field
     if (out.text.empty()) { err = "missing 'text'"; return false; }
+    std::string language = normalize_language_code(jstr(j, "language", "en_us"));
+    if (!s.text_norm_python.empty()) {
+        if (!text_norm_language_supported(language)) {
+            err = "unsupported language code '" + language + "'";
+            return false;
+        }
+        if (jbool(j, "text_normalization", true))
+            out.text = run_text_normalizer(s, out.text, language);
+    }
 
     out.sp.temperature   = (float) jnum(j, "temperature",   out.sp.temperature);
     out.sp.top_k         =         jint(j, "topk",          out.sp.top_k);
@@ -414,16 +872,15 @@ static bool parse_gen_req(ServerState & s, const json & j, const std::string & s
 
     const int cap = s.max_frames;
     const int req_max = jint(j, "max_tokens", 0);
+    if (j.contains("max_tokens") && !j["max_tokens"].is_null() && req_max <= 0) {
+        err = "max_tokens must be positive";
+        return false;
+    }
     out.max_frames = (req_max > 0) ? std::min(req_max, cap) : cap;
 
     // conditioning
-    const int n_feat = (int) s.model.hp.cond_quality_bucket_counts.size();
-    if (jbool(j, "speaking_rate_enabled", false)) {
-        if (j.contains("speaking_rate_bucket") && j["speaking_rate_bucket"].is_number())
-            out.opt.speaking_rate_bucket = (int) j["speaking_rate_bucket"].get<double>();
-    }
-    if (!jbool(j, "quality_enabled", true)) out.opt.quality_buckets.assign(n_feat, -1);
-    else out.opt.quality_buckets = parse_quality(j, n_feat);   // empty => model default
+    if (!resolve_speaking_rate_bucket(s, j, out.opt.speaking_rate_bucket, err)) return false;
+    if (!resolve_quality_buckets(j, s.model.hp, out.opt.quality_buckets, err)) return false;
 
     out.opt.clean_speaker_background = jbool(j, "clean_speaker_background", false);
     out.opt.accurate_mode            = jbool(j, "accurate_mode", true);
@@ -817,12 +1274,15 @@ static void handle_generate(ServerState & s, const httplib::Request & req, httpl
 
 // --------------------------------------------------------------------------- speaker endpoints
 
-static json speaker_json(const CachedSpeaker & sp, bool is_default = false) {
+static json speaker_json(const CachedSpeaker & sp, int fallback_dim = 0) {
+    const bool is_default = sp.is_default;
+    const int dim = !sp.emb.empty() ? (int) sp.emb.size() : fallback_dim;
     json o = {
         {"id", sp.id}, {"label", sp.label}, {"source_type", sp.source_type},
-        {"original_name", sp.original_name}, {"dimension", (int) sp.emb.size()},
+        {"original_name", sp.original_name}, {"dimension", dim},
         {"created_at", sp.created}, {"has_preview", !sp.pcm24k.empty()},
     };
+    if (sp.source_type == "audio") o["has_preview"] = true;
     if (is_default) { o["scope"] = "default"; o["is_default"] = true; }
     return o;
 }
@@ -859,11 +1319,21 @@ static void handle_speakers_post(ServerState & s, const httplib::Request & req, 
         sp.source_type = "audio";
         sp.pcm24k = std::move(pcm);   // keep decoded reference audio for /preview
     } else {
-        std::string err;
-        if (!resolve_speaker(s, j, session, sp.emb, err)) {
-            set_json(res, {{"error", err.empty() ? std::string("no speaker_audio_base64 / speaker_embedding_base64 provided") : err}}, 400);
+        const std::string emb_b64 = jstr(j, "speaker_embedding_base64");
+        if (emb_b64.empty()) {
+            set_json(res, {{"error", "provide an audio file or saved embedding file to cache"}}, 400);
             return;
         }
+        std::vector<uint8_t> bytes;
+        if (!b64_decode(emb_b64, bytes)) { set_json(res, {{"error", "invalid speaker_embedding_base64"}}, 400); return; }
+        const auto tmp = temp_path(s, ".npy");
+        FILE * f = fopen(tmp.string().c_str(), "wb");
+        if (!f) { set_json(res, {{"error", "cannot write temp embedding"}}, 500); return; }
+        fwrite(bytes.data(), 1, bytes.size(), f); fclose(f);
+        std::string err;
+        const bool ok = load_embedding_npy(tmp.string(), (int) s.model.hp.spk_dim, sp.emb, err);
+        std::error_code ec; std::filesystem::remove(tmp, ec);
+        if (!ok) { set_json(res, {{"error", err}}, 400); return; }
         sp.source_type = "embedding_file";
     }
 
@@ -873,7 +1343,7 @@ static void handle_speakers_post(ServerState & s, const httplib::Request & req, 
         std::lock_guard<std::mutex> lk(s.spk_mtx);
         s.sessions[session][sp.id] = sp;
     }
-    set_json(res, speaker_json(sp));
+    set_json(res, speaker_json(sp, (int) s.model.hp.spk_dim));
 }
 
 static void handle_speakers_get(ServerState & s, const httplib::Request & req, httplib::Response & res) {
@@ -881,9 +1351,15 @@ static void handle_speakers_get(ServerState & s, const httplib::Request & req, h
     json arr = json::array();
     {
         std::lock_guard<std::mutex> lk(s.spk_mtx);
+        refresh_default_speakers_locked(s);
+        std::vector<CachedSpeaker> defaults;
+        for (auto & kv : s.default_speakers) defaults.push_back(kv.second);
+        std::sort(defaults.begin(), defaults.end(),
+                  [](const CachedSpeaker & a, const CachedSpeaker & b) { return lower_ascii(a.label) < lower_ascii(b.label); });
+        for (auto & sp : defaults) arr.push_back(speaker_json(sp, (int) s.model.hp.spk_dim));
         auto it = s.sessions.find(session);
         if (it != s.sessions.end())
-            for (auto & kv : it->second) arr.push_back(speaker_json(kv.second));
+            for (auto & kv : it->second) arr.push_back(speaker_json(kv.second, (int) s.model.hp.spk_dim));
     }
     set_json(res, {{"speakers", arr}});
 }
@@ -892,12 +1368,30 @@ static void handle_speaker_preview(ServerState & s, const httplib::Request & req
     const std::string session = req.get_header_value("X-TTS-Session-ID");
     const std::string id = req.matches[1];
     std::vector<float> pcm;
+    bool default_audio = false;
+    CachedSpeaker default_sp;
     {
         std::lock_guard<std::mutex> lk(s.spk_mtx);
+        refresh_default_speakers_locked(s);
+        auto dit = s.default_speakers.find(id);
+        if (dit != s.default_speakers.end()) {
+            default_sp = dit->second;
+            default_audio = default_sp.source_type == "audio";
+        }
         auto it = s.sessions.find(session);
-        if (it != s.sessions.end()) {
+        if (!default_audio && it != s.sessions.end()) {
             auto sit = it->second.find(id);
             if (sit != it->second.end()) pcm = sit->second.pcm24k;
+        }
+    }
+    if (default_audio) {
+        pcm = default_sp.pcm24k;
+        if (pcm.empty()) pcm = spk_decode_audio_file(s.spk, default_sp.path.c_str());
+        if (!pcm.empty()) {
+            std::lock_guard<std::mutex> lk(s.spk_mtx);
+            auto it = s.default_speakers.find(default_sp.id);
+            if (it != s.default_speakers.end() && it->second.path == default_sp.path &&
+                it->second.mtime == default_sp.mtime) it->second.pcm24k = pcm;
         }
     }
     if (pcm.empty()) { set_json(res, {{"error", "no preview for speaker '" + id + "'"}}, 404); return; }
@@ -939,9 +1433,20 @@ static void handle_capabilities(ServerState & s, httplib::Response & res) {
         for (const auto & name : zonos2_emotion_names(s.emotion)) emotion_names.push_back(name);
         for (const auto & name : zonos2_emotion_axes(s.emotion)) emotion_axes.push_back(name);
     }
+    bool have_default_voices = false;
+    {
+        std::lock_guard<std::mutex> lk(s.spk_mtx);
+        refresh_default_speakers_locked(s);
+        have_default_voices = !s.default_speakers.empty();
+    }
+
+    json text_langs = json::array();
+    if (!s.text_norm_python.empty())
+        for (const auto & lang : TEXT_NORM_LANGUAGES) text_langs.push_back(lang);
+
     json caps = {
-        {"text_normalization_enabled", false},          // byte-level tokenizer: no NeMo normalizer
-        {"text_norm_languages", json::array()},
+        {"text_normalization_enabled", !s.text_norm_python.empty()},
+        {"text_norm_languages", text_langs},
         {"speaker_enabled", hp.spk_dim > 0},
         {"speaker_embedding_dim", (int) hp.spk_dim},
         {"n_codebooks", (int) hp.n_codebooks},
@@ -960,8 +1465,8 @@ static void handle_capabilities(ServerState & s, httplib::Response & res) {
         {"speaker_audio_upload", s.have_spk},
         {"speaker_embedding_upload", hp.spk_dim > 0},
         {"speaker_embedding_cache", true},
-        {"speaker_embedding_blend", false},             // SLERP blend: not in this port
-        {"default_voices_enabled", false},
+        {"speaker_embedding_blend", hp.spk_dim > 0},
+        {"default_voices_enabled", have_default_voices},
         {"emotion_enabled", s.have_emotion && hp.spk_dim > 0},
         {"emotion_names", emotion_names},
         {"emotion_axes", emotion_axes},
@@ -999,8 +1504,19 @@ static void usage(const char * a0) {
         "  --dac-threads N     DAC decode pool lanes, parallel decode across requests (default 4)\n"
         "  --stream-block N    frames per streamed PCM block (default 40)\n"
         "  --stream-context N  conv-context frames each side, >=16 seam-free (default 24)\n"
+        "  --tts-default-voices-dir DIR\n"
+        "                      scan default speaker audio/.npy files (default default_voices;\n"
+        "                      empty disables)\n"
         "  --tts-emotion-directions-dir DIR\n"
         "                      load emotion direction .npy files (default emotion_directions; empty disables)\n"
+        "  --text-normalizer-python PY\n"
+        "                      enable NeMo text normalization via PY and scripts/normalize-text.py\n"
+        "  --text-normalizer-script PATH\n"
+        "                      helper script path (default scripts/normalize-text.py)\n"
+        "  --text-normalizer-cache DIR\n"
+        "                      NeMo .far cache directory (default out/tts-norm-cache)\n"
+        "  --text-normalizer-zonos2-python DIR\n"
+        "                      reference ZONOS2/python path (default ../ZONOS2/python)\n"
         "  --ui PATH           web UI html to serve at / (default web/tts_ui.html)\n", a0);
 }
 
@@ -1026,7 +1542,12 @@ int main(int argc, char ** argv) {
         else if (a == "--dac-threads" && i + 1 < argc) s.dac_threads = std::max(1, atoi(argv[++i]));
         else if (a == "--stream-block" && i + 1 < argc) s.stream_block = atoi(argv[++i]);
         else if (a == "--stream-context" && i + 1 < argc) s.stream_ctx = atoi(argv[++i]);
+        else if (a == "--tts-default-voices-dir" && i + 1 < argc) s.default_voice_dir = argv[++i];
         else if (a == "--tts-emotion-directions-dir" && i + 1 < argc) s.emotion_dir = argv[++i];
+        else if (a == "--text-normalizer-python" && i + 1 < argc) s.text_norm_python = argv[++i];
+        else if (a == "--text-normalizer-script" && i + 1 < argc) s.text_norm_script = argv[++i];
+        else if (a == "--text-normalizer-cache" && i + 1 < argc) s.text_norm_cache = argv[++i];
+        else if (a == "--text-normalizer-zonos2-python" && i + 1 < argc) s.text_norm_zonos2_python = argv[++i];
         else if (a == "--ui" && i + 1 < argc) s.ui_path = argv[++i];
         else { usage(argv[0]); return 1; }
     }
