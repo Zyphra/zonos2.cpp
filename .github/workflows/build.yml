@@ -52,6 +52,11 @@ jobs:
       - name: README command tests
         shell: bash
         run: bash tests/readme-commands.sh
+      # Exercise the end-user launcher (download-if-missing + serve + teardown)
+      # against the dummy fixtures and a local http.server standing in for HF.
+      - name: Launcher smoke test
+        shell: bash
+        run: bash tests/launcher-smoke.sh
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -62,6 +67,8 @@ jobs:
           cp -r default_voices emotion_directions dist/
           mkdir -p dist/scripts
           cp scripts/normalize-text.py dist/scripts/
+          cp scripts/start-zonos2.sh dist/start-zonos2.sh
+          chmod +x dist/start-zonos2.sh
           tar -C dist -czf zonos2-linux-x64-cpu.tar.gz .
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
@@ -138,6 +145,10 @@ jobs:
           cp -r default_voices emotion_directions dist/
           mkdir -p dist/scripts
           cp scripts/normalize-text.py dist/scripts/
+          # stamp the launcher's backend default to match this archive's build
+          sed 's/^GPU_DEFAULT=cpu/GPU_DEFAULT=gpu/' scripts/start-zonos2.sh > dist/start-zonos2.sh
+          grep -q '^GPU_DEFAULT=gpu' dist/start-zonos2.sh || { echo "GPU stamp failed"; exit 1; }
+          chmod +x dist/start-zonos2.sh
           tar -C dist -czf zonos2-linux-x64-vulkan.tar.gz .
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
@@ -186,6 +197,11 @@ jobs:
       - name: README command tests
         shell: bash
         run: bash tests/readme-commands.sh
+      # Exercise the end-user launcher (download-if-missing + serve + teardown)
+      # against the dummy fixtures and a local http.server standing in for HF.
+      - name: Launcher smoke test
+        shell: bash
+        run: bash tests/launcher-smoke.sh
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -196,6 +212,12 @@ jobs:
           cp -r default_voices emotion_directions dist/
           mkdir -p dist/scripts
           cp scripts/normalize-text.py dist/scripts/
+          # stamp the launcher's backend default to match this archive's build;
+          # ship it twice: .command for Finder double-click, .sh for the terminal
+          sed 's/^GPU_DEFAULT=cpu/GPU_DEFAULT=gpu/' scripts/start-zonos2.sh > dist/start-zonos2.sh
+          grep -q '^GPU_DEFAULT=gpu' dist/start-zonos2.sh || { echo "GPU stamp failed"; exit 1; }
+          cp dist/start-zonos2.sh dist/start-zonos2.command
+          chmod +x dist/start-zonos2.sh dist/start-zonos2.command
           tar -C dist -czf zonos2-macos-arm64-metal.tar.gz .
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
@@ -288,6 +310,15 @@ jobs:
       - name: README command tests
         shell: bash
         run: bash tests/readme-commands.sh
+      # The launcher can't run end-to-end here (no bash trap semantics; see
+      # tests/launcher-smoke.sh for the Linux/macOS coverage), but a parse check
+      # catches ps1 syntax errors before they ship in a release archive.
+      - name: Launcher parse check
+        shell: pwsh
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\start-zonos2.ps1", [ref]$null, [ref]$errs) | Out-Null
+          if ($errs) { $errs; throw "start-zonos2.ps1 has parse errors" }
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -298,12 +329,18 @@ jobs:
           cp -r default_voices emotion_directions dist/
           mkdir -p dist/scripts
           cp scripts/normalize-text.py dist/scripts/
-          tar -C dist -czf zonos2-windows-x64-vulkan.tar.gz .
+          # stamp the launcher's backend default to match this archive's build
+          sed "s/^\\\$GPU_DEFAULT = 'cpu'/\$GPU_DEFAULT = 'gpu'/" scripts/start-zonos2.ps1 > dist/start-zonos2.ps1
+          grep -q "^\\\$GPU_DEFAULT = 'gpu'" dist/start-zonos2.ps1 || { echo "GPU stamp failed"; exit 1; }
+          cp scripts/start-zonos2.bat dist/start-zonos2.bat
+          # zip, not tar.gz: Explorer extracts it natively and (unlike tar) keeps
+          # the Mark-of-the-Web flow the README's SmartScreen guidance describes
+          (cd dist && 7z a -tzip ../zonos2-windows-x64-vulkan.zip . > /dev/null)
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: zonos2-windows-x64-vulkan
-          path: zonos2-windows-x64-vulkan.tar.gz
+          path: zonos2-windows-x64-vulkan.zip
 
   # ------------------------------------------------- Release (version tags only)
   release:

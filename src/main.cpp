@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "prune-stats.h"
 #include "prune-policy.h"
+#include "model-paths.h"
 
 #include <chrono>
 #include <cstdio>
@@ -26,12 +27,13 @@ static void usage(const char * a0) {
         "       %s <model.gguf> --build-prompt \"<text>\" <out_ids.npy> [--speaker <spk.npy>]\n"
         "       %s <model.gguf> --batch-test \"<t1|t2|...>\" [--slots N] [--max N] [--greedy] [--dac <dac.gguf>] --gpu\n"
         "  (with --dac, a .wav output is decoded directly; an .npy output also writes a sibling .wav)\n"
+        "  (--dac / --spk-encoder default to dac.gguf / spk-encoder.gguf next to <model.gguf> when present)\n"
         "  (--dump-ids <ids.npy> on --generate/--tts writes the full teacher-forcing sequence for imatrix calibration)\n"
         "  (--prune-mask <stats.bin> (--keep N | --mass-eps E | --drop-below-hits H): audition a pruned recipe by ear before baking with prune-cli)\n"
         "  conditioning paths (--tts/--build-prompt): [--inaccurate] [--noisy-bg] [--speaking-rate N] [--quality f:b[,f:b...]]\n"
         "  emotion control (--tts/--generate): [--emotion happy=1[,sad=-0.5]] [--emotion-valence X] [--emotion-arousal X]\n"
         "                                      [--emotion-strength X] [--emotion-cfg-scale X] [--emotion-dir DIR]\n"
-        "  voice cloning: --speaker <spk.npy> (precomputed) OR --clone <ref_audio> --spk-encoder <spk-encoder.gguf>\n"
+        "  voice cloning: --speaker <spk.npy> (precomputed) OR --clone <ref_audio> --spk-encoder|--spk <spk-encoder.gguf>\n"
         "                 (--clone encodes the reference in-process via ffmpeg+ECAPA; add --save-speaker <out.npy> to cache it)\n",
         a0, a0, a0, a0, a0, a0);
 }
@@ -54,7 +56,7 @@ static void emit_output(const std::string & out, const std::vector<int32_t> & co
         printf("wrote %s\n", out.c_str());
     }
     if (want_wav && dac_path.empty()) {
-        fprintf(stderr, "error: .wav output requested but no --dac <dac.gguf> given\n");
+        fprintf(stderr, "error: .wav output requested but no --dac <dac.gguf> given (also auto-detected next to <model.gguf>)\n");
         return;
     }
     if (!dac_path.empty() && n_frames > 0) {
@@ -355,7 +357,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--dac") && i + 1 < argc) dac_path = argv[++i];
         else if (!strcmp(argv[i], "--speaker") && i + 1 < argc) spk_path = argv[++i];
         else if (!strcmp(argv[i], "--clone") && i + 1 < argc) clone_path = argv[++i];
-        else if (!strcmp(argv[i], "--spk-encoder") && i + 1 < argc) spk_encoder_path = argv[++i];
+        else if ((!strcmp(argv[i], "--spk-encoder") || !strcmp(argv[i], "--spk")) && i + 1 < argc) spk_encoder_path = argv[++i];
         else if (!strcmp(argv[i], "--save-speaker") && i + 1 < argc) save_spk_path = argv[++i];
         else if (!strcmp(argv[i], "--speaker-pos") && i + 1 < argc) spk_pos = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed")   && i + 1 < argc) sp.seed = (uint32_t) atoi(argv[++i]);
@@ -381,12 +383,36 @@ int main(int argc, char ** argv) {
         else { usage(argv[0]); return 1; }
     }
 
+    if (!mp_file_exists(path)) {
+        fprintf(stderr, "failed to load model %s\n", path.c_str());
+        mp_print_download_hint("zonos2-q6_k.gguf (or another quant)", path);
+        return 1;
+    }
+
+    // Companion discovery, gated on the modes that actually need the file (an unconditional
+    // dac pickup would silently start emitting sibling .wavs on .npy outputs).
+    if (dac_path.empty() && !out_codes.empty() && ends_with(out_codes, ".wav")) {
+        dac_path = mp_find_companion(path, "dac.gguf");
+        if (!dac_path.empty()) fprintf(stderr, "zonos2-cli: using dac.gguf found next to model: %s\n", dac_path.c_str());
+        else {
+            // fail before generation rather than after minutes of decode
+            fprintf(stderr, "error: .wav output requested but no --dac <dac.gguf> given (also auto-detected next to <model.gguf>)\n");
+            mp_print_download_hint("dac.gguf", mp_parent_dir(path) + "/dac.gguf");
+            return 1;
+        }
+    }
+    if (spk_encoder_path.empty() && !clone_path.empty()) {
+        spk_encoder_path = mp_find_companion(path, "spk-encoder.gguf");
+        if (!spk_encoder_path.empty()) fprintf(stderr, "zonos2-cli: using spk-encoder.gguf found next to model: %s\n", spk_encoder_path.c_str());
+    }
+
     if (!clone_path.empty() && !spk_path.empty()) {
         fprintf(stderr, "error: --clone and --speaker are mutually exclusive (pick reference audio OR a precomputed embedding)\n");
         return 1;
     }
     if (!clone_path.empty() && spk_encoder_path.empty()) {
-        fprintf(stderr, "error: --clone <ref_audio> requires --spk-encoder <spk-encoder.gguf>\n");
+        fprintf(stderr, "error: --clone <ref_audio> requires --spk-encoder <spk-encoder.gguf> (also auto-detected next to <model.gguf>)\n");
+        mp_print_download_hint("spk-encoder.gguf", mp_parent_dir(path) + "/spk-encoder.gguf");
         return 1;
     }
     if (clone_path.empty() && (!spk_encoder_path.empty() || !save_spk_path.empty())) {
@@ -396,7 +422,8 @@ int main(int argc, char ** argv) {
 
     zonos2_model model;
     if (!zonos2_model_load(model, path.c_str(), use_gpu)) {
-        fprintf(stderr, "load failed\n");
+        fprintf(stderr, "failed to load model %s\n", path.c_str());
+        if (!mp_file_exists(path)) mp_print_download_hint("zonos2-q6_k.gguf (or another quant)", path);
         return 1;
     }
 
@@ -421,6 +448,7 @@ int main(int argc, char ** argv) {
         spk_model sm;
         if (!spk_load(sm, spk_encoder_path.c_str())) {
             fprintf(stderr, "failed to load speaker encoder %s\n", spk_encoder_path.c_str());
+            if (!mp_file_exists(spk_encoder_path)) mp_print_download_hint("spk-encoder.gguf", spk_encoder_path);
             zonos2_model_free(model); return 1;
         }
         spk = spk_embed_from_file(sm, clone_path.c_str());
