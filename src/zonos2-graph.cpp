@@ -330,6 +330,16 @@ ggml_tensor * build_graph(gctx & g, int n_layer_limit) {
         const std::string s = std::to_string(L);
 
         res = res ? ggml_add(ctx, x, res) : x;
+
+        // depth-prune (--skip-layers): bypass this whole block. `res` already folds every prior
+        // block's contribution, so passing it through unchanged is an exact identity; x must carry
+        // no pending FFN (it was just folded above), so zero it — the next iteration's fold then
+        // adds nothing. Attention + FFN for this block are never built (real compute/KV savings).
+        if (L < (int) m.layer_skip.size() && m.layer_skip[L]) {
+            x = ggml_scale(ctx, res, 0.0f);
+            continue;
+        }
+
         ggml_tensor * cur = g.cap("attn_in_" + s, rms_w(ctx, res, ly.attn_norm, hp.rms_eps));
         ggml_tensor * attn = g.cap("attn_out_" + s, build_attention(g, cur, ly, L));
         res = g.cap("layer_res_" + s, ggml_add(ctx, attn, res));

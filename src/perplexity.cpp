@@ -52,6 +52,8 @@ void usage(const char * a0) {
         "  (--imatrix-out and --prune-stats may be combined: one capture pass, two sidecar outputs)\n"
         "  (--prune-mask <stats.bin> (--keep N | --drop-below-hits H): runtime expert pruning before any\n"
         "   mode above -- sweep the quality knee vs a --kl-divergence base without writing GGUFs)\n"
+        "  (--skip-layers L1,L2,...: depth pruning -- bypass whole transformer blocks (attn+FFN) before\n"
+        "   any mode above; sweep the block-redundancy knee vs a --kl-divergence base)\n"
         "  (ids.npy: row-major [n, n_codebooks+1] input_ids, e.g. from `zonos2-cli --build-prompt`)\n"
         "  (--manifest: per-line `ids.npy [speaker.npy [spk_pos]]` -- per-sequence conditioning for multi-speaker/multi-path bases)\n",
         a0, a0, a0, a0, a0);
@@ -499,6 +501,7 @@ int main(int argc, char ** argv) {
     std::string prune_mask_path;            // --prune-mask: dynamically drop experts before this run
     int mask_keep = -1, mask_drop_hits = -1, mask_drop_lowest = -1;
     double mask_mass_eps = -1.0;
+    std::string skip_layers_arg;            // --skip-layers L1,L2,...: bypass whole transformer blocks
 
     for (int i = 2; i < argc; ++i) {
         const char * a = argv[i];
@@ -515,6 +518,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--drop-below-hits")    && i + 1 < argc) mask_drop_hits = atoi(argv[++i]);
         else if (!strcmp(a, "--mass-eps")           && i + 1 < argc) mask_mass_eps  = atof(argv[++i]);
         else if (!strcmp(a, "--drop-lowest")        && i + 1 < argc) mask_drop_lowest = atoi(argv[++i]);
+        else if (!strcmp(a, "--skip-layers")        && i + 1 < argc) skip_layers_arg = argv[++i];
         else if (!strcmp(a, "--manifest")    && i + 1 < argc) manifest_path = argv[++i];
         else if (!strcmp(a, "--speaker")     && i + 1 < argc) spk_path = argv[++i];
         else if (!strcmp(a, "--speaker-pos") && i + 1 < argc) spk_pos  = atoi(argv[++i]);
@@ -549,6 +553,29 @@ int main(int argc, char ** argv) {
         if (!prune_stats::load(prune_mask_path, st)) { zonos2_model_free(model); return 1; }
         const auto keep = prune_policy::select(st, { mask_keep, mask_drop_hits, mask_mass_eps, mask_drop_lowest });
         if (!zonos2_set_expert_mask(model, keep)) { zonos2_model_free(model); return 1; }
+    }
+
+    // --skip-layers: bypass whole transformer blocks (depth pruning) at graph-build time. Comma-
+    // separated block indices; the residual stream passes through each listed block unchanged.
+    if (!skip_layers_arg.empty()) {
+        model.layer_skip.assign(model.hp.n_layer, 0);
+        std::string ls; int n_skip = 0;
+        for (size_t p = 0; p <= skip_layers_arg.size(); ++p) {
+            const char c = p < skip_layers_arg.size() ? skip_layers_arg[p] : ',';
+            if (c == ',') {
+                if (!ls.empty()) {
+                    const int L = atoi(ls.c_str());
+                    if (L < 0 || L >= (int) model.hp.n_layer) {
+                        fprintf(stderr, "perplexity: --skip-layers index %d out of range [0,%u)\n",
+                                L, model.hp.n_layer);
+                        zonos2_model_free(model); return 1;
+                    }
+                    if (!model.layer_skip[L]) { model.layer_skip[L] = 1; ++n_skip; }
+                    ls.clear();
+                }
+            } else if (c != ' ') ls.push_back(c);
+        }
+        printf("depth-prune: skipping %d/%u blocks [%s]\n", n_skip, model.hp.n_layer, skip_layers_arg.c_str());
     }
 
     const int W = (int) model.hp.n_codebooks + 1;

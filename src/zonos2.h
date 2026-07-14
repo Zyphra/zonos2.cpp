@@ -111,6 +111,13 @@ struct zonos2_model {
     // optional runtime expert mask (set by zonos2_set_expert_mask; see ly.router_mask)
     struct ggml_context * ctx_mask = nullptr;
     ggml_backend_buffer_t buf_mask = nullptr;
+
+    // optional runtime depth-prune: transformer blocks whose index has a nonzero entry here are
+    // bypassed at graph-build time — the block's attention + FFN are not built and the residual
+    // stream passes through unchanged (identity). Empty (or all-zero) => every block runs. Set
+    // directly on the model before building a graph; every prefill/decode path honors it. Used to
+    // sweep the depth-pruning quality knee (leave-one-out / contiguous-span KLD) before baking.
+    std::vector<char> layer_skip;   // size 0 or n_layer; layer_skip[L] != 0 => skip block L
 };
 
 // Load a zonos2 GGUF onto the CPU or first GPU backend. Returns false on error.
