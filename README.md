@@ -152,6 +152,31 @@ curl -s http://localhost:1919/tts/generate \
 
 **Web UI:** Open `http://localhost:1919/` in your browser.
 
+## Desktop App (zonos2-app)
+
+The same server and web UI, packaged as a native window (a [saucer](https://github.com/saucer/saucer)
+webview: WebView2 / WKWebView / WebKitGTK). First launch opens a setup page to pick your `.gguf`
+files with native file dialogs; the choice is saved (`~/.config/zonos2/app.json`, or the platform
+equivalent) and later launches boot straight into the UI. The embedded server binds an ephemeral
+`127.0.0.1` port and its whole HTTP API stays reachable while the app runs; closing the window
+shuts it down. Release tags ship prebuilt bundles: `zonos2-linux-x64-app.tar.gz`,
+`zonos2-macos-arm64-app.zip` (a `Zonos2.app`), and `zonos2-app.exe` inside the Windows
+`zonos2-windows-x64-vulkan.zip`.
+
+Building it is opt-in — saucer needs a much newer toolchain than the rest of the project
+(CMake ≥ 3.31 and a C++23 compiler: GCC ≥ 14 / Clang ≥ 20 / Xcode ≥ 16.3 / MSVC ≥ 19.44):
+
+```bash
+# Linux additionally needs: libgtk-4-dev (>= 4.12, i.e. Ubuntu 24.04+), libwebkitgtk-6.0-dev,
+# libadwaita-1-dev, libjson-glib-dev
+cmake -B build -DZONOS2_APP=ON
+cmake --build build --target zonos2-app
+
+./build/zonos2-app                 # setup page on first run, saved config afterwards
+./build/zonos2-app --setup         # reopen the setup page
+./build/zonos2-app out/zonos2-q8_0.gguf --dac out/dac.gguf --gpu   # or pass zonos2-server args through
+```
+
 ## Emotion Control
 
 Emotion control nudges a cloned speaker voice with shipped direction vectors: named sliders

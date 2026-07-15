@@ -100,3 +100,57 @@ target_link_libraries(zonos2-server PRIVATE zonos2 ggml Threads::Threads)
 if (WIN32)
     target_link_libraries(zonos2-server PRIVATE ws2_32)
 endif()
+
+# --- Desktop app: the server embedded in a native webview window (saucer). Opt-in
+#     because saucer needs a much newer toolchain than the rest of the project:
+#     CMake >= 3.25, C++23 (GCC >= 14 / Clang >= 20 / AppleClang >= 17 / MSVC >= 19.44),
+#     and on Linux GTK4 >= 4.12 + WebKitGTK-6.0 + libadwaita + json-glib dev packages.
+#     Everything else in this file keeps building with the C++17 / CMake 3.18 floor. ---
+option(ZONOS2_APP "Build the zonos2-app desktop shell (requires a C++23 toolchain, see README)" OFF)
+if (ZONOS2_APP)
+    if (CMAKE_VERSION VERSION_LESS 3.31)
+        # saucer core says 3.25, but its saucer-embed dependency uses policy CMP0174 (3.31).
+        message(FATAL_ERROR "ZONOS2_APP requires CMake >= 3.31 (saucer); this is CMake ${CMAKE_VERSION}")
+    endif()
+
+    include(FetchContent)
+    FetchContent_Declare(saucer
+        GIT_REPOSITORY https://github.com/saucer/saucer
+        GIT_TAG        v8.0.5)
+    FetchContent_Declare(saucer-desktop      # native file pickers (saucer module)
+        GIT_REPOSITORY https://github.com/saucer/desktop
+        GIT_TAG        v4.1.0)
+    FetchContent_MakeAvailable(saucer saucer-desktop)
+
+    add_executable(zonos2-app src/app.cpp src/server.cpp src/dac.cpp src/spk-encoder.cpp)
+    target_compile_definitions(zonos2-app PRIVATE ZONOS2_APP_EMBED)   # server.cpp: no main()
+    target_compile_features(zonos2-app PRIVATE cxx_std_23)
+    target_include_directories(zonos2-app PRIVATE src vendor ggml/include)
+    target_link_libraries(zonos2-app PRIVATE zonos2 ggml saucer::saucer saucer::desktop Threads::Threads)
+
+    if (WIN32)
+        # GUI subsystem (no console window) with the icon resource; saucer has no
+        # WinMain, so keep the standard main() as the entry point.
+        target_sources(zonos2-app PRIVATE assets/app/zonos2.rc)
+        set_target_properties(zonos2-app PROPERTIES WIN32_EXECUTABLE TRUE)
+        target_link_libraries(zonos2-app PRIVATE ws2_32)
+        if (MSVC)
+            target_link_options(zonos2-app PRIVATE "/ENTRY:mainCRTStartup")
+        endif()
+    elseif (APPLE)
+        # Zonos2.app bundle; the web UI and icon ship inside Contents/Resources
+        # (app.cpp resolves ../Resources/tts_ui.html relative to the executable).
+        set(ZONOS2_APP_RESOURCES web/tts_ui.html assets/app/zonos2.icns assets/app/zonos2.png)
+        target_sources(zonos2-app PRIVATE ${ZONOS2_APP_RESOURCES})
+        set_source_files_properties(${ZONOS2_APP_RESOURCES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+        set_target_properties(zonos2-app PROPERTIES
+            OUTPUT_NAME Zonos2
+            MACOSX_BUNDLE TRUE
+            MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/assets/app/Info.plist.in
+            MACOSX_BUNDLE_BUNDLE_NAME Zonos2
+            MACOSX_BUNDLE_GUI_IDENTIFIER cpp.zonos2.app
+            MACOSX_BUNDLE_BUNDLE_VERSION 1.0
+            MACOSX_BUNDLE_SHORT_VERSION_STRING 1.0
+            MACOSX_BUNDLE_ICON_FILE zonos2.icns)
+    endif()
+endif()

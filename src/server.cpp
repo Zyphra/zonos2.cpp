@@ -20,6 +20,7 @@
 #include "spk-encoder.h"
 #include "npy.h"
 #include "model-paths.h"
+#include "server-embed.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -1493,7 +1494,7 @@ static void usage(const char * a0) {
         "usage: %s <model.gguf> [--dac <dac.gguf>] [--spk|--spk-encoder <encoder.gguf>] [options]\n"
         "  (dac.gguf / spk-encoder.gguf are auto-detected next to <model.gguf> when the flags are omitted)\n"
         "  --host H            bind address (default 127.0.0.1)\n"
-        "  --port P            port (default 1919)\n"
+        "  --port P            port (default 1919; 0 picks a free ephemeral port)\n"
         "  --gpu | --cpu       backend (default cpu)\n"
         "  --dac-cpu           run the DAC decoder on CPU even with --gpu (isolates the\n"
         "                      backbone graph; makes streamed audio bit-exact; default on Metal)\n"
@@ -1522,7 +1523,7 @@ static void usage(const char * a0) {
         "  --ui PATH           web UI html to serve at / (default web/tts_ui.html)\n", a0);
 }
 
-int main(int argc, char ** argv) {
+static int server_run(int argc, char ** argv, zonos2_server_ctl * ctl) {
     if (argc < 2) { usage(argv[0]); return 1; }
 
     ServerState s;
@@ -1679,8 +1680,18 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "zonos2-server: backbone=%s dac=%s spk=%s backend=%s batch=%d dac-threads=%d\n",
             model_path.c_str(), dac_path.c_str(), s.have_spk ? spk_path.c_str() : "(none)",
             s.use_gpu ? "GPU" : "CPU", s.batch_slots, s.dac_threads);
-    fprintf(stderr, "zonos2-server: listening on http://%s:%d  (UI: %s)\n", host.c_str(), port, s.ui_path.c_str());
-    const bool ok = svr.listen(host, port);
+    // Bind before announcing (and before publishing to ctl): --port 0 asks the OS
+    // for a free ephemeral port, which the embedding app reads back from ctl->port.
+    bool bound = true;
+    if (port == 0) { port = svr.bind_to_any_port(host); bound = port > 0; }
+    else            bound = svr.bind_to_port(host, port);
+
+    bool ok = false;
+    if (bound) {
+        fprintf(stderr, "zonos2-server: listening on http://%s:%d  (UI: %s)\n", host.c_str(), port, s.ui_path.c_str());
+        if (ctl) { ctl->svr = &svr; ctl->port.store(port); }
+        ok = svr.listen_after_bind();
+    }
 
     s.stop.store(true);                 // stop the worker + DAC pool before returning
     s.sched_cv.notify_all();
@@ -1691,6 +1702,19 @@ int main(int argc, char ** argv) {
         if (lane.th.joinable()) lane.th.join();
         dac_free(lane.dac);
     }
-    if (!ok) { fprintf(stderr, "error: failed to bind %s:%d\n", host.c_str(), port); return 1; }
-    return 0;
+    if (ctl) ctl->svr = nullptr;        // svr is about to go out of scope
+    if (!bound) { fprintf(stderr, "error: failed to bind %s:%d\n", host.c_str(), port); return 1; }
+    // listen_after_bind() returns true on a graceful stop() and false only if the
+    // accept loop died on a real error.
+    return ok ? 0 : 1;
 }
+
+int zonos2_server_main(int argc, char ** argv, zonos2_server_ctl * ctl) {
+    const int rc = server_run(argc, argv, ctl);
+    if (rc != 0 && ctl) ctl->failed.store(true);
+    return rc;
+}
+
+#ifndef ZONOS2_APP_EMBED
+int main(int argc, char ** argv) { return zonos2_server_main(argc, argv, nullptr); }
+#endif

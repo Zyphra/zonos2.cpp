@@ -156,10 +156,71 @@ jobs:
           name: zonos2-linux-x64-vulkan
           path: zonos2-linux-x64-vulkan.tar.gz
 
+  # -------------------------------------------------------- Linux desktop app
+  # zonos2-app (saucer webview shell). Needs ubuntu-24.04: saucer hard-requires
+  # GTK4 >= 4.12 + a C++23 compiler (gcc-14), both beyond the 22.04 jobs above,
+  # which stay on 22.04 to keep the glibc baseline of the CLI artifacts.
+  linux-app:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install desktop + Vulkan deps
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk gcc-14 g++-14 \
+            libgtk-4-dev libwebkitgtk-6.0-dev libadwaita-1-dev libjson-glib-dev
+      - name: Resolve ggml submodule rev
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:ggml)" >> "$GITHUB_OUTPUT"
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-app
+      # Same shader-gen build-tree cache rationale as the linux-vulkan job.
+      - name: Cache build tree
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: linux-app-build-${{ steps.ggml.outputs.sha }}-${{ hashFiles('src/**', 'CMakeLists.txt') }}
+          restore-keys: |
+            linux-app-build-${{ steps.ggml.outputs.sha }}-
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DZONOS2_APP=ON -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
+          -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin=$(find build -name zonos2-app -type f | head -1)
+          out=$("$bin" --help 2>&1 || true)
+          echo "$out" | grep -q "usage:" || { echo "app smoke failed:"; echo "$out"; exit 1; }
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          mkdir -p dist
+          find build -name 'zonos2-app' -type f -exec cp {} dist/ \;
+          cp -r web dist/web
+          cp assets/app/zonos2.desktop assets/app/zonos2.png dist/
+          tar -C dist -czf zonos2-linux-x64-app.tar.gz .
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: zonos2-linux-x64-app
+          path: zonos2-linux-x64-app.tar.gz
+
   # ------------------------------------------------------------- macOS Metal
-  # macos-14 is Apple Silicon (arm64); Metal is enabled by default in ggml.
+  # macos-15 is Apple Silicon (arm64); Metal is enabled by default in ggml.
+  # (15 rather than 14 because zonos2-app's saucer dependency needs AppleClang 17
+  # / Xcode >= 16.3.)
   macos-metal:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,12 +228,22 @@ jobs:
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: macos-metal
+      - name: Select Xcode >= 16.3 (saucer needs AppleClang 17)
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_16.*.app /Applications/Xcode_2*.app 2>/dev/null | sort -V | tail -1)/Contents/Developer"
+          clang++ --version
       - name: Configure
         run: >
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DZONOS2_APP=ON -DBUILD_SHARED_LIBS=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: App smoke test
+        shell: bash
+        run: |
+          bin=$(find build -path '*Zonos2.app/Contents/MacOS/*' -type f -perm +111 | head -1)
+          out=$("$bin" --help 2>&1 || true)
+          echo "$out" | grep -q "usage:" || { echo "app smoke failed:"; echo "$out"; exit 1; }
       - name: Smoke test
         shell: bash
         run: |
@@ -219,11 +290,20 @@ jobs:
           cp dist/start-zonos2.sh dist/start-zonos2.command
           chmod +x dist/start-zonos2.sh dist/start-zonos2.command
           tar -C dist -czf zonos2-macos-arm64-metal.tar.gz .
+          # Desktop app bundle, ad-hoc signed (users right-click > Open past Gatekeeper).
+          app=$(find build -name 'Zonos2.app' -type d | head -1)
+          codesign --force --deep -s - "$app"
+          ditto -c -k --keepParent "$app" zonos2-macos-arm64-app.zip
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: zonos2-macos-arm64-metal
           path: zonos2-macos-arm64-metal.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: zonos2-macos-arm64-app
+          path: zonos2-macos-arm64-app.zip
 
   # ----------------------------------------------------------- Windows Vulkan
   # MSVC build; relies on the _WIN32 file-IO shim in src/compat.h.
@@ -282,10 +362,16 @@ jobs:
             win-vulkan-build-${{ steps.ggml.outputs.sha }}-
       - name: Configure
         run: >
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DZONOS2_APP=ON -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j
+      - name: App smoke test
+        shell: bash
+        run: |
+          bin=$(find build -name zonos2-app.exe -type f | head -1)
+          out=$("$bin" --help 2>&1 || true)
+          echo "$out" | grep -q "usage:" || { echo "app smoke failed:"; echo "$out"; exit 1; }
       - name: Smoke test
         shell: bash
         run: |
@@ -324,7 +410,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find build \( -name 'zonos2-cli.exe' -o -name 'spk-encoder-cli.exe' -o -name 'dac-cli.exe' -o -name 'quantize-cli.exe' -o -name 'zonos2-server.exe' \) -type f -exec cp {} dist/ \;
+          find build \( -name 'zonos2-cli.exe' -o -name 'spk-encoder-cli.exe' -o -name 'dac-cli.exe' -o -name 'quantize-cli.exe' -o -name 'zonos2-server.exe' -o -name 'zonos2-app.exe' \) -type f -exec cp {} dist/ \;
           cp -r web dist/web
           cp -r default_voices emotion_directions dist/
           mkdir -p dist/scripts
@@ -344,7 +430,7 @@ jobs:
 
   # ------------------------------------------------- Release (version tags only)
   release:
-    needs: [linux-cpu, linux-vulkan, macos-metal, windows-vulkan]
+    needs: [linux-cpu, linux-vulkan, linux-app, macos-metal, windows-vulkan]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

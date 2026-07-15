@@ -16,5 +16,8 @@ __pycache__/
 .venv-tts-norm/
 _pydeps/
 
+# zonos2-app (saucer) runtime state — cookies/localStorage SQLite db, not source
+.saucer
+
 # Personal Claude Code instructions (private)
 CLAUDE.local.md
