@@ -8,6 +8,17 @@
 #include <system_error>
 
 #ifdef _WIN32
+// This header pulls <windows.h>, and translation units that also use httplib (app.cpp)
+// include it before <httplib.h>'s <winsock2.h>. Left alone, <windows.h> drags in the
+// legacy <winsock.h> (v1), which then hard-conflicts with <winsock2.h>. Block just
+// winsock1 via _WINSOCKAPI_ (not WIN32_LEAN_AND_MEAN, which would also strip the OLE/COM
+// headers saucer's WebView2 backend needs) and match httplib's NOMINMAX.
+#ifndef _WINSOCKAPI_
+#define _WINSOCKAPI_
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>

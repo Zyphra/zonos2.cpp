@@ -33,12 +33,6 @@
 #include <thread>
 #include <vector>
 
-#ifdef _WIN32
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
-
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
