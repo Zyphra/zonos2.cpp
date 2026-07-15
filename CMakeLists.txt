@@ -113,6 +113,16 @@ if (ZONOS2_APP)
         message(FATAL_ERROR "ZONOS2_APP requires CMake >= 3.31 (saucer); this is CMake ${CMAKE_VERSION}")
     endif()
 
+    # saucer's macOS (WKWebView) backend and saucer-embed's injected sources are
+    # Objective-C++. saucer enables OBJC/OBJCXX inside its own FetchContent subdirectory,
+    # but that scope doesn't set CMAKE_OBJCXX_COMPILE_OBJECT for the top-level directory
+    # where zonos2-app is defined (embed injects .mm sources into it) -> CMake fails at
+    # generate with "CMAKE_OBJCXX_COMPILE_OBJECT not set". Enable it here in the top scope.
+    if (APPLE)
+        enable_language(OBJC)
+        enable_language(OBJCXX)
+    endif()
+
     include(FetchContent)
     FetchContent_Declare(saucer
         GIT_REPOSITORY https://github.com/saucer/saucer
