@@ -40,6 +40,40 @@ using json = nlohmann::json;
 
 static fs::path exe_dir() { return zonos2_exe_dir(); }
 
+// macOS's saucer file picker returns NSURL.absoluteString — a percent-encoded
+// file:// URI (e.g. file:///Users/.../my%20model.gguf), not a POSIX path — so a
+// filesystem lookup on it fails. Normalize any file:// URI to a native path;
+// plain paths (Linux/Windows pickers, hand-typed) have no scheme and pass through.
+static std::string file_uri_to_path(const std::string & s) {
+    constexpr const char * scheme = "file://";
+    if (s.rfind(scheme, 0) != 0) return s;
+    // Drop scheme (+ optional empty authority: file://host/path -> /path); percent-decode.
+    std::string rest = s.substr(7);
+    std::string out;
+    out.reserve(rest.size());
+    auto unhex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < rest.size(); ++i) {
+        int hi, lo;
+        if (rest[i] == '%' && i + 2 < rest.size() &&
+            (hi = unhex(rest[i + 1])) >= 0 && (lo = unhex(rest[i + 2])) >= 0) {
+            out.push_back(static_cast<char>(hi * 16 + lo));
+            i += 2;
+        } else {
+            out.push_back(rest[i]);
+        }
+    }
+#ifdef _WIN32
+    // A Windows file URI decodes to "/C:/path"; strip the spurious leading slash.
+    if (out.size() >= 3 && out[0] == '/' && out[2] == ':') out.erase(0, 1);
+#endif
+    return out;
+}
+
 static fs::path config_path() {
 #ifdef _WIN32
     const char * base = getenv("APPDATA");
@@ -78,7 +112,11 @@ static json load_config() {
     std::ifstream f(config_path());
     if (!f) return json::object();
     json j = json::parse(f, nullptr, false);
-    return j.is_object() ? j : json::object();
+    if (!j.is_object()) return json::object();
+    // Repair configs written before the file://-URI fix (macOS picker); harmless on plain paths.
+    for (const char * k : {"model", "dac", "spk"})
+        if (j.contains(k) && j[k].is_string()) j[k] = file_uri_to_path(j[k].get<std::string>());
+    return j;
 }
 
 static std::string save_config(const json & j) {   // returns error message or ""
@@ -365,13 +403,17 @@ coco::stray start(saucer::application * app) {
 
     webview->expose("pick_file", [&desktop](const std::string & /*kind*/) -> std::string {
         auto r = desktop.pick<saucer::modules::picker::type::file>({.filters = {"*.gguf"}});
-        return r ? r->string() : std::string{};
+        return r ? file_uri_to_path(r->string()) : std::string{};
     });
 
     webview->expose("get_config", []() -> std::string { return load_config().dump(); });
 
-    webview->expose("launch", [webview](const std::string & model, const std::string & dac,
-                                        const std::string & spk, bool gpu) -> std::string {
+    webview->expose("launch", [webview](const std::string & model_in, const std::string & dac_in,
+                                        const std::string & spk_in, bool gpu) -> std::string {
+        // Self-heal file:// URIs (macOS picker, or a config saved before this fix).
+        const std::string model = file_uri_to_path(model_in);
+        const std::string dac   = file_uri_to_path(dac_in);
+        const std::string spk   = file_uri_to_path(spk_in);
         std::error_code ec;
         if (!fs::exists(model, ec)) return "backbone model not found: " + model;
         if (!fs::exists(dac, ec))   return "DAC decoder not found: " + dac;
