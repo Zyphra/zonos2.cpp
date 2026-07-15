@@ -80,6 +80,7 @@ struct zonos2_layer {
     struct ggml_tensor * router_norm   = nullptr; // [router_dim]
     struct ggml_tensor * router_bias   = nullptr; // [n_expert]
     struct ggml_tensor * router_eda_scale = nullptr; // [router_dim], null on first MoE layer
+    struct ggml_tensor * router_mask = nullptr; // [n_expert] additive: 0 keep / -inf dropped (runtime --prune-mask)
 
     bool is_moe = false;
     int  top_k  = 0;
@@ -106,6 +107,17 @@ struct zonos2_model {
     ggml_backend_buffer_t      buf_w   = nullptr;
     std::map<std::string, struct ggml_tensor *> tensors;
     bool is_gpu = false;
+
+    // optional runtime expert mask (set by zonos2_set_expert_mask; see ly.router_mask)
+    struct ggml_context * ctx_mask = nullptr;
+    ggml_backend_buffer_t buf_mask = nullptr;
+
+    // optional runtime depth-prune: transformer blocks whose index has a nonzero entry here are
+    // bypassed at graph-build time — the block's attention + FFN are not built and the residual
+    // stream passes through unchanged (identity). Empty (or all-zero) => every block runs. Set
+    // directly on the model before building a graph; every prefill/decode path honors it. Used to
+    // sweep the depth-pruning quality knee (leave-one-out / contiguous-span KLD) before baking.
+    std::vector<char> layer_skip;   // size 0 or n_layer; layer_skip[L] != 0 => skip block L
 };
 
 // Load a zonos2 GGUF onto the CPU or first GPU backend. Returns false on error.
@@ -114,6 +126,14 @@ void zonos2_model_free(zonos2_model & model);
 
 // router hidden dimension, derived from the router_down weight (ne1).
 int zonos2_router_dim(const zonos2_model & model);
+
+// Install a runtime expert mask: for each layer id in `keep`, only the listed expert ids stay
+// routable — the others get -inf router logits, so the softmax renormalizes over the survivors
+// and top-k never selects them. This is the runtime equivalent of prune-cli (same keep-set), for
+// sweeping the quality knee without rewriting GGUFs. Layers absent from `keep` are unmasked;
+// passing {} clears any previous mask. The mask lives on the model, so every graph path (validate,
+// logits, generate, batch, moe_capture) applies it automatically. Returns false on alloc failure.
+bool zonos2_set_expert_mask(zonos2_model & model, const std::map<int, std::vector<int>> & keep);
 
 // Run a single prefill forward over `ids` (row-major [n_tokens, n_codebooks+1], values
 // as floats), capturing named intermediate tensors as <out_dir>/<name>.npy for numeric

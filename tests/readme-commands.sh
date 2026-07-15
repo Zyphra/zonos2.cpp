@@ -67,6 +67,17 @@ pass "--tts -> codes .npy"
 is_riff "$WORK/t.wav" || fail "--tts --dac did not write a RIFF WAV"
 pass "--tts --dac -> WAV"
 
+# same, with --dac dropped: dac.gguf sitting next to the backbone is auto-detected
+# (README CLI section's models/ example)
+mkdir -p "$WORK/models"
+cp "$MODEL" "$WORK/models/zonos2-q6_k.gguf"
+cp "$DAC"   "$WORK/models/dac.gguf"
+out=$("$CLI" "$WORK/models/zonos2-q6_k.gguf" --tts "ci tts autodiscover" "$WORK/auto.wav" --max 8 --greedy 2>&1) \
+  || { echo "$out"; fail "--tts with sibling dac.gguf exited nonzero"; }
+echo "$out" | grep -q "using dac.gguf found next to model" || { echo "$out"; fail "no dac auto-discovery line"; }
+is_riff "$WORK/auto.wav" || fail "--tts with sibling dac.gguf did not write a RIFF WAV"
+pass "--tts (sibling dac.gguf auto-detected) -> WAV"
+
 # standalone codes -> wav (dac-cli), if present
 DACCLI="$(find_bin dac-cli "")"
 if [ -x "$DACCLI" ]; then

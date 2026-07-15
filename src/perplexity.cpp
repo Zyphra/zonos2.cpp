@@ -12,6 +12,8 @@
 #include "zonos2.h"
 #include "npy.h"
 #include "imatrix.h"
+#include "prune-stats.h"
+#include "prune-policy.h"
 
 #include <algorithm>
 #include <cctype>
@@ -46,9 +48,15 @@ void usage(const char * a0) {
         "       %s <ref.gguf>   --kl-divergence-base <base.bin> {<ids.npy>... [--speaker s.npy] | --manifest m.txt} [--cpu|--gpu]\n"
         "       %s <quant.gguf> --kl-divergence <base.bin> [--cpu|--gpu]\n"
         "       %s <f16.gguf>   --imatrix-out <imatrix.bin> {<ids.npy>... | --manifest m.txt} [--imatrix-min-hits N] [--cpu|--gpu]\n"
+        "       %s <f16.gguf>   --prune-stats <stats.bin> {<ids.npy>... | --manifest m.txt} [--cpu|--gpu]\n"
+        "  (--imatrix-out and --prune-stats may be combined: one capture pass, two sidecar outputs)\n"
+        "  (--prune-mask <stats.bin> (--keep N | --drop-below-hits H): runtime expert pruning before any\n"
+        "   mode above -- sweep the quality knee vs a --kl-divergence base without writing GGUFs)\n"
+        "  (--skip-layers L1,L2,...: depth pruning -- bypass whole transformer blocks (attn+FFN) before\n"
+        "   any mode above; sweep the block-redundancy knee vs a --kl-divergence base)\n"
         "  (ids.npy: row-major [n, n_codebooks+1] input_ids, e.g. from `zonos2-cli --build-prompt`)\n"
         "  (--manifest: per-line `ids.npy [speaker.npy [spk_pos]]` -- per-sequence conditioning for multi-speaker/multi-path bases)\n",
-        a0, a0, a0, a0);
+        a0, a0, a0, a0, a0);
 }
 
 // load a 2-D [n, W] input_ids npy; W must equal n_codebooks+1.
@@ -371,7 +379,7 @@ int run_kl_divergence(const zonos2_model & m, const std::string & base_path) {
 // --imatrix-out : collect per-expert importance (mean activation^2) over the corpus
 // ---------------------------------------------------------------------------
 int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
-                const std::string & out_path, int min_hits) {
+                const std::string & out_path, const std::string & prune_path, int min_hits) {
     const int ne = (int) m.hp.n_expert;
     if (ne == 0) { fprintf(stderr, "imatrix: model has no experts\n"); return 1; }
 
@@ -411,6 +419,7 @@ int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
     }
 
     std::map<std::string, imatrix::entry> im;
+    std::map<int, prune_stats::layer>     ps;                  // per-layer MSAN/hit counts for prune-cli
     int64_t total_hits = 0; int zero_slots = 0, below_thresh = 0, n_layers = 0;
     std::vector<int64_t> all_cnt;                              // every (layer,expert) hit count
     for (auto & kv : acc) {
@@ -438,16 +447,33 @@ int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
         im[p + "ffn_gate_exps.weight"] = std::move(gate);
         im[p + "ffn_up_exps.weight"]   = std::move(up);
         im[p + "ffn_down_exps.weight"] = std::move(down);
+
+        if (!prune_path.empty()) {
+            // MSAN_e = mean over routed tokens of ‖down-input‖² = sum_c A.dn[e,c] / cnt_e.
+            // Raw cnt (not the min-hits floor) so rarely-routed experts get their true — and
+            // typically lowest — score, which is exactly what flags them as prune candidates.
+            prune_stats::layer pl;
+            pl.top_k = (kv.first < (int) m.layers.size()) ? m.layers[kv.first].top_k : 0;
+            pl.cnt.assign(A.cnt.begin(), A.cnt.end());
+            pl.msan.resize(ne);
+            for (int e = 0; e < ne; ++e) {
+                double s = 0.0;
+                for (int c = 0; c < A.n_ff; ++c) s += A.dn[(size_t) e*A.n_ff + c];
+                pl.msan[e] = (float) (A.cnt[e] > 0 ? s / (double) A.cnt[e] : 0.0);
+            }
+            ps[kv.first] = std::move(pl);
+        }
     }
-    if (!imatrix::save(out_path, im)) return 1;
+    if (!out_path.empty()   && !imatrix::save(out_path, im))      return 1;
+    if (!prune_path.empty() && !prune_stats::save(prune_path, ps)) return 1;
 
     std::sort(all_cnt.begin(), all_cnt.end());
     const int64_t hmin = all_cnt.empty() ? 0 : all_cnt.front();
     const int64_t hmed = all_cnt.empty() ? 0 : all_cnt[all_cnt.size() / 2];
     const int64_t hmax = all_cnt.empty() ? 0 : all_cnt.back();
-    printf("\n=== imatrix ===\n");
-    printf("wrote %s : %d MoE layers, %d experts, %lld routed (token,expert) hits\n",
-           out_path.c_str(), n_layers, ne, (long long) total_hits);
+    printf("\n=== expert importance ===\n");
+    printf("%d MoE layers, %d experts, %lld routed (token,expert) hits\n",
+           n_layers, ne, (long long) total_hits);
     printf("per-(layer,expert) hits: min %lld, median %lld, max %lld (min-hits floor = %d)\n",
            (long long) hmin, (long long) hmed, (long long) hmax, min_hits);
     if (zero_slots || below_thresh)
@@ -455,6 +481,8 @@ int run_imatrix(const zonos2_model & m, const std::vector<sequence> & seqs,
                zero_slots, below_thresh, (int) all_cnt.size(),
                (zero_slots + below_thresh) * 4 > (int) all_cnt.size()
                    ? "consider more/longer generation traces" : "ok, well-covered");
+    if (!out_path.empty())   printf("wrote imatrix    %s\n", out_path.c_str());
+    if (!prune_path.empty()) printf("wrote prune-stats %s\n", prune_path.c_str());
     return 0;
 }
 
@@ -466,10 +494,14 @@ int main(int argc, char ** argv) {
 
     enum { NONE, PPL, KLBASE, KLDIV, IMATRIX } mode = NONE;
     bool use_gpu = false;
-    std::string base_path, spk_path, manifest_path;
+    std::string base_path, prune_path, spk_path, manifest_path;
     std::vector<std::string> ids_paths;
     int spk_pos = 0;
     int imat_min_hits = 32;   // experts seen fewer than this many times fall back to RTN
+    std::string prune_mask_path;            // --prune-mask: dynamically drop experts before this run
+    int mask_keep = -1, mask_drop_hits = -1, mask_drop_lowest = -1;
+    double mask_mass_eps = -1.0;
+    std::string skip_layers_arg;            // --skip-layers L1,L2,...: bypass whole transformer blocks
 
     for (int i = 2; i < argc; ++i) {
         const char * a = argv[i];
@@ -479,7 +511,14 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--kl-divergence-base") && i + 1 < argc) { mode = KLBASE; base_path = argv[++i]; }
         else if (!strcmp(a, "--kl-divergence")      && i + 1 < argc) { mode = KLDIV;  base_path = argv[++i]; }
         else if (!strcmp(a, "--imatrix-out")        && i + 1 < argc) { mode = IMATRIX; base_path = argv[++i]; }
+        else if (!strcmp(a, "--prune-stats")        && i + 1 < argc) { mode = IMATRIX; prune_path = argv[++i]; }
         else if (!strcmp(a, "--imatrix-min-hits")   && i + 1 < argc) imat_min_hits = atoi(argv[++i]);
+        else if (!strcmp(a, "--prune-mask")         && i + 1 < argc) prune_mask_path = argv[++i];
+        else if (!strcmp(a, "--keep")               && i + 1 < argc) mask_keep      = atoi(argv[++i]);
+        else if (!strcmp(a, "--drop-below-hits")    && i + 1 < argc) mask_drop_hits = atoi(argv[++i]);
+        else if (!strcmp(a, "--mass-eps")           && i + 1 < argc) mask_mass_eps  = atof(argv[++i]);
+        else if (!strcmp(a, "--drop-lowest")        && i + 1 < argc) mask_drop_lowest = atoi(argv[++i]);
+        else if (!strcmp(a, "--skip-layers")        && i + 1 < argc) skip_layers_arg = argv[++i];
         else if (!strcmp(a, "--manifest")    && i + 1 < argc) manifest_path = argv[++i];
         else if (!strcmp(a, "--speaker")     && i + 1 < argc) spk_path = argv[++i];
         else if (!strcmp(a, "--speaker-pos") && i + 1 < argc) spk_pos  = atoi(argv[++i]);
@@ -502,6 +541,43 @@ int main(int argc, char ** argv) {
     if (!zonos2_model_load(model, model_path.c_str(), use_gpu)) {
         fprintf(stderr, "load failed\n"); return 1;
     }
+
+    // --prune-mask: dynamically drop low-MSAN experts before scoring (runtime equivalent of
+    // prune-cli, for sweeping the quality knee against a KLD base without rewriting GGUFs).
+    if (!prune_mask_path.empty()) {
+        if (mask_keep < 0 && mask_drop_hits < 0 && mask_mass_eps < 0.0 && mask_drop_lowest < 0) {
+            fprintf(stderr, "perplexity: --prune-mask needs --keep N, --mass-eps E, --drop-lowest N, or --drop-below-hits H\n");
+            zonos2_model_free(model); return 1;
+        }
+        std::map<int, prune_stats::layer> st;
+        if (!prune_stats::load(prune_mask_path, st)) { zonos2_model_free(model); return 1; }
+        const auto keep = prune_policy::select(st, { mask_keep, mask_drop_hits, mask_mass_eps, mask_drop_lowest });
+        if (!zonos2_set_expert_mask(model, keep)) { zonos2_model_free(model); return 1; }
+    }
+
+    // --skip-layers: bypass whole transformer blocks (depth pruning) at graph-build time. Comma-
+    // separated block indices; the residual stream passes through each listed block unchanged.
+    if (!skip_layers_arg.empty()) {
+        model.layer_skip.assign(model.hp.n_layer, 0);
+        std::string ls; int n_skip = 0;
+        for (size_t p = 0; p <= skip_layers_arg.size(); ++p) {
+            const char c = p < skip_layers_arg.size() ? skip_layers_arg[p] : ',';
+            if (c == ',') {
+                if (!ls.empty()) {
+                    const int L = atoi(ls.c_str());
+                    if (L < 0 || L >= (int) model.hp.n_layer) {
+                        fprintf(stderr, "perplexity: --skip-layers index %d out of range [0,%u)\n",
+                                L, model.hp.n_layer);
+                        zonos2_model_free(model); return 1;
+                    }
+                    if (!model.layer_skip[L]) { model.layer_skip[L] = 1; ++n_skip; }
+                    ls.clear();
+                }
+            } else if (c != ' ') ls.push_back(c);
+        }
+        printf("depth-prune: skipping %d/%u blocks [%s]\n", n_skip, model.hp.n_layer, skip_layers_arg.c_str());
+    }
+
     const int W = (int) model.hp.n_codebooks + 1;
 
     // optional speaker embedding (kl-divergence reads it from the base file instead)
@@ -523,7 +599,7 @@ int main(int argc, char ** argv) {
         std::vector<sequence> seqs;
         if (load_manifest(manifest_path, W, model.hp.spk_dim, seqs)) {
             printf("manifest: %zu sequences from %s\n", seqs.size(), manifest_path.c_str());
-            rc = (mode == IMATRIX) ? run_imatrix(model, seqs, base_path, imat_min_hits)
+            rc = (mode == IMATRIX) ? run_imatrix(model, seqs, base_path, prune_path, imat_min_hits)
                                    : run_kl_base(model, base_path, seqs);
         }
     } else {
@@ -535,7 +611,7 @@ int main(int argc, char ** argv) {
         }
         if (ok) {
             rc = (mode == PPL)     ? run_perplexity(model, seqs, spk_ptr, spk_pos)
-               : (mode == IMATRIX) ? run_imatrix(model, seqs, base_path, imat_min_hits)
+               : (mode == IMATRIX) ? run_imatrix(model, seqs, base_path, prune_path, imat_min_hits)
                                    : run_kl_base(model, base_path, seqs);
         }
     }

@@ -19,6 +19,8 @@
 #include "dac.h"
 #include "spk-encoder.h"
 #include "npy.h"
+#include "model-paths.h"
+#include "server-embed.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -1489,9 +1491,10 @@ static std::string read_file(const std::string & path) {
 
 static void usage(const char * a0) {
     fprintf(stderr,
-        "usage: %s <model.gguf> --dac <dac.gguf> [--spk <encoder.gguf>] [options]\n"
+        "usage: %s <model.gguf> [--dac <dac.gguf>] [--spk|--spk-encoder <encoder.gguf>] [options]\n"
+        "  (dac.gguf / spk-encoder.gguf are auto-detected next to <model.gguf> when the flags are omitted)\n"
         "  --host H            bind address (default 127.0.0.1)\n"
-        "  --port P            port (default 1919)\n"
+        "  --port P            port (default 1919; 0 picks a free ephemeral port)\n"
         "  --gpu | --cpu       backend (default cpu)\n"
         "  --dac-cpu           run the DAC decoder on CPU even with --gpu (isolates the\n"
         "                      backbone graph; makes streamed audio bit-exact; default on Metal)\n"
@@ -1520,7 +1523,7 @@ static void usage(const char * a0) {
         "  --ui PATH           web UI html to serve at / (default web/tts_ui.html)\n", a0);
 }
 
-int main(int argc, char ** argv) {
+static int server_run(int argc, char ** argv, zonos2_server_ctl * ctl) {
     if (argc < 2) { usage(argv[0]); return 1; }
 
     ServerState s;
@@ -1530,7 +1533,7 @@ int main(int argc, char ** argv) {
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if      (a == "--dac" && i + 1 < argc) dac_path = argv[++i];
-        else if (a == "--spk" && i + 1 < argc) spk_path = argv[++i];
+        else if ((a == "--spk" || a == "--spk-encoder") && i + 1 < argc) spk_path = argv[++i];
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
         else if (a == "--port" && i + 1 < argc) port = atoi(argv[++i]);
         else if (a == "--gpu") s.use_gpu = true;
@@ -1551,10 +1554,33 @@ int main(int argc, char ** argv) {
         else if (a == "--ui" && i + 1 < argc) s.ui_path = argv[++i];
         else { usage(argv[0]); return 1; }
     }
-    if (dac_path.empty()) { fprintf(stderr, "error: --dac <dac.gguf> is required\n"); return 1; }
+    if (!mp_file_exists(model_path)) {
+        fprintf(stderr, "failed to load model %s\n", model_path.c_str());
+        mp_print_download_hint("zonos2-q6_k.gguf (or another quant)", model_path);
+        return 1;
+    }
+
+    // dac/spk-encoder conventionally sit next to the backbone; pick them up when unflagged.
+    if (dac_path.empty()) {
+        dac_path = mp_find_companion(model_path, "dac.gguf");
+        if (!dac_path.empty()) fprintf(stderr, "zonos2-server: using dac.gguf found next to model: %s\n", dac_path.c_str());
+    }
+    if (spk_path.empty()) {
+        spk_path = mp_find_companion(model_path, "spk-encoder.gguf");
+        if (!spk_path.empty()) fprintf(stderr, "zonos2-server: using spk-encoder.gguf found next to model: %s\n", spk_path.c_str());
+    }
+    if (dac_path.empty()) {
+        fprintf(stderr, "error: --dac <dac.gguf> is required (also auto-detected when dac.gguf sits next to <model.gguf>)\n");
+        mp_print_download_hint("dac.gguf", mp_parent_dir(model_path) + "/dac.gguf");
+        return 1;
+    }
     s.prof = getenv("ZONOS2_PROFILE") != nullptr;
 
-    if (!zonos2_model_load(s.model, model_path.c_str(), s.use_gpu)) { fprintf(stderr, "failed to load model\n"); return 1; }
+    if (!zonos2_model_load(s.model, model_path.c_str(), s.use_gpu)) {
+        fprintf(stderr, "failed to load model %s\n", model_path.c_str());
+        if (!mp_file_exists(model_path)) mp_print_download_hint("zonos2-q6_k.gguf (or another quant)", model_path);
+        return 1;
+    }
     {
         std::string err;
         s.have_emotion = zonos2_emotion_load(s.emotion, s.emotion_dir, err);
@@ -1578,9 +1604,17 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "zonos2-server: Metal GPU -> DAC defaults to CPU (avoids backbone contention; --dac-gpu to override)\n");
         }
     }
-    if (!dac_load(s.dac, dac_path.c_str(), s.use_gpu && !dac_cpu)) { fprintf(stderr, "failed to load dac\n"); return 1; }
+    if (!dac_load(s.dac, dac_path.c_str(), s.use_gpu && !dac_cpu)) {
+        fprintf(stderr, "failed to load dac %s\n", dac_path.c_str());
+        if (!mp_file_exists(dac_path)) mp_print_download_hint("dac.gguf", dac_path);
+        return 1;
+    }
     if (!spk_path.empty()) {
-        if (!spk_load(s.spk, spk_path.c_str())) { fprintf(stderr, "failed to load speaker encoder\n"); return 1; }
+        if (!spk_load(s.spk, spk_path.c_str())) {
+            fprintf(stderr, "failed to load speaker encoder %s\n", spk_path.c_str());
+            if (!mp_file_exists(spk_path)) mp_print_download_hint("spk-encoder.gguf", spk_path);
+            return 1;
+        }
         s.have_spk = true;
     }
 
@@ -1646,8 +1680,18 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "zonos2-server: backbone=%s dac=%s spk=%s backend=%s batch=%d dac-threads=%d\n",
             model_path.c_str(), dac_path.c_str(), s.have_spk ? spk_path.c_str() : "(none)",
             s.use_gpu ? "GPU" : "CPU", s.batch_slots, s.dac_threads);
-    fprintf(stderr, "zonos2-server: listening on http://%s:%d  (UI: %s)\n", host.c_str(), port, s.ui_path.c_str());
-    const bool ok = svr.listen(host, port);
+    // Bind before announcing (and before publishing to ctl): --port 0 asks the OS
+    // for a free ephemeral port, which the embedding app reads back from ctl->port.
+    bool bound = true;
+    if (port == 0) { port = svr.bind_to_any_port(host); bound = port > 0; }
+    else            bound = svr.bind_to_port(host, port);
+
+    bool ok = false;
+    if (bound) {
+        fprintf(stderr, "zonos2-server: listening on http://%s:%d  (UI: %s)\n", host.c_str(), port, s.ui_path.c_str());
+        if (ctl) { ctl->svr = &svr; ctl->port.store(port); }
+        ok = svr.listen_after_bind();
+    }
 
     s.stop.store(true);                 // stop the worker + DAC pool before returning
     s.sched_cv.notify_all();
@@ -1658,6 +1702,19 @@ int main(int argc, char ** argv) {
         if (lane.th.joinable()) lane.th.join();
         dac_free(lane.dac);
     }
-    if (!ok) { fprintf(stderr, "error: failed to bind %s:%d\n", host.c_str(), port); return 1; }
-    return 0;
+    if (ctl) ctl->svr = nullptr;        // svr is about to go out of scope
+    if (!bound) { fprintf(stderr, "error: failed to bind %s:%d\n", host.c_str(), port); return 1; }
+    // listen_after_bind() returns true on a graceful stop() and false only if the
+    // accept loop died on a real error.
+    return ok ? 0 : 1;
 }
+
+int zonos2_server_main(int argc, char ** argv, zonos2_server_ctl * ctl) {
+    const int rc = server_run(argc, argv, ctl);
+    if (rc != 0 && ctl) ctl->failed.store(true);
+    return rc;
+}
+
+#ifndef ZONOS2_APP_EMBED
+int main(int argc, char ** argv) { return zonos2_server_main(argc, argv, nullptr); }
+#endif

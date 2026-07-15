@@ -191,7 +191,10 @@ static ggml_tensor * build_dense_ffn(gctx & g, ggml_tensor * cur, const zonos2_l
 static ggml_tensor * build_moe(gctx & g, ggml_tensor * cur, const zonos2_layer & ly, int L) {
     const zonos2_hparams & hp = g.m->hp;
     ggml_context * ctx = g.ctx;
-    const int ne = (int) hp.n_expert, k = ly.top_k, n = g.n, n_embd = (int) hp.n_embd;
+    // Per-layer expert count (not hp.n_expert): a pruned GGUF can keep a different number of
+    // experts per layer, so derive it from the actual stack. The router_mlp4/router_bias the
+    // softmax runs over are sliced to match, so softmax renormalizes over the survivors.
+    const int ne = (int) ly.ffn_up_exps->ne[2], k = ly.top_k, n = g.n, n_embd = (int) hp.n_embd;
 
     ggml_tensor * rh = ggml_add(ctx, ggml_mul_mat(ctx, ly.router_down, cur), ly.router_down_b); // [rd, n]
     if (ly.router_eda_scale && g.router_states) {
@@ -204,9 +207,15 @@ static ggml_tensor * build_moe(gctx & g, ggml_tensor * cur, const zonos2_layer &
     ggml_tensor * h = ggml_gelu_erf(ctx, ggml_add(ctx, ggml_mul_mat(ctx, ly.router_mlp0, rn), ly.router_mlp0_b));
     h = ggml_gelu_erf(ctx, ggml_add(ctx, ggml_mul_mat(ctx, ly.router_mlp2, h), ly.router_mlp2_b));
     ggml_tensor * rlogits = ggml_mul_mat(ctx, ly.router_mlp4, h);   // [ne, n]
+    // Runtime expert mask (--prune-mask): -inf on dropped experts before softmax, so the
+    // survivors' probabilities renormalize exactly as in a prune-cli'd model (broadcasts over n).
+    if (ly.router_mask) rlogits = ggml_add(ctx, rlogits, ly.router_mask);
     ggml_tensor * probs   = ggml_soft_max(ctx, rlogits);           // [ne, n]
 
     ggml_tensor * scores = ggml_add(ctx, probs, ly.router_bias);    // legacy: probs + bias
+    // Re-apply the mask to the selection scores too: a dropped expert's prob is already 0, but
+    // probs+bias could still rank it into the top-k, so force it to -inf here as well.
+    if (ly.router_mask) scores = ggml_add(ctx, scores, ly.router_mask);
     ggml_tensor * sel    = ggml_top_k(ctx, scores, k);             // [k, n] i32
     ggml_tensor * weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, ne, n), sel); // [1, k, n]
 
@@ -321,6 +330,16 @@ ggml_tensor * build_graph(gctx & g, int n_layer_limit) {
         const std::string s = std::to_string(L);
 
         res = res ? ggml_add(ctx, x, res) : x;
+
+        // depth-prune (--skip-layers): bypass this whole block. `res` already folds every prior
+        // block's contribution, so passing it through unchanged is an exact identity; x must carry
+        // no pending FFN (it was just folded above), so zero it — the next iteration's fold then
+        // adds nothing. Attention + FFN for this block are never built (real compute/KV savings).
+        if (L < (int) m.layer_skip.size() && m.layer_skip[L]) {
+            x = ggml_scale(ctx, res, 0.0f);
+            continue;
+        }
+
         ggml_tensor * cur = g.cap("attn_in_" + s, rms_w(ctx, res, ly.attn_norm, hp.rms_eps));
         ggml_tensor * attn = g.cap("attn_out_" + s, build_attention(g, cur, ly, L));
         res = g.cap("layer_res_" + s, ggml_add(ctx, attn, res));

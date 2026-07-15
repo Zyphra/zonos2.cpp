@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Zonos2
+Comment=Zonos2 text-to-speech
+Exec=zonos2-app
+Icon=zonos2
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+StartupWMClass=zonos2
