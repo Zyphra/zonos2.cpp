@@ -33,6 +33,7 @@ usage: $0 [options] [-- <extra zonos2-server args>]
   --no-browser   don't open the web UI
 env overrides: ZONOS2_QUANT ZONOS2_MODEL_DIR ZONOS2_BASE_URL ZONOS2_HOST ZONOS2_PORT
                ZONOS2_SERVER_BIN ZONOS2_ASSUME_YES ZONOS2_NO_BROWSER ZONOS2_FFMPEG_URL
+               ZONOS2_DL_CONNECTIONS (parallel download connections, default 8, max 16)
 ffmpeg (voice cloning only) is fetched into $ZONOS2_MODEL_DIR/bin if not already there or
 on PATH; basic TTS needs no ffmpeg.
 EOF
@@ -55,8 +56,6 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -x "$ZONOS2_SERVER_BIN" ] || die "zonos2-server not found at $ZONOS2_SERVER_BIN (run this script from the extracted release archive, or set ZONOS2_SERVER_BIN)"
-
 model_size_gb() {
     case "$1" in
         zonos2-f16.gguf)  echo 15.3 ;;
@@ -70,11 +69,55 @@ model_size_gb() {
     esac
 }
 
+# Segmented parallel download: one HEAD resolves the exact size + final CDN URL (HF's resolve/
+# endpoint 302s to a Xet CDN that honors Range), then N concurrent range requests are stitched
+# back together — the trick hf_transfer uses to beat single-stream HF (~2x+ here). Falls back to
+# a single stream (below) on any hiccup. Tunable via ZONOS2_DL_CONNECTIONS (default 8, max 16).
+download_segmented() {
+    seg_name="$1"; seg_url="$2"; seg_dst="$3"
+    conns="${ZONOS2_DL_CONNECTIONS:-8}"
+    case "$conns" in ''|*[!0-9]*) conns=8 ;; esac
+    [ "$conns" -lt 1 ] && conns=1
+    [ "$conns" -gt 16 ] && conns=16
+    [ "$conns" -le 1 ] && return 1
+    # resolve final URL + exact size from a single redirect-following HEAD
+    seg_head=$(curl -sIL "$seg_url" | tr -d '\r') || return 1
+    seg_size=$(printf '%s\n' "$seg_head" | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
+    seg_eff=$(printf  '%s\n' "$seg_head" | awk 'tolower($1)=="location:"{v=$2} END{print v}')
+    [ -n "$seg_eff" ] || seg_eff="$seg_url"
+    case "$seg_size" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$seg_size" -lt 33554432 ] && return 1   # < 32 MB: not worth segmenting
+    seg_len=$((seg_size / conns))
+    rm -f "$seg_dst".part[0-9]*
+    echo "downloading $seg_name ($(model_size_gb "$seg_name") GB, $conns connections) ..."
+    k=0; pids=""
+    while [ "$k" -lt "$conns" ]; do
+        s=$((k * seg_len))
+        if [ "$k" -eq $((conns - 1)) ]; then e=$((seg_size - 1)); else e=$(((k + 1) * seg_len - 1)); fi
+        curl -sfL --retry 3 --range "$s-$e" -o "$seg_dst.part$k" "$seg_eff" &
+        pids="$pids $!"
+        k=$((k + 1))
+    done
+    seg_ok=1
+    for p in $pids; do wait "$p" || seg_ok=0; done
+    if [ "$seg_ok" != 1 ]; then rm -f "$seg_dst".part[0-9]*; return 1; fi
+    : > "$seg_dst.part"
+    k=0
+    while [ "$k" -lt "$conns" ]; do
+        cat "$seg_dst.part$k" >> "$seg_dst.part" || { rm -f "$seg_dst".part*; return 1; }
+        rm -f "$seg_dst.part$k"
+        k=$((k + 1))
+    done
+    if [ "$(wc -c < "$seg_dst.part")" != "$seg_size" ]; then rm -f "$seg_dst.part"; return 1; fi
+    mv "$seg_dst.part" "$seg_dst"
+}
+
 # curl -C - --fail exits 33 when the .part is already complete (HTTP 416): restart clean once.
 download_one() {
     name="$1"
     url="$ZONOS2_BASE_URL/$name"
     dst="$ZONOS2_MODEL_DIR/$name"
+    download_segmented "$name" "$url" "$dst" && return 0   # fast path; falls through on any failure
     echo "downloading $name ($(model_size_gb "$name") GB) ..."
     rc=0
     curl -L --fail --retry 3 -C - --progress-bar -o "$dst.part" "$url" || rc=$?
@@ -121,6 +164,12 @@ ffmpeg_download() {
     fi
     [ -x "$FFMPEG_BIN" ]
 }
+
+# Sourced by tests/segment-download.sh to exercise download_segmented in isolation; a normal
+# run leaves ZONOS2_LIB_ONLY unset and proceeds into the main flow below.
+[ "${ZONOS2_LIB_ONLY:-}" = 1 ] && return 0
+
+[ -x "$ZONOS2_SERVER_BIN" ] || die "zonos2-server not found at $ZONOS2_SERVER_BIN (run this script from the extracted release archive, or set ZONOS2_SERVER_BIN)"
 
 BACKBONE="zonos2-$ZONOS2_QUANT.gguf"
 MISSING=()

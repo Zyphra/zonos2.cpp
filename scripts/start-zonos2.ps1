@@ -62,10 +62,66 @@ $Sizes = @{
 }
 function Get-SizeGB([string]$name) { if ($Sizes.ContainsKey($name)) { $Sizes[$name] } else { '?' } }
 
+# Segmented parallel download: one HEAD resolves the exact size + final CDN URL (HF's resolve/
+# endpoint 302s to a Xet CDN that honors Range), then N concurrent range requests are stitched
+# back together — the trick hf_transfer uses to beat single-stream HF (~2x+). Falls back to a
+# single stream on any hiccup. Tunable via ZONOS2_DL_CONNECTIONS (default 8, max 16).
+function Download-Segmented([string]$name, [string]$url, [string]$dst) {
+    $conns = 8
+    if ($env:ZONOS2_DL_CONNECTIONS) {
+        $parsed = 0
+        if ([int]::TryParse($env:ZONOS2_DL_CONNECTIONS, [ref]$parsed) -and $parsed -gt 0) { $conns = $parsed }
+    }
+    if ($conns -lt 1) { $conns = 1 }
+    if ($conns -gt 16) { $conns = 16 }
+    if ($conns -le 1) { return $false }
+    # resolve final URL + exact size from a single redirect-following HEAD (-match is case-insensitive)
+    $head = & curl.exe -sIL $url
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $size = [int64]0; $eff = $url
+    foreach ($line in $head) {
+        $l = $line.TrimEnd("`r")
+        if ($l -match '^content-length:\s*(\d+)') { $v = [int64]$Matches[1]; if ($v -gt $size) { $size = $v } }
+        elseif ($l -match '^location:\s*(\S+)')    { $eff = $Matches[1] }
+    }
+    if ($size -lt 33554432) { return $false }   # < 32 MB: not worth segmenting
+    $seg = [int64]([math]::Floor($size / $conns))
+    Get-ChildItem "$dst.part*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Write-Host "downloading $name ($(Get-SizeGB $name) GB, $conns connections) ..."
+    $procs = @()
+    for ($k = 0; $k -lt $conns; $k++) {
+        $s = [int64]$k * $seg
+        if ($k -eq ($conns - 1)) { $e = $size - 1 } else { $e = [int64]($k + 1) * $seg - 1 }
+        $procs += Start-Process -FilePath curl.exe -PassThru -NoNewWindow -ArgumentList `
+            @('-sfL', '--retry', '3', '--range', "$s-$e", '-o', "$dst.part$k", $eff)
+    }
+    $ok = $true
+    foreach ($p in $procs) { $p.WaitForExit(); if ($p.ExitCode -ne 0) { $ok = $false } }
+    if (-not $ok) {
+        Get-ChildItem "$dst.part*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    $out = [System.IO.File]::Create("$dst.part")   # concatenate segments in order, freeing each
+    try {
+        for ($k = 0; $k -lt $conns; $k++) {
+            $part = "$dst.part$k"
+            $in = [System.IO.File]::OpenRead($part)
+            try { $in.CopyTo($out) } finally { $in.Close() }
+            Remove-Item -Force $part -ErrorAction SilentlyContinue
+        }
+    } finally { $out.Close() }
+    if ((Get-Item "$dst.part").Length -ne $size) {
+        Remove-Item -Force "$dst.part" -ErrorAction SilentlyContinue; return $false
+    }
+    Move-Item -Force "$dst.part" $dst
+    return $true
+}
+
 # curl -C - --fail exits 33 when the .part is already complete (HTTP 416): restart clean once.
 function Download-One([string]$name) {
     $url = "$BaseUrl/$name"
     $dst = Join-Path $ModelDir $name
+    if (Download-Segmented $name $url $dst) { return $true }   # fast path; falls through on failure
     Write-Host "downloading $name ($(Get-SizeGB $name) GB) ..."
     & curl.exe -L --fail --retry 3 -C - --progress-bar -o "$dst.part" $url
     if ($LASTEXITCODE -eq 33) {
