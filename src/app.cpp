@@ -23,15 +23,21 @@
 #include <saucer/modules/desktop.hpp>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>   // WEXITSTATUS — decode a curl exit code from std::system
+#endif
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -39,6 +45,40 @@ using json = nlohmann::json;
 // --------------------------------------------------------------------------- paths
 
 static fs::path exe_dir() { return zonos2_exe_dir(); }
+
+// macOS's saucer file picker returns NSURL.absoluteString — a percent-encoded
+// file:// URI (e.g. file:///Users/.../my%20model.gguf), not a POSIX path — so a
+// filesystem lookup on it fails. Normalize any file:// URI to a native path;
+// plain paths (Linux/Windows pickers, hand-typed) have no scheme and pass through.
+static std::string file_uri_to_path(const std::string & s) {
+    constexpr const char * scheme = "file://";
+    if (s.rfind(scheme, 0) != 0) return s;
+    // Drop scheme (+ optional empty authority: file://host/path -> /path); percent-decode.
+    std::string rest = s.substr(7);
+    std::string out;
+    out.reserve(rest.size());
+    auto unhex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < rest.size(); ++i) {
+        int hi, lo;
+        if (rest[i] == '%' && i + 2 < rest.size() &&
+            (hi = unhex(rest[i + 1])) >= 0 && (lo = unhex(rest[i + 2])) >= 0) {
+            out.push_back(static_cast<char>(hi * 16 + lo));
+            i += 2;
+        } else {
+            out.push_back(rest[i]);
+        }
+    }
+#ifdef _WIN32
+    // A Windows file URI decodes to "/C:/path"; strip the spurious leading slash.
+    if (out.size() >= 3 && out[0] == '/' && out[2] == ':') out.erase(0, 1);
+#endif
+    return out;
+}
 
 static fs::path config_path() {
 #ifdef _WIN32
@@ -78,7 +118,11 @@ static json load_config() {
     std::ifstream f(config_path());
     if (!f) return json::object();
     json j = json::parse(f, nullptr, false);
-    return j.is_object() ? j : json::object();
+    if (!j.is_object()) return json::object();
+    // Repair configs written before the file://-URI fix (macOS picker); harmless on plain paths.
+    for (const char * k : {"model", "dac", "spk"})
+        if (j.contains(k) && j[k].is_string()) j[k] = file_uri_to_path(j[k].get<std::string>());
+    return j;
 }
 
 static std::string save_config(const json & j) {   // returns error message or ""
@@ -218,6 +262,142 @@ static void ensure_ffmpeg() {
         else
             fprintf(stderr, "zonos2-app: ffmpeg ready at %s\n", bin.string().c_str());
     }).detach();
+}
+
+// --------------------------------------------------------------------------- model download
+// Mirrors scripts/start-zonos2.sh: fetch the backbone (chosen quant) + dac + optional
+// spk-encoder from the public HF GGUF repo into <config>/models/, via system curl (the same
+// transport as the ffmpeg fetch). A background thread does the work; the setup page polls
+// download_status() for a progress bar. ZONOS2_BASE_URL overrides the source (also test seam).
+
+static fs::path models_dir() { return config_path().parent_path() / "models"; }
+
+static std::string base_url() {
+    if (const char * u = getenv("ZONOS2_BASE_URL"); u && *u) return u;
+    return "https://huggingface.co/Zyphra/ZONOS2-GGUF/resolve/main";
+}
+
+// Approximate byte sizes, used as the progress denominator only when a HEAD request fails.
+static long long model_size_hint(const std::string & name) {
+    if (name == "zonos2-f16.gguf")  return 15300LL * 1000000;
+    if (name == "zonos2-q8_0.gguf") return  8500LL * 1000000;
+    if (name == "zonos2-q6_k.gguf") return  6800LL * 1000000;
+    if (name == "zonos2-q5_k.gguf") return  5800LL * 1000000;
+    if (name == "zonos2-q4_k.gguf") return  4900LL * 1000000;
+    if (name == "dac.gguf")         return   250LL * 1000000;
+    if (name == "spk-encoder.gguf") return    20LL * 1000000;
+    return 0;
+}
+
+static int sys_exit(int r) {
+#ifdef _WIN32
+    return r;                                   // std::system returns the exit code directly
+#else
+    return WIFEXITED(r) ? WEXITSTATUS(r) : -1;
+#endif
+}
+
+// Content-Length of the (possibly redirected) URL, for an accurate progress bar; 0 on failure.
+static long long remote_size(const std::string & url) {
+    std::error_code ec;
+    fs::create_directories(models_dir(), ec);
+    const fs::path tmp = models_dir() / ".head";
+    const std::string cmd = "curl -sIL " + shq(url) + " -o " + shq(tmp.string());
+    long long best = 0;
+    if (sys_exit(std::system(cmd.c_str())) == 0) {
+        std::ifstream f(tmp);
+        static const std::string key = "content-length:";
+        for (std::string line; std::getline(f, line); ) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size() <= key.size()) continue;
+            std::string head = line.substr(0, key.size());
+            for (char & c : head) c = static_cast<char>(std::tolower((unsigned char) c));
+            if (head == key) {                  // take the largest across redirect hops (the CDN 200)
+                long long v = std::atoll(line.c_str() + key.size());
+                if (v > best) best = v;
+            }
+        }
+    }
+    fs::remove(tmp, ec);
+    return best;
+}
+
+// Fetch one file to <models>/<name> via curl, resuming a prior .part; rc 33 (HTTP 416 on an
+// already-complete .part) means restart clean once. Returns true on success.
+static bool download_one(const std::string & name) {
+    const fs::path dst  = models_dir() / name;
+    const fs::path part = fs::path(dst.string() + ".part");
+    const std::string url = base_url() + "/" + name;
+    std::error_code ec;
+    const std::string resume = "curl -L --fail --retry 3 -C - -o " + shq(part.string()) + " " + shq(url);
+    int code = sys_exit(std::system(resume.c_str()));
+    if (code == 33) {                           // .part already complete → server 416s the resume
+        fs::remove(part, ec);
+        const std::string clean = "curl -L --fail --retry 3 -o " + shq(part.string()) + " " + shq(url);
+        code = sys_exit(std::system(clean.c_str()));
+    }
+    if (code != 0) return false;
+    fs::rename(part, dst, ec);
+    return !ec && fs::exists(dst, ec);
+}
+
+// Progress/result shared with the setup page. Non-movable (mutex + thread), so reset in place.
+struct download_state {
+    std::mutex  mu;
+    bool        active = false, finished = false, ok = false;
+    std::string file;                 // file currently downloading (for the .part stat)
+    int         idx = 0, count = 0;   // 1-based current file / total files
+    long long   total = 0;            // byte size of the current file (0 = unknown)
+    std::string error;                // failure detail when !ok
+    std::string model, dac, spk;      // resulting paths on success (spk may be empty)
+    bool        gpu = true;
+    std::thread th;
+};
+static download_state g_dl;
+
+// Runs on g_dl.th (or synchronously in the --selftest seam). Publishes progress under g_dl.mu.
+static void run_download(std::string quant, bool want_spk, bool gpu) {
+    std::error_code ec;
+    fs::create_directories(models_dir(), ec);
+    const std::string backbone = "zonos2-" + quant + ".gguf";
+    std::vector<std::pair<std::string, bool>> files = {   // {name, fatal}
+        {backbone, true}, {"dac.gguf", true}};
+    if (want_spk) files.push_back({"spk-encoder.gguf", false});
+
+    const std::string model_path = (models_dir() / backbone).string();
+    const std::string dac_path   = (models_dir() / "dac.gguf").string();
+    std::string spk_path;
+    bool ok = true;
+    std::string err;
+
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::string & name  = files[i].first;
+        const bool          fatal = files[i].second;
+        {
+            std::lock_guard<std::mutex> lk(g_dl.mu);
+            g_dl.file = name; g_dl.idx = static_cast<int>(i) + 1;
+            g_dl.count = static_cast<int>(files.size()); g_dl.total = 0;
+        }
+        const fs::path final_path = models_dir() / name;
+        if (fs::exists(final_path, ec)) {                 // already downloaded — reuse
+            if (name == "spk-encoder.gguf") spk_path = final_path.string();
+            continue;
+        }
+        long long total = remote_size(base_url() + "/" + name);
+        if (total <= 0) total = model_size_hint(name);
+        { std::lock_guard<std::mutex> lk(g_dl.mu); g_dl.total = total; }
+
+        if (!download_one(name)) {
+            if (fatal) { ok = false; err = "failed to download " + name + " from " + base_url(); break; }
+            fprintf(stderr, "zonos2-app: warning: could not download %s — voice cloning disabled\n", name.c_str());
+            continue;                                     // spk-encoder is optional
+        }
+        if (name == "spk-encoder.gguf") spk_path = final_path.string();
+    }
+
+    std::lock_guard<std::mutex> lk(g_dl.mu);
+    g_dl.active = false; g_dl.finished = true; g_dl.ok = ok; g_dl.error = err;
+    if (ok) { g_dl.model = model_path; g_dl.dac = dac_path; g_dl.spk = spk_path; g_dl.gpu = gpu; }
 }
 
 // --------------------------------------------------------------------------- state
@@ -365,13 +545,17 @@ coco::stray start(saucer::application * app) {
 
     webview->expose("pick_file", [&desktop](const std::string & /*kind*/) -> std::string {
         auto r = desktop.pick<saucer::modules::picker::type::file>({.filters = {"*.gguf"}});
-        return r ? r->string() : std::string{};
+        return r ? file_uri_to_path(r->string()) : std::string{};
     });
 
     webview->expose("get_config", []() -> std::string { return load_config().dump(); });
 
-    webview->expose("launch", [webview](const std::string & model, const std::string & dac,
-                                        const std::string & spk, bool gpu) -> std::string {
+    webview->expose("launch", [webview](const std::string & model_in, const std::string & dac_in,
+                                        const std::string & spk_in, bool gpu) -> std::string {
+        // Self-heal file:// URIs (macOS picker, or a config saved before this fix).
+        const std::string model = file_uri_to_path(model_in);
+        const std::string dac   = file_uri_to_path(dac_in);
+        const std::string spk   = file_uri_to_path(spk_in);
         std::error_code ec;
         if (!fs::exists(model, ec)) return "backbone model not found: " + model;
         if (!fs::exists(dac, ec))   return "DAC decoder not found: " + dac;
@@ -389,6 +573,38 @@ coco::stray start(saucer::application * app) {
 
     webview->expose("show_setup", [webview] { webview->set_html(page(ZONOS2_APP_SETUP_PAGE)); });
 
+    // Kick off a model download into <config>/models on a background thread; the setup page
+    // polls download_status() for progress, then calls launch() with the fetched paths.
+    webview->expose("download_models",
+                    [](const std::string & quant, bool want_spk, bool gpu) -> std::string {
+        { std::lock_guard<std::mutex> lk(g_dl.mu); if (g_dl.active) return ""; }  // already running
+        if (g_dl.th.joinable()) g_dl.th.join();                                   // reap a finished run
+        {
+            std::lock_guard<std::mutex> lk(g_dl.mu);
+            g_dl.active = true; g_dl.finished = false; g_dl.ok = false;
+            g_dl.file.clear(); g_dl.error.clear(); g_dl.idx = g_dl.count = 0; g_dl.total = 0;
+            g_dl.model.clear(); g_dl.dac.clear(); g_dl.spk.clear();
+        }
+        g_dl.th = std::thread(run_download, quant, want_spk, gpu);
+        return "";
+    });
+
+    webview->expose("download_status", []() -> std::string {
+        std::lock_guard<std::mutex> lk(g_dl.mu);
+        long long done = 0;
+        if (!g_dl.file.empty()) {   // live byte count: the .part while downloading, else the final file
+            std::error_code ec;
+            auto sz = fs::file_size(models_dir() / (g_dl.file + ".part"), ec);
+            if (ec) { ec.clear(); sz = fs::file_size(models_dir() / g_dl.file, ec); }
+            if (!ec) done = static_cast<long long>(sz);
+        }
+        json j = {{"active", g_dl.active}, {"finished", g_dl.finished}, {"ok", g_dl.ok},
+                  {"file", g_dl.file}, {"idx", g_dl.idx}, {"count", g_dl.count},
+                  {"total", g_dl.total}, {"done", done}, {"error", g_dl.error},
+                  {"model", g_dl.model}, {"dac", g_dl.dac}, {"spk", g_dl.spk}, {"gpu", g_dl.gpu}};
+        return j.dump();
+    });
+
     if (!g_passthrough.empty()) {
         webview->set_html(page(ZONOS2_APP_SPLASH_PAGE));
         start_server(webview, g_passthrough);
@@ -404,6 +620,9 @@ coco::stray start(saucer::application * app) {
 
     g_state.shutdown.store(true);
     stop_server();
+    // A download in flight can't be interrupted cleanly (curl runs in a blocking child), so
+    // detach rather than block window-close on it; the process exit reaps the orphan.
+    if (g_dl.th.joinable()) g_dl.th.detach();
 }
 
 static void usage() {
@@ -429,6 +648,14 @@ int main(int argc, char ** argv) {
         g_passthrough.push_back(a);
     }
     if (!g_passthrough.empty()) g_passthrough.insert(g_passthrough.begin(), "zonos2-app");
+
+    // Headless test seam: run a model download synchronously against ZONOS2_BASE_URL and exit,
+    // so the download path is verifiable without driving the GUI (see tests/launcher-smoke.sh).
+    if (const char * q = getenv("ZONOS2_APP_SELFTEST_DOWNLOAD"); q && *q) {
+        run_download(q, true, false);
+        fprintf(stderr, "selftest-download: ok=%d model=%s\n", g_dl.ok ? 1 : 0, g_dl.model.c_str());
+        return g_dl.ok ? 0 : 1;
+    }
 
     ensure_ffmpeg();   // fetch ffmpeg for voice cloning in the background if none is present
 
