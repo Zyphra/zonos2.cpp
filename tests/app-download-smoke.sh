@@ -36,12 +36,14 @@ fail() { echo "FAIL: $1"; [ -f "$WORK/app.log" ] && { echo "--- app log ---"; ca
 PORT="${ZONOS2_TEST_APP_HTTP_PORT:-18989}"
 
 echo "== app: model download self-test =="
-# Distinctive random payloads with different sizes so the HEAD/Content-Length path is exercised.
+# Distinctive random payloads. The backbone is >32 MB so the segmented (parallel-range) path
+# is exercised; dac/spk stay under the threshold and take the single-stream path. tests/range_server.py
+# answers Range requests with 206 (the stdlib http.server ignores Range), emulating HF's CDN.
 mkdir -p "$WORK/serve"
-head -c 3000000 /dev/urandom > "$WORK/serve/zonos2-q6_k.gguf"
-head -c  500000 /dev/urandom > "$WORK/serve/dac.gguf"
-head -c   40000 /dev/urandom > "$WORK/serve/spk-encoder.gguf"
-python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$WORK/serve" >/dev/null 2>&1 &
+head -c 40000000 /dev/urandom > "$WORK/serve/zonos2-q6_k.gguf"
+head -c   500000 /dev/urandom > "$WORK/serve/dac.gguf"
+head -c    40000 /dev/urandom > "$WORK/serve/spk-encoder.gguf"
+python3 "$ROOT/tests/range_server.py" "$PORT" "$WORK/serve" >/dev/null 2>&1 &
 HTTP_PID=$!
 up=0
 for _ in $(seq 1 50); do
@@ -59,6 +61,9 @@ ZONOS2_BASE_URL="http://127.0.0.1:$PORT" ZONOS2_APP_SELFTEST_DOWNLOAD=q6_k \
   "$APP" >"$WORK/app.log" 2>&1 || fail "self-test exited nonzero"
 grep -q "selftest-download: ok=1" "$WORK/app.log" || fail "self-test did not report ok=1"
 pass "self-test downloaded and reported success"
+grep -q "zonos2-q6_k.gguf fetched with .* parallel connections" "$WORK/app.log" \
+  || fail "backbone did not use the segmented (parallel) download path"
+pass "backbone fetched via segmented parallel download"
 
 for f in zonos2-q6_k.gguf dac.gguf spk-encoder.gguf; do
   cmp -s "$WORK/serve/$f" "$MODELS/$f" || fail "$f missing or not byte-identical"

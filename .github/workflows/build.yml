@@ -57,6 +57,9 @@ jobs:
       - name: Launcher smoke test
         shell: bash
         run: bash tests/launcher-smoke.sh
+      - name: Segmented download test
+        shell: bash
+        run: bash tests/segment-download.sh
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash

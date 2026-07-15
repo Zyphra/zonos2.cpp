@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -297,34 +298,110 @@ static int sys_exit(int r) {
 #endif
 }
 
-// Content-Length of the (possibly redirected) URL, for an accurate progress bar; 0 on failure.
-static long long remote_size(const std::string & url) {
+// Number of parallel connections for a segmented download (ZONOS2_DL_CONNECTIONS, default 8).
+static int dl_connections() {
+    int n = 8;
+    if (const char * e = getenv("ZONOS2_DL_CONNECTIONS"); e && *e) { int v = std::atoi(e); if (v > 0) n = v; }
+    return n < 1 ? 1 : (n > 16 ? 16 : n);
+}
+
+// One HEAD (following redirects) yields both the exact Content-Length and the final CDN URL:
+// HF's resolve/ endpoint 302-redirects to a Xet CDN that honors Range, so we resolve once and
+// reuse that URL across all segments. Sets eff to the last Location seen (or url if none) and
+// size to the largest Content-Length (the CDN 200, not the redirect stub). false on failure.
+static bool probe_remote(const std::string & url, std::string & eff, long long & size) {
     std::error_code ec;
     fs::create_directories(models_dir(), ec);
     const fs::path tmp = models_dir() / ".head";
     const std::string cmd = "curl -sIL " + shq(url) + " -o " + shq(tmp.string());
-    long long best = 0;
-    if (sys_exit(std::system(cmd.c_str())) == 0) {
-        std::ifstream f(tmp);
-        static const std::string key = "content-length:";
-        for (std::string line; std::getline(f, line); ) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.size() <= key.size()) continue;
-            std::string head = line.substr(0, key.size());
-            for (char & c : head) c = static_cast<char>(std::tolower((unsigned char) c));
-            if (head == key) {                  // take the largest across redirect hops (the CDN 200)
-                long long v = std::atoll(line.c_str() + key.size());
-                if (v > best) best = v;
+    eff = url; size = 0;
+    if (sys_exit(std::system(cmd.c_str())) != 0) { fs::remove(tmp, ec); return false; }
+    std::ifstream f(tmp);
+    auto header = [](std::string line, const char * key, std::string & val) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t klen = std::strlen(key);
+        if (line.size() <= klen) return false;
+        std::string head = line.substr(0, klen);
+        for (char & c : head) c = static_cast<char>(std::tolower((unsigned char) c));
+        if (head != key) return false;
+        size_t b = klen; while (b < line.size() && (line[b] == ' ' || line[b] == '\t')) ++b;
+        val = line.substr(b);
+        return true;
+    };
+    for (std::string line, v; std::getline(f, line); ) {
+        if (header(line, "content-length:", v)) { long long n = std::atoll(v.c_str()); if (n > size) size = n; }
+        else if (header(line, "location:", v) && !v.empty()) eff = v;   // last Location = final CDN URL
+    }
+    fs::remove(tmp, ec);
+    return size > 0;
+}
+
+// Segmented download: split [0,total) into `conns` byte ranges fetched concurrently from the
+// resolved CDN URL, concatenate, and verify the size. Returns false (caller falls back to a
+// single stream) on any segment error, a short concat, or a size mismatch. No new dependency —
+// just parallel curl range requests, the same trick hf_transfer uses to beat single-stream HF.
+static bool download_segmented(const std::string & name, const std::string & eff,
+                               long long total, int conns) {
+    const fs::path dst = models_dir() / name;
+    auto part_k = [&](int k) { return fs::path(dst.string() + ".part" + std::to_string(k)); };
+    std::error_code ec;
+    for (int k = 0; k < conns; ++k) fs::remove(part_k(k), ec);   // clear any stale segments
+
+    const long long seg = total / conns;
+    std::vector<int> rc(conns, -1);
+    std::vector<std::thread> ths;
+    ths.reserve(conns);
+    for (int k = 0; k < conns; ++k) {
+        const long long s = static_cast<long long>(k) * seg;
+        const long long e = (k == conns - 1) ? total - 1 : static_cast<long long>(k + 1) * seg - 1;
+        ths.emplace_back([&rc, k, s, e, eff, p = part_k(k)] {
+            const std::string cmd = "curl -sfL --retry 3 --range " + std::to_string(s) + "-" +
+                                    std::to_string(e) + " -o " + shq(p.string()) + " " + shq(eff);
+            rc[k] = sys_exit(std::system(cmd.c_str()));
+        });
+    }
+    for (auto & t : ths) t.join();
+
+    bool ok = true;
+    for (int r : rc) if (r != 0) ok = false;
+    const fs::path whole = fs::path(dst.string() + ".part");
+    if (ok) {
+        fs::remove(whole, ec);
+        std::ofstream out(whole, std::ios::binary);
+        for (int k = 0; k < conns && ok; ++k) {                 // append, freeing each segment as we go
+            std::ifstream in(part_k(k), std::ios::binary);
+            if (!in) { ok = false; break; }
+            out << in.rdbuf();
+            in.close();
+            fs::remove(part_k(k), ec);
+        }
+        out.close();
+        if (ok) {
+            const auto sz = fs::file_size(whole, ec);
+            if (!ec && static_cast<long long>(sz) == total) {
+                fs::rename(whole, dst, ec);
+                if (!ec) {
+                    fprintf(stderr, "zonos2-app: %s fetched with %d parallel connections\n", name.c_str(), conns);
+                    return true;
+                }
             }
         }
     }
-    fs::remove(tmp, ec);
-    return best;
+    for (int k = 0; k < conns; ++k) fs::remove(part_k(k), ec);   // failure: leave no partial segments
+    fs::remove(whole, ec);
+    return false;
 }
 
-// Fetch one file to <models>/<name> via curl, resuming a prior .part; rc 33 (HTTP 416 on an
-// already-complete .part) means restart clean once. Returns true on success.
-static bool download_one(const std::string & name) {
+// Fetch one file to <models>/<name>: parallel segmented download when the size is known and
+// worth it, else a single resumable stream (rc 33 = HTTP 416 on an already-complete .part →
+// restart clean once). `eff` is the resolved URL and `exact` the Content-Length from probe_remote
+// (exact == 0 means unknown → single stream only). Returns true on success.
+static bool download_one(const std::string & name, const std::string & eff, long long exact) {
+    const int conns = dl_connections();
+    if (exact >= 32LL * 1024 * 1024 && conns > 1 && !eff.empty()
+        && download_segmented(name, eff, exact, conns))
+        return true;
+
     const fs::path dst  = models_dir() / name;
     const fs::path part = fs::path(dst.string() + ".part");
     const std::string url = base_url() + "/" + name;
@@ -383,11 +460,12 @@ static void run_download(std::string quant, bool want_spk, bool gpu) {
             if (name == "spk-encoder.gguf") spk_path = final_path.string();
             continue;
         }
-        long long total = remote_size(base_url() + "/" + name);
-        if (total <= 0) total = model_size_hint(name);
+        std::string eff; long long exact = 0;
+        const bool probed = probe_remote(base_url() + "/" + name, eff, exact);
+        const long long total = probed ? exact : model_size_hint(name);  // exact drives segmentation
         { std::lock_guard<std::mutex> lk(g_dl.mu); g_dl.total = total; }
 
-        if (!download_one(name)) {
+        if (!download_one(name, eff, probed ? exact : 0)) {
             if (fatal) { ok = false; err = "failed to download " + name + " from " + base_url(); break; }
             fprintf(stderr, "zonos2-app: warning: could not download %s — voice cloning disabled\n", name.c_str());
             continue;                                     // spk-encoder is optional
@@ -592,11 +670,18 @@ coco::stray start(saucer::application * app) {
     webview->expose("download_status", []() -> std::string {
         std::lock_guard<std::mutex> lk(g_dl.mu);
         long long done = 0;
-        if (!g_dl.file.empty()) {   // live byte count: the .part while downloading, else the final file
+        if (!g_dl.file.empty()) {   // live byte count: sum every <file>.part* (single .part or N segments)
             std::error_code ec;
-            auto sz = fs::file_size(models_dir() / (g_dl.file + ".part"), ec);
-            if (ec) { ec.clear(); sz = fs::file_size(models_dir() / g_dl.file, ec); }
-            if (!ec) done = static_cast<long long>(sz);
+            const std::string prefix = g_dl.file + ".part";
+            for (fs::directory_iterator it(models_dir(), ec), end; !ec && it != end; it.increment(ec)) {
+                std::error_code fe;
+                if (it->path().filename().string().rfind(prefix, 0) == 0)
+                    if (auto sz = it->file_size(fe); !fe) done += static_cast<long long>(sz);
+            }
+            if (done == 0) {        // fully downloaded: parts gone, final file in place
+                auto sz = fs::file_size(models_dir() / g_dl.file, ec);
+                if (!ec) done = static_cast<long long>(sz);
+            }
         }
         json j = {{"active", g_dl.active}, {"finished", g_dl.finished}, {"ok", g_dl.ok},
                   {"file", g_dl.file}, {"idx", g_dl.idx}, {"count", g_dl.count},
