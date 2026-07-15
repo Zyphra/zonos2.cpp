@@ -148,11 +148,14 @@ curl -s http://localhost:1919/tts/generate \
 ## Desktop App (zonos2-app)
 
 The same server and web UI, packaged as a native window (a [saucer](https://github.com/saucer/saucer)
-webview: WebView2 / WKWebView / WebKitGTK). First launch opens a setup page to pick your `.gguf`
-files with native file dialogs; the choice is saved (`~/.config/zonos2/app.json`, or the platform
-equivalent) and later launches boot straight into the UI. The embedded server binds an ephemeral
-`127.0.0.1` port and its whole HTTP API stays reachable while the app runs; closing the window
-shuts it down. Release tags ship prebuilt bundles: `zonos2-linux-x64-app.tar.gz`,
+webview: WebView2 / WKWebView / WebKitGTK). First launch opens a setup page: pick a model quality
+and click **Download &amp; Launch** and it fetches the model files for you (into
+`~/.config/zonos2/models`, or the platform equivalent) — same one-click path as the launcher
+scripts, no terminal needed. If you already have the `.gguf` files, "I already have the model files"
+reveals native file pickers instead. The choice is saved (`~/.config/zonos2/app.json`, or the
+platform equivalent) and later launches boot straight into the UI. The embedded server binds an
+ephemeral `127.0.0.1` port and its whole HTTP API stays reachable while the app runs; closing the
+window shuts it down. Release tags ship prebuilt bundles: `zonos2-linux-x64-app.tar.gz`,
 `zonos2-macos-arm64-app.zip` (a `Zonos2.app`), and `zonos2-app.exe` inside the Windows
 `zonos2-windows-x64-vulkan.zip`.
 
