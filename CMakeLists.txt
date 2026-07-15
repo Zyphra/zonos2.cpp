@@ -10,6 +10,22 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# --- zonos2-app (desktop shell) opt-in. Declared here, before add_subdirectory(ggml),
+#     specifically so the Apple Objective-C / -C++ languages it needs are enabled in
+#     THIS root scope first. saucer's WKWebView backend + saucer-embed inject .m/.mm
+#     sources into the top-level zonos2-app target; ggml's Metal backend also enables
+#     OBJC — but inside ggml's own subdirectory scope. Whichever scope enables a
+#     language *first* is the only one that gets CMAKE_<LANG>_COMPILE_OBJECT, so if
+#     ggml (a subdir) wins the race the top-level target is left without the rule and
+#     CMake dies at generate with "CMAKE_OBJC_COMPILE_OBJECT not set". Enabling both
+#     here, pre-ggml, makes the root scope the first enabler and the rules propagate
+#     down to ggml and up to zonos2-app alike. C++23 toolchain still required (README). ---
+option(ZONOS2_APP "Build the zonos2-app desktop shell (requires a C++23 toolchain, see README)" OFF)
+if (ZONOS2_APP AND APPLE)
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+endif()
+
 # --- CUDA target (H100 = sm_90). Enable with -DGGML_CUDA=ON ---
 if (GGML_CUDA)
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -106,21 +122,12 @@ endif()
 #     CMake >= 3.25, C++23 (GCC >= 14 / Clang >= 20 / AppleClang >= 17 / MSVC >= 19.44),
 #     and on Linux GTK4 >= 4.12 + WebKitGTK-6.0 + libadwaita + json-glib dev packages.
 #     Everything else in this file keeps building with the C++17 / CMake 3.18 floor. ---
-option(ZONOS2_APP "Build the zonos2-app desktop shell (requires a C++23 toolchain, see README)" OFF)
+# ZONOS2_APP is declared (and its Apple languages enabled) near the top of this file,
+# before add_subdirectory(ggml); see the comment there for why the ordering matters.
 if (ZONOS2_APP)
     if (CMAKE_VERSION VERSION_LESS 3.31)
         # saucer core says 3.25, but its saucer-embed dependency uses policy CMP0174 (3.31).
         message(FATAL_ERROR "ZONOS2_APP requires CMake >= 3.31 (saucer); this is CMake ${CMAKE_VERSION}")
-    endif()
-
-    # saucer's macOS (WKWebView) backend and saucer-embed's injected sources are
-    # Objective-C++. saucer enables OBJC/OBJCXX inside its own FetchContent subdirectory,
-    # but that scope doesn't set CMAKE_OBJCXX_COMPILE_OBJECT for the top-level directory
-    # where zonos2-app is defined (embed injects .mm sources into it) -> CMake fails at
-    # generate with "CMAKE_OBJCXX_COMPILE_OBJECT not set". Enable it here in the top scope.
-    if (APPLE)
-        enable_language(OBJC)
-        enable_language(OBJCXX)
     endif()
 
     include(FetchContent)
