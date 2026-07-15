@@ -445,3 +445,5 @@ jobs:
         with:
           files: artifacts/**/*
           generate_release_notes: true
+          # Tags with a hyphen (v0.5.0-rc1, ...) are prereleases, so they don't show as "Latest".
+          prerelease: ${{ contains(github.ref_name, '-') }}
