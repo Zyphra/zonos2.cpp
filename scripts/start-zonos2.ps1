@@ -25,6 +25,9 @@ if (-not $Port)     { $Port     = if ($env:ZONOS2_PORT)      { [int]$env:ZONOS2_
 $ServerBin          = if ($env:ZONOS2_SERVER_BIN)            { $env:ZONOS2_SERVER_BIN } else { Join-Path $ScriptDir 'zonos2-server.exe' }
 if ($env:ZONOS2_ASSUME_YES) { $Yes = $true }
 if ($env:ZONOS2_NO_BROWSER) { $NoBrowser = $true }
+$FfmpegUrl = $env:ZONOS2_FFMPEG_URL   # override with a single-binary .exe URL (used by tests); default is BtbN LGPL
+$FfmpegDir = Join-Path $ModelDir 'bin'
+$FfmpegBin = Join-Path $FfmpegDir 'ffmpeg.exe'
 $GpuMode = $GPU_DEFAULT
 if ($Cpu) { $GpuMode = 'cpu' }
 if ($Gpu) { $GpuMode = 'gpu' }
@@ -40,7 +43,8 @@ usage: start-zonos2.bat [options] [extra zonos2-server args]
   -Yes         don't ask before downloading
   -NoBrowser   don't open the web UI
 env overrides: ZONOS2_QUANT ZONOS2_MODEL_DIR ZONOS2_BASE_URL ZONOS2_HOST ZONOS2_PORT
-               ZONOS2_SERVER_BIN ZONOS2_ASSUME_YES ZONOS2_NO_BROWSER
+               ZONOS2_SERVER_BIN ZONOS2_ASSUME_YES ZONOS2_NO_BROWSER ZONOS2_FFMPEG_URL
+ffmpeg (voice cloning only) is fetched into <ModelDir>\bin if not already there or on PATH.
 "@
     exit 0
 }
@@ -73,19 +77,58 @@ function Download-One([string]$name) {
     return $true
 }
 
+# Fetch a static ffmpeg into $FfmpegDir — voice cloning only; basic TTS never uses it.
+# Windows uses the BtbN LGPL build (a zip nesting the exe at ffmpeg-*/bin/ffmpeg.exe);
+# override with ZONOS2_FFMPEG_URL (single-binary .exe URL).
+function Download-Ffmpeg {
+    New-Item -ItemType Directory -Force -Path $FfmpegDir | Out-Null
+    if ($FfmpegUrl) {
+        Write-Host "downloading ffmpeg (for voice cloning) ..."
+        & curl.exe -L --fail --retry 3 --progress-bar -o "$FfmpegBin.part" $FfmpegUrl
+        if ($LASTEXITCODE -ne 0) { return $false }
+        Move-Item -Force "$FfmpegBin.part" $FfmpegBin
+        return $true
+    }
+    $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-lgpl-7.1.zip'
+    $zip = Join-Path $FfmpegDir 'ffmpeg-dl.zip'
+    $ex  = Join-Path $FfmpegDir '.extract'
+    Write-Host "downloading ffmpeg (~90 MB, for voice cloning) ..."
+    & curl.exe -L --fail --retry 3 --progress-bar -o $zip $url
+    if ($LASTEXITCODE -ne 0) { return $false }
+    if (Test-Path $ex) { Remove-Item -Recurse -Force $ex }
+    Expand-Archive -Path $zip -DestinationPath $ex -Force
+    $found = Get-ChildItem -Path $ex -Recurse -Filter ffmpeg.exe |
+             Where-Object { $_.FullName -match '[\\/]bin[\\/]' } | Select-Object -First 1
+    if (-not $found) { Remove-Item -Recurse -Force $zip, $ex -ErrorAction SilentlyContinue; return $false }
+    Move-Item -Force $found.FullName $FfmpegBin
+    Remove-Item -Recurse -Force $zip, $ex -ErrorAction SilentlyContinue
+    return (Test-Path $FfmpegBin)
+}
+
 $Backbone = "zonos2-$Quant.gguf"
 $Missing = @()
 foreach ($f in @($Backbone, 'dac.gguf', 'spk-encoder.gguf')) {
     if (-not (Test-Path (Join-Path $ModelDir $f))) { $Missing += $f }
 }
 
-if ($Missing.Count -gt 0) {
+# ffmpeg is only needed for voice cloning: prefer our own copy, then a system ffmpeg
+# on PATH, else fetch it alongside the models.
+$needFfmpeg = $false
+if (Test-Path $FfmpegBin) {
+    $env:ZONOS2_FFMPEG = $FfmpegBin
+} elseif ($env:ZONOS2_SKIP_PATH_FFMPEG -ne '1' -and (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
+    # a system ffmpeg is on PATH; the server resolves it there
+} else {
+    $needFfmpeg = $true
+}
+
+if ($Missing.Count -gt 0 -or $needFfmpeg) {
     if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
         Fail "curl.exe is required to download models (it ships with Windows 10 1803+) — or place the .gguf files in $ModelDir yourself (see README)"
     }
-    Write-Host "The following models are missing from $ModelDir and will be downloaded:"
-    foreach ($f in $Missing) { Write-Host "  $f  ($(Get-SizeGB $f) GB)" }
-    Write-Host "  from $BaseUrl"
+    Write-Host "The following will be downloaded into ${ModelDir}:"
+    foreach ($f in $Missing) { Write-Host "  $f  ($(Get-SizeGB $f) GB)  from $BaseUrl" }
+    if ($needFfmpeg) { Write-Host "  ffmpeg  (~90 MB, voice cloning only)" }
     if (-not $Yes) {
         $ans = Read-Host 'Download now? [Y/n]'
         if ($ans -and $ans -notmatch '^[yY]') { Write-Host 'aborted.'; exit 1 }
@@ -99,6 +142,10 @@ if ($Missing.Count -gt 0) {
                 Fail "failed to download $f from $BaseUrl/$f"
             }
         }
+    }
+    if ($needFfmpeg) {
+        if (Download-Ffmpeg) { $env:ZONOS2_FFMPEG = $FfmpegBin }
+        else { Write-Warning "ffmpeg download failed — voice cloning disabled (basic TTS still works)" }
     }
 }
 

@@ -102,6 +102,27 @@ pass "/tts/generate -> WAV"
 stop_launcher
 pass "TERM tears the server down"
 
+echo "== launcher: ffmpeg auto-download =="
+# Serve a fake single-binary ffmpeg and force the download (ZONOS2_SKIP_PATH_FFMPEG bypasses
+# the system-ffmpeg check that CI/dev boxes would otherwise satisfy). Models already present,
+# so only ffmpeg is fetched.
+FF_PORT="${ZONOS2_TEST_FF_PORT:-18124}"
+mkdir -p "$WORK/ffserve"
+printf '#!/bin/sh\necho fake-ffmpeg "$@"\n' > "$WORK/ffserve/ffmpeg"
+python3 -m http.server "$FF_PORT" --bind 127.0.0.1 --directory "$WORK/ffserve" >/dev/null 2>&1 &
+HTTP_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$FF_PORT/" >/dev/null 2>&1 && break; sleep 0.2; done
+rm -rf "$WORK/models/bin"
+export ZONOS2_SKIP_PATH_FFMPEG=1 ZONOS2_FFMPEG_URL="http://127.0.0.1:$FF_PORT/ffmpeg"
+run_launcher "http://127.0.0.1:9"
+[ -x "$WORK/models/bin/ffmpeg" ] || fail "ffmpeg was not downloaded to models/bin"
+pass "ffmpeg auto-downloaded to models/bin"
+grep -q "downloading ffmpeg" "$WORK/launch.log" || fail "launcher did not announce the ffmpeg download"
+pass "ffmpeg download announced"
+stop_launcher
+unset ZONOS2_SKIP_PATH_FFMPEG ZONOS2_FFMPEG_URL
+kill "$HTTP_PID" 2>/dev/null || true; wait "$HTTP_PID" 2>/dev/null || true; HTTP_PID=""
+
 echo "== launcher: download path =="
 HTTP_PORT="${ZONOS2_TEST_HTTP_PORT:-18123}"
 mkdir -p "$WORK/serve"

@@ -15,6 +15,9 @@ ZONOS2_PORT="${ZONOS2_PORT:-1919}"
 ZONOS2_SERVER_BIN="${ZONOS2_SERVER_BIN:-$SCRIPT_DIR/zonos2-server}"
 ASSUME_YES="${ZONOS2_ASSUME_YES:-0}"
 NO_BROWSER="${ZONOS2_NO_BROWSER:-0}"
+FFMPEG_URL="${ZONOS2_FFMPEG_URL:-}"   # override with a single-binary URL (used by tests); default is per-OS
+FFMPEG_DIR="$ZONOS2_MODEL_DIR/bin"
+FFMPEG_BIN="$FFMPEG_DIR/ffmpeg"
 GPU_MODE="$GPU_DEFAULT"
 EXTRA_ARGS=()
 
@@ -29,7 +32,9 @@ usage: $0 [options] [-- <extra zonos2-server args>]
   -y, --yes      don't ask before downloading
   --no-browser   don't open the web UI
 env overrides: ZONOS2_QUANT ZONOS2_MODEL_DIR ZONOS2_BASE_URL ZONOS2_HOST ZONOS2_PORT
-               ZONOS2_SERVER_BIN ZONOS2_ASSUME_YES ZONOS2_NO_BROWSER
+               ZONOS2_SERVER_BIN ZONOS2_ASSUME_YES ZONOS2_NO_BROWSER ZONOS2_FFMPEG_URL
+ffmpeg (voice cloning only) is fetched into $ZONOS2_MODEL_DIR/bin if not already there or
+on PATH; basic TTS needs no ffmpeg.
 EOF
 }
 
@@ -82,19 +87,65 @@ download_one() {
     mv "$dst.part" "$dst"
 }
 
+ffmpeg_size_mb() { case "$(uname -s)" in Darwin) echo 45 ;; *) echo 108 ;; esac; }
+
+# Fetch a static ffmpeg into $FFMPEG_DIR — only needed for voice cloning (decoding the
+# reference audio); basic TTS never touches it. Linux uses the BtbN LGPL build; macOS a
+# pinned static arm64 binary (GPL, but we don't redistribute it — your machine fetches it
+# from the provider, like the models from HF). Override with ZONOS2_FFMPEG_URL.
+ffmpeg_download() {
+    mkdir -p "$FFMPEG_DIR" || return 1
+    ff_url=""; ff_single=1
+    if [ -n "$FFMPEG_URL" ]; then
+        ff_url="$FFMPEG_URL"
+    elif [ "$(uname -s)" = Darwin ]; then
+        ff_url="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64"
+    else
+        ff_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-lgpl-7.1.tar.xz"
+        ff_single=0
+    fi
+    echo "downloading ffmpeg ($(ffmpeg_size_mb) MB, for voice cloning) ..."
+    if [ "$ff_single" = 1 ]; then
+        curl -L --fail --retry 3 --progress-bar -o "$FFMPEG_BIN.part" "$ff_url" || return 1
+        chmod +x "$FFMPEG_BIN.part"; mv "$FFMPEG_BIN.part" "$FFMPEG_BIN"
+    else
+        # BtbN archive nests the binary at ffmpeg-*/bin/ffmpeg; extract, relocate, clean up
+        ff_tmp="$FFMPEG_DIR/ffmpeg-dl.tar.xz"; ff_x="$FFMPEG_DIR/.extract"
+        rm -rf "$ff_x"; mkdir -p "$ff_x"
+        curl -L --fail --retry 3 --progress-bar -o "$ff_tmp" "$ff_url" || { rm -rf "$ff_tmp" "$ff_x"; return 1; }
+        tar -xf "$ff_tmp" -C "$ff_x" || { rm -rf "$ff_tmp" "$ff_x"; return 1; }
+        ff_found=$(find "$ff_x" -type f -name ffmpeg -path '*/bin/*' 2>/dev/null | head -1)
+        [ -n "$ff_found" ] || { rm -rf "$ff_tmp" "$ff_x"; return 1; }
+        mv "$ff_found" "$FFMPEG_BIN"; chmod +x "$FFMPEG_BIN"
+        rm -rf "$ff_tmp" "$ff_x"
+    fi
+    [ -x "$FFMPEG_BIN" ]
+}
+
 BACKBONE="zonos2-$ZONOS2_QUANT.gguf"
 MISSING=()
 for f in "$BACKBONE" dac.gguf spk-encoder.gguf; do
     [ -f "$ZONOS2_MODEL_DIR/$f" ] || MISSING+=("$f")
 done
 
-if [ "${#MISSING[@]}" -gt 0 ]; then
+# ffmpeg is only needed for voice cloning. Prefer our own downloaded copy, then a system
+# ffmpeg on PATH; otherwise mark it for download alongside the models.
+NEED_FFMPEG=0
+if [ -x "$FFMPEG_BIN" ]; then
+    export ZONOS2_FFMPEG="$FFMPEG_BIN"
+elif [ "${ZONOS2_SKIP_PATH_FFMPEG:-0}" != 1 ] && command -v ffmpeg >/dev/null 2>&1; then
+    :   # a system ffmpeg is on PATH; the server/CLI resolve it there (ZONOS2_SKIP_PATH_FFMPEG=1 forces a download, for tests)
+else
+    NEED_FFMPEG=1
+fi
+
+if [ "${#MISSING[@]}" -gt 0 ] || [ "$NEED_FFMPEG" = 1 ]; then
     command -v curl >/dev/null 2>&1 || die "curl is required to download models — install it (e.g. 'sudo apt install curl' / 'brew install curl'), or place the .gguf files in $ZONOS2_MODEL_DIR yourself (see README)"
-    echo "The following models are missing from $ZONOS2_MODEL_DIR and will be downloaded:"
+    echo "The following will be downloaded into $ZONOS2_MODEL_DIR:"
     for f in "${MISSING[@]}"; do
-        echo "  $f  ($(model_size_gb "$f") GB)"
+        echo "  $f  ($(model_size_gb "$f") GB)  from $ZONOS2_BASE_URL"
     done
-    echo "  from $ZONOS2_BASE_URL"
+    [ "$NEED_FFMPEG" = 1 ] && echo "  ffmpeg  (~$(ffmpeg_size_mb) MB, voice cloning only)"
     if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then
         printf "Download now? [Y/n] "
         read -r ans
@@ -110,6 +161,13 @@ if [ "${#MISSING[@]}" -gt 0 ]; then
             fi
         fi
     done
+    if [ "$NEED_FFMPEG" = 1 ]; then
+        if ffmpeg_download; then
+            export ZONOS2_FFMPEG="$FFMPEG_BIN"
+        else
+            echo "start-zonos2: warning: ffmpeg download failed — voice cloning disabled (basic TTS still works)" >&2
+        fi
+    fi
 fi
 
 # The UI, default voices, and emotion directions ship next to this script in release

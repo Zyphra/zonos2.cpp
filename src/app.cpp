@@ -14,6 +14,7 @@
 // Built only with -DZONOS2_APP=ON (needs a C++23 toolchain; see README).
 #include "server-embed.h"
 #include "app-pages.h"
+#include "exe-path.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -27,6 +28,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,26 +44,7 @@ using json = nlohmann::json;
 
 // --------------------------------------------------------------------------- paths
 
-static fs::path exe_dir() {
-    std::error_code ec;
-#ifdef _WIN32
-    wchar_t buf[MAX_PATH];
-    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) return fs::path(std::wstring(buf, n)).parent_path();
-#elif defined(__APPLE__)
-    uint32_t sz = 0;
-    _NSGetExecutablePath(nullptr, &sz);
-    std::string buf(sz, '\0');
-    if (_NSGetExecutablePath(buf.data(), &sz) == 0) {
-        fs::path p = fs::canonical(buf.c_str(), ec);
-        if (!ec) return p.parent_path();
-    }
-#else
-    fs::path p = fs::canonical("/proc/self/exe", ec);
-    if (!ec) return p.parent_path();
-#endif
-    return fs::current_path(ec);
-}
+static fs::path exe_dir() { return zonos2_exe_dir(); }
 
 static fs::path config_path() {
 #ifdef _WIN32
@@ -118,6 +101,129 @@ static bool config_launchable(const json & j) {
     std::error_code ec;
     return j.contains("model") && j.contains("dac") &&
            fs::exists(j.value("model", ""), ec) && fs::exists(j.value("dac", ""), ec);
+}
+
+// --------------------------------------------------------------------------- ffmpeg
+// Voice cloning decodes the reference audio through ffmpeg; plain TTS never touches it.
+// The packaged app can't assume ffmpeg is installed, so if none is found we fetch a
+// static build into the app config dir (bin/) and point the embedded server at it via
+// ZONOS2_FFMPEG. The fetch runs on a detached background thread so startup isn't blocked;
+// cloning just fails gracefully (existing "ffmpeg failed" error) until it lands.
+
+static void set_env(const char * k, const std::string & v) {
+#ifdef _WIN32
+    _putenv_s(k, v.c_str());
+#else
+    setenv(k, v.c_str(), 1);
+#endif
+}
+
+static std::string shq(const std::string & s) {   // quote a path for the system() shell
+#ifdef _WIN32
+    return "\"" + s + "\"";
+#else
+    std::string q = "'";
+    for (char c : s) q += (c == '\'') ? "'\\''" : std::string(1, c);
+    return q + "'";
+#endif
+}
+
+static fs::path ffmpeg_bin_path() {
+#ifdef _WIN32
+    return config_path().parent_path() / "bin" / "ffmpeg.exe";
+#else
+    return config_path().parent_path() / "bin" / "ffmpeg";
+#endif
+}
+
+static bool ffmpeg_on_path() {
+    const char * p = getenv("PATH");
+    if (!p) return false;
+#ifdef _WIN32
+    const char sep = ';'; const char * name = "ffmpeg.exe";
+#else
+    const char sep = ':'; const char * name = "ffmpeg";
+#endif
+    std::error_code ec;
+    std::stringstream ss{std::string(p)};
+    for (std::string dir; std::getline(ss, dir, sep); )
+        if (!dir.empty() && fs::exists(fs::path(dir) / name, ec)) return true;
+    return false;
+}
+
+// Pull the ffmpeg binary out of a BtbN archive (nested at ffmpeg-*/bin/ffmpeg[.exe]).
+static bool extract_ffmpeg(const fs::path & archive, const fs::path & dst) {
+    std::error_code ec;
+    const fs::path tmp = dst.parent_path() / ".ffx";
+    fs::remove_all(tmp, ec); fs::create_directories(tmp, ec);
+    // tar handles .tar.xz (GNU tar) and .zip (bsdtar ships on Win10 1803+, like curl.exe)
+    if (std::system(("tar -xf " + shq(archive.string()) + " -C " + shq(tmp.string())).c_str()) != 0) {
+        fs::remove_all(tmp, ec); return false;
+    }
+    fs::path found;
+    for (fs::recursive_directory_iterator it(tmp, ec), end; !ec && it != end; it.increment(ec))
+        if (it->is_regular_file(ec) && it->path().filename() == dst.filename() &&
+            it->path().parent_path().filename() == "bin") { found = it->path(); break; }
+    bool ok = false;
+    if (!found.empty()) {
+        fs::rename(found, dst, ec);
+        if (ec) { ec.clear(); fs::copy_file(found, dst, fs::copy_options::overwrite_existing, ec); }
+        ok = !ec;
+    }
+    fs::remove_all(tmp, ec);
+    return ok;
+}
+
+static bool download_ffmpeg(const fs::path & dst) {
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+
+    std::string url; bool single;
+    if (const char * o = getenv("ZONOS2_FFMPEG_URL"); o && *o) { url = o; single = true; }   // test override
+#if defined(__APPLE__)
+    else { url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64"; single = true; }
+#elif defined(_WIN32)
+    else { url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-lgpl-7.1.zip"; single = false; }
+#else
+    else { url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-lgpl-7.1.tar.xz"; single = false; }
+#endif
+
+    if (single) {
+        const fs::path part = fs::path(dst.string() + ".part");
+        if (std::system(("curl -L --fail --retry 3 -o " + shq(part.string()) + " " + shq(url)).c_str()) != 0) return false;
+        fs::rename(part, dst, ec);
+        if (ec) return false;
+    } else {
+        const fs::path arc = dst.parent_path() / "ffmpeg-dl.archive";
+        if (std::system(("curl -L --fail --retry 3 -o " + shq(arc.string()) + " " + shq(url)).c_str()) != 0) return false;
+        const bool ok = extract_ffmpeg(arc, dst);
+        fs::remove(arc, ec);
+        if (!ok) return false;
+    }
+#ifndef _WIN32
+    fs::permissions(dst, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                         fs::perms::others_read | fs::perms::others_exec, ec);
+#endif
+    return fs::exists(dst, ec);
+}
+
+// Ensure ffmpeg is available and, when we own it, point the server at it via ZONOS2_FFMPEG.
+// Call once, before the embedded server starts (sets the env single-threaded); the actual
+// fetch is detached.
+static void ensure_ffmpeg() {
+    if (const char * e = getenv("ZONOS2_FFMPEG"); e && *e) return;   // user/CLI override wins
+    const fs::path bin = ffmpeg_bin_path();
+    std::error_code ec;
+    if (fs::exists(bin, ec)) { set_env("ZONOS2_FFMPEG", bin.string()); return; }
+    if (getenv("ZONOS2_SKIP_PATH_FFMPEG") == nullptr && ffmpeg_on_path()) return;  // use system ffmpeg
+    // none present: reserve the path now (env set before any server thread), fetch in background
+    set_env("ZONOS2_FFMPEG", bin.string());
+    std::thread([bin] {
+        if (!download_ffmpeg(bin))
+            fprintf(stderr, "zonos2-app: ffmpeg download failed — voice cloning disabled until it is available\n");
+        else
+            fprintf(stderr, "zonos2-app: ffmpeg ready at %s\n", bin.string().c_str());
+    }).detach();
 }
 
 // --------------------------------------------------------------------------- state
@@ -329,6 +435,8 @@ int main(int argc, char ** argv) {
         g_passthrough.push_back(a);
     }
     if (!g_passthrough.empty()) g_passthrough.insert(g_passthrough.begin(), "zonos2-app");
+
+    ensure_ffmpeg();   // fetch ffmpeg for voice cloning in the background if none is present
 
     // Deliberately not forwarding argc/argv: GTK would try to parse the
     // server-passthrough options (--dac, ...) and error out on them.

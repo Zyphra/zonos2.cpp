@@ -88,22 +88,7 @@ on Windows — extract it anywhere). Each archive is self-contained: the `start-
 
 </details>
 
-### 2. Install ffmpeg (required for voice cloning)
-
-Voice cloning decodes reference audio by shelling out to `ffmpeg` — the server's `--spk`
-upload route, `zonos2-cli --clone`, and `spk-encoder-cli --clone` all need it on your `PATH`.
-Plain TTS works without it.
-
-```bash
-# macOS
-brew install ffmpeg
-# Debian / Ubuntu
-sudo apt install ffmpeg
-# Windows
-winget install ffmpeg    # or: choco install ffmpeg / scoop install ffmpeg
-```
-
-### 3. Run the start script
+### 2. Run the start script
 
 | OS | Do this |
 |---|---|
@@ -116,6 +101,14 @@ encoder) into `models/` next to the script; downloads resume if interrupted. It 
 `zonos2-server` and opens the web UI at `http://127.0.0.1:1919/`. Later runs skip straight to
 launch. The Vulkan/Metal archives default to GPU, the CPU archive to CPU. Close the window (or
 Ctrl-C) to stop the server.
+
+For **voice cloning**, a static `ffmpeg` (used only to decode your reference audio — plain TTS
+never needs it) is fetched into `models/bin/` on first run unless one is already on your `PATH`.
+Linux/Windows use the [BtbN](https://github.com/BtbN/FFmpeg-Builds) LGPL build; macOS uses a
+pinned static [arm64 build](https://github.com/eugeneware/ffmpeg-static) (GPL — nothing is
+redistributed here, your machine downloads it from the provider, and it runs as a separate
+process). The desktop app fetches its own copy the same way. Set `ZONOS2_FFMPEG=/path/to/ffmpeg`
+to point at your own instead.
 
 Common knobs (`./start-zonos2.sh --help` / `start-zonos2.bat -Help` lists everything):
 
@@ -131,7 +124,7 @@ Model dir, download URL, and more can be overridden via `ZONOS2_*` environment v
 `--help`). Prefer to launch the server by hand, or want CUDA? See
 [Manual & advanced setup](#manual--advanced-setup).
 
-### 4. Generate Speech
+### 3. Generate Speech
 
 **curl:**
 
@@ -212,7 +205,9 @@ zonos2-cli out/zonos2-q8_0.gguf --tts "Hello, world." out.wav \
     --dac out/dac.gguf --gpu --seed 1
 ```
 
-Clone a voice in-process by pointing `--clone` at any reference audio (needs `ffmpeg` on PATH):
+Clone a voice in-process by pointing `--clone` at any reference audio. The standalone `zonos2-cli`
+resolves `ffmpeg` from `$ZONOS2_FFMPEG`, then next to the binary, then `PATH` (unlike the start
+script / desktop app, it does not auto-download one — install ffmpeg or point `ZONOS2_FFMPEG` at one):
 
 ```bash
 zonos2-cli out/zonos2-q8_0.gguf --tts "Cloned voice demo." out.wav \

@@ -4,6 +4,7 @@
 // mono waveform (STFT via DFT matmul + slaney mel + log). CPU backend.
 #include "compat.h"
 #include "spk-encoder.h"
+#include "exe-path.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -13,6 +14,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -295,9 +297,28 @@ static std::string shell_quote_path(const char * path) {
 #endif
 }
 
+// Locate the ffmpeg used to decode reference audio for cloning. The launcher and the
+// desktop app download an ffmpeg on demand and point us at it via ZONOS2_FFMPEG; we
+// also look next to the executable (dist layout / macOS bundle Resources) before
+// falling back to a bare "ffmpeg" on PATH.
+static std::string resolve_ffmpeg() {
+    if (const char * e = getenv("ZONOS2_FFMPEG"); e && *e) return e;
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    const char * name = "ffmpeg.exe";
+#else
+    const char * name = "ffmpeg";
+#endif
+    std::error_code ec;
+    const fs::path dir = zonos2_exe_dir();
+    for (const fs::path c : { dir / name, dir / "bin" / name, dir / ".." / "Resources" / name })
+        if (fs::exists(c, ec)) return c.lexically_normal().string();
+    return name;   // rely on PATH
+}
+
 std::vector<float> spk_decode_audio_file(const spk_model & m, const char * path) {
     // decode any audio via ffmpeg -> 24 kHz mono f32
-    std::string cmd = "ffmpeg -v error -i " + shell_quote_path(path) +
+    std::string cmd = shell_quote_path(resolve_ffmpeg().c_str()) + " -v error -i " + shell_quote_path(path) +
                       " -ac 1 -ar " + std::to_string(m.sr) + " -f f32le -";
 #ifdef _WIN32
     // binary mode: text mode eats 0x1A as EOF and mangles CRLF in the raw f32
