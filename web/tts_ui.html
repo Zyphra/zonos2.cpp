@@ -2098,6 +2098,15 @@
       state.speakerInitialSelectionApplied = true;
     }
 
+    function applyUploadedSpeakers(addedSpeakers) {
+      // Populate the <select> options before assigning the uploaded speaker.
+      // Setting select.value to an ID that has no option clears the selection.
+      renderSpeakerSelectOptions();
+      autoAssignSpeakers(addedSpeakers);
+      renderSpeakerLibrary();
+      updateSpeakerBlendUI();
+    }
+
     async function cacheSpeakerFile(file, kind) {
       const body = { label: file.name.replace(/\.[^.]+$/, '') };
       if (kind === 'audio') {
@@ -2150,10 +2159,7 @@
           addedSpeakers.push(speaker);
         }
 
-        autoAssignSpeakers(addedSpeakers);
-        renderSpeakerSelectOptions();
-        renderSpeakerLibrary();
-        updateSpeakerBlendUI();
+        applyUploadedSpeakers(addedSpeakers);
         setSpeakerStatus(
           `Cached ${addedSpeakers.length} ${addedSpeakers.length === 1 ? 'speaker' : 'speakers'} for this session.`,
           'success',
