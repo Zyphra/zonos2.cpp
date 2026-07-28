@@ -87,6 +87,20 @@ add_executable(spk-encoder-cli src/spk-encoder-cli.cpp src/spk-encoder.cpp)
 target_include_directories(spk-encoder-cli PRIVATE src ggml/include)
 target_link_libraries(spk-encoder-cli PRIVATE ggml)
 
+# Decoder-only smoke test. EXCLUDE_FROM_ALL keeps release builds unchanged; CI builds
+# it explicitly to exercise ffmpeg process launch and binary stdout without a model.
+add_executable(ffmpeg-decode-smoke EXCLUDE_FROM_ALL
+    tests/ffmpeg-decode-smoke.cpp
+    src/spk-encoder.cpp
+)
+target_include_directories(ffmpeg-decode-smoke PRIVATE src ggml/include)
+target_link_libraries(ffmpeg-decode-smoke PRIVATE ggml)
+
+if (WIN32)
+    # Deterministic stand-in for ffmpeg in the Windows process-launch regression test.
+    add_executable(fake-ffmpeg EXCLUDE_FROM_ALL tests/fake-ffmpeg.cpp)
+endif()
+
 # --- DAC vocoder decoder CLI (codes -> wav) ---
 add_executable(dac-cli src/dac-cli.cpp src/dac.cpp)
 target_include_directories(dac-cli PRIVATE src ggml/include)

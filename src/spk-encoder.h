@@ -46,8 +46,8 @@ std::vector<float> spk_embed_from_mel(const spk_model & m, const float * mel, in
 std::vector<float> spk_embed_from_pcm24k(const spk_model & m, const float * wav, int n);
 
 // Decode any audio file to sample_rate (24 kHz) mono f32 via ffmpeg. Returns empty on failure.
-// Requires ffmpeg on PATH. Useful to keep the decoded waveform (e.g. for a preview) alongside
-// the embedding from spk_embed_from_pcm24k.
+// Resolves ffmpeg from ZONOS2_FFMPEG, next to the executable, or PATH. Useful to keep the
+// decoded waveform (e.g. for a preview) alongside the embedding from spk_embed_from_pcm24k.
 std::vector<float> spk_decode_audio_file(const spk_model & m, const char * path);
 
 // Embed from any audio file: spk_decode_audio_file() then spk_embed_from_pcm24k().

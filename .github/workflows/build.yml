@@ -370,6 +370,38 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j
+      - name: Build voice-cloning regression tests
+        run: cmake --build build --target fake-ffmpeg ffmpeg-decode-smoke -j
+      - name: Windows ffmpeg process-launch test
+        shell: pwsh
+        run: |
+          $fake = Get-ChildItem build -Recurse -Filter fake-ffmpeg.exe | Select-Object -First 1
+          $smoke = Get-ChildItem build -Recurse -Filter ffmpeg-decode-smoke.exe | Select-Object -First 1
+          if (-not $fake -or -not $smoke) { throw "voice-cloning test binaries not found" }
+
+          $testDir = Join-Path $env:RUNNER_TEMP 'zonos2 ffmpeg % & smoke'
+          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+          $input = Join-Path $testDir 'reference voice % &.wav'
+          [System.IO.File]::WriteAllText($input, 'fake audio input')
+
+          # The packaged launcher sets an absolute executable path. Both that path
+          # and the uploaded audio path deliberately contain cmd.exe metacharacters.
+          $envFfmpeg = Join-Path $testDir 'ffmpeg % & helper.exe'
+          Copy-Item $fake.FullName $envFfmpeg
+          $env:ZONOS2_FFMPEG = $envFfmpeg
+          & $smoke.FullName $input
+          if ($LASTEXITCODE -ne 0) { throw "ZONOS2_FFMPEG launch test failed" }
+
+          # The standalone CLI also promises to discover a system ffmpeg on PATH.
+          $pathDir = Join-Path $testDir 'path fallback'
+          New-Item -ItemType Directory -Force -Path $pathDir | Out-Null
+          Copy-Item $fake.FullName (Join-Path $pathDir 'ffmpeg.exe')
+          Remove-Item Env:ZONOS2_FFMPEG
+          $env:PATH = "$pathDir;$env:PATH"
+          & $smoke.FullName $input
+          if ($LASTEXITCODE -ne 0) { throw "PATH ffmpeg launch test failed" }
+      - name: Web UI speaker-upload regression test
+        run: node --test tests/ui-speaker-upload.test.js
       - name: App smoke test
         shell: bash
         run: |
