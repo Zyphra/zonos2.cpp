@@ -120,10 +120,12 @@ Common knobs (`./start-zonos2.sh --help` / `start-zonos2.bat -Help` lists everyt
 | Skip download prompt / browser | `-y`, `--no-browser` | `-Yes`, `-NoBrowser` |
 | Extra `zonos2-server` flags | `-- --batch 16` | appended verbatim |
 
-Large model files download over several parallel connections (~2× faster than a single stream on
-Hugging Face); tune with `ZONOS2_DL_CONNECTIONS` (default 8). Model dir, download URL, and more can
-be overridden via `ZONOS2_*` environment variables (see `--help`). Prefer to launch the server by
-hand, or want CUDA? See [Manual & advanced setup](#manual--advanced-setup).
+Windows model downloads use one connection by default. Interrupted transfers automatically
+resume from the partial file, with up to three retries and a short backoff. Linux/macOS use eight
+parallel connections by default; tune either launcher with `ZONOS2_DL_CONNECTIONS` (1 disables
+parallel downloads, maximum 16). Model dir, download URL, and more can be overridden via
+`ZONOS2_*` environment variables (see `--help` / `-Help`). Prefer to launch the server by hand, or
+want CUDA? See [Manual & advanced setup](#manual--advanced-setup).
 
 ### 3. Generate Speech
 

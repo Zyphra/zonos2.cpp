@@ -317,6 +317,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Prepare Windows launchers
+        shell: bash
+        run: |
+          mkdir -p dist
+          # sed preserves the UTF-8 BOM required by Windows PowerShell 5.1.
+          # Prepare on every run so PRs test the launcher shipped in releases.
+          sed "s/^\\\$GPU_DEFAULT = 'cpu'/\$GPU_DEFAULT = 'gpu'/" scripts/start-zonos2.ps1 > dist/start-zonos2.ps1
+          grep -q "^\\\$GPU_DEFAULT = 'gpu'" dist/start-zonos2.ps1 || { echo "GPU stamp failed"; exit 1; }
+          cp scripts/start-zonos2.bat dist/start-zonos2.bat
+      - name: Launcher regression tests (Windows PowerShell 5.1)
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/windows-launcher.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell launcher regression tests failed" }
+      - name: Launcher regression tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\windows-launcher.ps1
       # Ninja needs cl.exe on PATH (the VS generator found it implicitly).
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -432,15 +449,6 @@ jobs:
       - name: README command tests
         shell: bash
         run: bash tests/readme-commands.sh
-      # The launcher can't run end-to-end here (no bash trap semantics; see
-      # tests/launcher-smoke.sh for the Linux/macOS coverage), but a parse check
-      # catches ps1 syntax errors before they ship in a release archive.
-      - name: Launcher parse check
-        shell: pwsh
-        run: |
-          $errs = $null
-          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\start-zonos2.ps1", [ref]$null, [ref]$errs) | Out-Null
-          if ($errs) { $errs; throw "start-zonos2.ps1 has parse errors" }
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -451,10 +459,7 @@ jobs:
           cp -r default_voices emotion_directions dist/
           mkdir -p dist/scripts
           cp scripts/normalize-text.py dist/scripts/
-          # stamp the launcher's backend default to match this archive's build
-          sed "s/^\\\$GPU_DEFAULT = 'cpu'/\$GPU_DEFAULT = 'gpu'/" scripts/start-zonos2.ps1 > dist/start-zonos2.ps1
-          grep -q "^\\\$GPU_DEFAULT = 'gpu'" dist/start-zonos2.ps1 || { echo "GPU stamp failed"; exit 1; }
-          cp scripts/start-zonos2.bat dist/start-zonos2.bat
+          # dist already contains the BOM-preserving, regression-tested launchers.
           # zip, not tar.gz: Explorer extracts it natively and (unlike tar) keeps
           # the Mark-of-the-Web flow the README's SmartScreen guidance describes
           (cd dist && 7z a -tzip ../zonos2-windows-x64-vulkan.zip . > /dev/null)

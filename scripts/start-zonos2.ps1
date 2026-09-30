@@ -1,4 +1,4 @@
-# start-zonos2.ps1 — download the models if missing, launch zonos2-server, open the browser.
+﻿# start-zonos2.ps1 — download the models if missing, launch zonos2-server, open the browser.
 # Launched by start-zonos2.bat (double-click) with -ExecutionPolicy Bypass; mirrors
 # scripts/start-zonos2.sh — keep the two in sync.
 param(
@@ -44,6 +44,7 @@ usage: start-zonos2.bat [options] [extra zonos2-server args]
   -NoBrowser   don't open the web UI
 env overrides: ZONOS2_QUANT ZONOS2_MODEL_DIR ZONOS2_BASE_URL ZONOS2_HOST ZONOS2_PORT
                ZONOS2_SERVER_BIN ZONOS2_ASSUME_YES ZONOS2_NO_BROWSER ZONOS2_FFMPEG_URL
+               ZONOS2_DL_CONNECTIONS (download connections, default 1, max 16)
 ffmpeg (voice cloning only) is fetched into <ModelDir>\bin if not already there or on PATH.
 "@
     exit 0
@@ -65,9 +66,9 @@ function Get-SizeGB([string]$name) { if ($Sizes.ContainsKey($name)) { $Sizes[$na
 # Segmented parallel download: one HEAD resolves the exact size + final CDN URL (HF's resolve/
 # endpoint 302s to a Xet CDN that honors Range), then N concurrent range requests are stitched
 # back together — the trick hf_transfer uses to beat single-stream HF (~2x+). Falls back to a
-# single stream on any hiccup. Tunable via ZONOS2_DL_CONNECTIONS (default 8, max 16).
+# single stream on any hiccup. Opt in via ZONOS2_DL_CONNECTIONS (default 1, max 16).
 function Download-Segmented([string]$name, [string]$url, [string]$dst) {
-    $conns = 8
+    $conns = 1
     if ($env:ZONOS2_DL_CONNECTIONS) {
         $parsed = 0
         if ([int]::TryParse($env:ZONOS2_DL_CONNECTIONS, [ref]$parsed) -and $parsed -gt 0) { $conns = $parsed }
@@ -117,20 +118,36 @@ function Download-Segmented([string]$name, [string]$url, [string]$dst) {
     return $true
 }
 
-# curl -C - --fail exits 33 when the .part is already complete (HTTP 416): restart clean once.
+# curl's --retry handles transient HTTP errors/timeouts. Retry interrupted transfers
+# separately so each attempt resumes the bytes already saved in .part.
 function Download-One([string]$name) {
     $url = "$BaseUrl/$name"
     $dst = Join-Path $ModelDir $name
     if (Download-Segmented $name $url $dst) { return $true }   # fast path; falls through on failure
     Write-Host "downloading $name ($(Get-SizeGB $name) GB) ..."
-    & curl.exe -L --fail --retry 3 -C - --progress-bar -o "$dst.part" $url
-    if ($LASTEXITCODE -eq 33) {
-        Remove-Item -Force "$dst.part" -ErrorAction SilentlyContinue
-        & curl.exe -L --fail --retry 3 --progress-bar -o "$dst.part" $url
+    $maxAttempts = 4
+    # DNS/proxy lookup, partial transfer, TLS handshake, empty reply, send/receive,
+    # and HTTP/2 stream failures. HTTP errors and local file errors are not retried here.
+    $interrupted = @(5, 6, 18, 35, 52, 55, 56, 92)
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        & curl.exe -L --fail --retry 3 --retry-connrefused -C - --progress-bar -o "$dst.part" $url
+        $rc = $LASTEXITCODE
+        # A server refusing ranges (33) or an invalid resume offset (36): restart clean once.
+        if ($rc -eq 33 -or $rc -eq 36) {
+            Remove-Item -Force "$dst.part" -ErrorAction SilentlyContinue
+            & curl.exe -L --fail --retry 3 --retry-connrefused --progress-bar -o "$dst.part" $url
+            $rc = $LASTEXITCODE
+        }
+        if ($rc -eq 0) {
+            Move-Item -Force "$dst.part" $dst
+            return $true
+        }
+        if ($rc -notin $interrupted -or $attempt -eq $maxAttempts) { return $false }
+        $delay = [int][math]::Pow(2, $attempt - 1)
+        Write-Warning "download interrupted (curl exit $rc); retrying $name in $delay s ($attempt of $($maxAttempts - 1) retries)"
+        Start-Sleep -Seconds $delay
     }
-    if ($LASTEXITCODE -ne 0) { return $false }
-    Move-Item -Force "$dst.part" $dst
-    return $true
+    return $false
 }
 
 # Fetch a static ffmpeg into $FfmpegDir — voice cloning only; basic TTS never uses it.
