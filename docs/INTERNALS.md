@@ -294,6 +294,12 @@ the server runs a decode-graph ladder so a lone request never pays full-batch-wi
 `--batch >= 32` engages the expert GEMM kernel for peak aggregate throughput (~14× real-time
 aggregate across concurrent streams); the DAC defaults to CPU on Metal (`--dac-gpu` to override).
 
+M2 base (measured 2026-10-30, `q4_k`, greedy, 600 frames = 7 s): backbone ~14.5 ms GPU + ~1.9 ms
+encode per frame (RTF ≈ 1.4); GPU DAC 1.15 s for the clip (RTF ≈ 0.17) after the 1D `im2col`
+Metal kernel in `patches/metal-im2col-1d.patch` and the view-based transposed-conv fold — the
+stock kernel put the vocoder at RTF ≈ 0.55 on the same chip. `DAC_PROFILE=2` prints a per-op
+breakdown of a decode; `ZONOS2_PROFILE_STEP=1` does the same per decode step for the backbone.
+
 ## Numerical validation
 
 | stage | result vs PyTorch reference |
