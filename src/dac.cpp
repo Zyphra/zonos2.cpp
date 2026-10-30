@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
 
 ggml_tensor * dac_model::get(const std::string & n) const {
@@ -194,29 +196,31 @@ static ggml_tensor * convt1d(ggml_context * ctx, const dac_model & m, ggml_tenso
     ggml_tensor * wp = m.get(std::string(ggml_get_name(w)) + ".wp");      // [IC, K*OC] (ko = k + K*oc)
     ggml_tensor * xT = ggml_cont(ctx, ggml_transpose(ctx, x));            // [IC, L]
     ggml_tensor * yk = ggml_mul_mat(ctx, wp, xT);                          // [K*OC, L]  yk[k+K*oc, i]
-    // reshape to [K, OC, L] then split lower (k<s) / upper (k>=s) halves -> each [s, OC, L]
+    // reshape to [K, OC, L]; the lower (k<s) / upper (k>=s) halves are strided views of it. Each
+    // goes straight to time-major [L*s, OC] with one permute+cont (index t = b*s + p): lower
+    // contributes to block b, upper(b) to block b+1.
     yk = ggml_reshape_3d(ctx, yk, K, OC, L);                              // [K, OC, L]
-    ggml_tensor * lower = ggml_cont(ctx, ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], 0));
-    ggml_tensor * upper = ggml_cont(ctx, ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], (size_t) s * yk->nb[0]));
-    // time-major [L*s, OC]: index t = b*s + p. lower contributes to block b, upper(b) to block b+1.
-    // lower -> [s,OC,L] -> permute to [s,L,OC] -> reshape [L*s, OC]; same for upper.
-    auto to_time_major = [&](ggml_tensor * h) {                           // [s,OC,L] -> [L*s, OC]
+    auto half_time_major = [&](size_t off) {                              // [s, OC, L] view -> [L*s, OC]
+        ggml_tensor * h = ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], off);
         h = ggml_cont(ctx, ggml_permute(ctx, h, 0, 2, 1, 3));            // [s, L, OC]
         return ggml_reshape_2d(ctx, h, (int64_t) s * L, OC);              // [L*s, OC]
     };
-    ggml_tensor * lo = to_time_major(lower);                              // aligned at block b
-    ggml_tensor * up = to_time_major(upper);                             // belongs at block b+1 (shift +s)
-    // O (length (L+1)*s) = lo placed at [0, L*s) + up placed at [s, (L+1)*s). Final crop [s/2, s/2+L*s).
-    // final[t'] = lo[t'+s/2]  (t'+s/2 < L*s)  +  up[t'-s/2]  (t' >= s/2).
-    const int h = s / 2;
-    // term A: lo[h : L*s], length L*s-h, then pad h zeros at end -> [L*s, OC]
-    ggml_tensor * A = ggml_cont(ctx, ggml_view_2d(ctx, lo, (int64_t) s * L - h, OC, lo->nb[1], (size_t) h * lo->nb[0]));
-    A = ggml_pad(ctx, A, h, 0, 0, 0);                                    // [L*s, OC]
-    // term B: up[0 : L*s-h], shifted right by h -> prepend h zeros. Build via pad at front using concat.
-    ggml_tensor * Bhead = ggml_cont(ctx, ggml_view_2d(ctx, up, (int64_t) s * L - h, OC, up->nb[1], 0)); // [L*s-h, OC]
-    ggml_tensor * zeros = ggml_scale(ctx, ggml_cont(ctx, ggml_view_2d(ctx, up, h, OC, up->nb[1], 0)), 0.0f); // [h,OC]
-    ggml_tensor * B = ggml_concat(ctx, zeros, Bhead, 0); // [L*s, OC]
-    ggml_tensor * v = ggml_add(ctx, A, B);                               // [L*s, OC]
+    ggml_tensor * lo = half_time_major(0);                                // aligned at block b
+    ggml_tensor * up = half_time_major((size_t) s * yk->nb[0]);           // belongs at block b+1 (shift +s)
+    // O (length (L+1)*s) = lo placed at [0, L*s) + up placed at [s, (L+1)*s), cropped to [s/2, s/2+L*s):
+    //   final[t'] = lo[t'+h] (t'+h < L*s)  +  up[t'-h] (t' >= h),  h = s/2.
+    // Assembled from row-contiguous views (no pad/scale/zero-fill passes over the full tensor):
+    //   head [0,h)      = lo[h, 2h)
+    //   mid  [h, T-h)   = lo[2h, T) + up[0, T-2h)
+    //   tail [T-h, T)   = up[T-2h, T-h)
+    const int64_t T = (int64_t) s * L, h = s / 2;
+    auto rows = [&](ggml_tensor * t, int64_t n, int64_t off) {
+        return ggml_view_2d(ctx, t, n, OC, t->nb[1], (size_t) off * t->nb[0]);
+    };
+    ggml_tensor * head = rows(lo, h, h);
+    ggml_tensor * mid  = ggml_add(ctx, rows(lo, T - 2 * h, 2 * h), rows(up, T - 2 * h, 0));
+    ggml_tensor * tail = rows(up, h, T - 2 * h);
+    ggml_tensor * v = ggml_concat(ctx, ggml_concat(ctx, head, mid, 0), tail, 0);   // [L*s, OC]
     if (bias) v = ggml_add(ctx, v, bias);
     return v;
 }
@@ -311,8 +315,61 @@ static bool dac_run_decoder(const dac_model & m, const std::vector<std::vector<i
     for (int i = 0; i < m.n_codebooks; ++i)
         ggml_backend_tensor_set(code_in[i], idx[i].data(), 0, (size_t) L * sizeof(int32_t));
 
-    const bool dac_prof = getenv("DAC_PROFILE") != nullptr;
+    const char * prof_env = getenv("DAC_PROFILE");
+    const bool dac_prof = prof_env != nullptr;
     auto t_c0 = std::chrono::steady_clock::now();
+    if (prof_env && atoi(prof_env) >= 2) {
+        // DAC_PROFILE=2: per-node timing. Replays the graph node by node through a scheduler eval
+        // callback (which syncs after every node), then prints time aggregated by op and the top
+        // nodes. Slower than the real run because of the syncs; use it for proportions only.
+        struct prof_ud { std::chrono::steady_clock::time_point t; std::vector<std::pair<double, const ggml_tensor *>> rows; };
+        prof_ud ud; ud.t = std::chrono::steady_clock::now();
+        auto cb = [](struct ggml_tensor * t, bool ask, void * user) -> bool {
+            prof_ud * u = (prof_ud *) user;
+            if (ask) return true;
+            auto now = std::chrono::steady_clock::now();
+            u->rows.push_back({ std::chrono::duration<double, std::milli>(now - u->t).count(), t });
+            u->t = std::chrono::steady_clock::now();
+            return true;
+        };
+        // the scheduler requires a CPU backend last; everything still lands on m.backend since
+        // the weights live in its buffers.
+        ggml_backend_t cpu = m.is_gpu ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) : nullptr;
+        ggml_backend_t bes[2] = { m.backend, cpu };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(bes, nullptr, cpu ? 2 : 1, 16384, false, true);
+        ggml_backend_sched_set_eval_callback(sched, cb, &ud);
+        ggml_backend_sched_graph_compute(sched, gf);
+        std::map<std::string, std::pair<double, int>> by_op;
+        double tot = 0;
+        for (auto & r : ud.rows) {
+            std::string k = ggml_op_name(r.second->op);
+            if (r.second->op == GGML_OP_UNARY) k += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(r.second));
+            if (r.second->op == GGML_OP_MUL_MAT) {
+                char b[96]; snprintf(b, sizeof b, ":%s[%lld,%lld]x[%lld,%lld]", ggml_type_name(r.second->src[0]->type),
+                    (long long) r.second->src[0]->ne[0], (long long) r.second->src[0]->ne[1],
+                    (long long) r.second->src[1]->ne[0], (long long) r.second->src[1]->ne[1]);
+                k += b;
+            }
+            by_op[k].first += r.first; by_op[k].second += 1; tot += r.first;
+        }
+        std::vector<std::pair<double, std::string>> v;
+        for (auto & kv : by_op) v.push_back({ kv.second.first, kv.first + " x" + std::to_string(kv.second.second) });
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "dac[prof2]: %zu nodes, %.1f ms total (with per-node sync)\n", ud.rows.size(), tot);
+        for (size_t i = 0; i < v.size() && i < 25; ++i)
+            fprintf(stderr, "dac[prof2]:  %7.1f ms %5.1f%%  %s\n", v[i].first, 100.0 * v[i].first / tot, v[i].second.c_str());
+        std::vector<std::pair<double, const ggml_tensor *>> top = ud.rows;
+        std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        for (size_t i = 0; i < top.size() && i < 20; ++i) {
+            const ggml_tensor * t = top[i].second;
+            fprintf(stderr, "dac[prof2]:  node %7.1f ms  %-8s %-6s [%lld,%lld,%lld]  <- %s [%lld,%lld,%lld]\n", top[i].first,
+                ggml_op_name(t->op), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                t->src[0] ? ggml_type_name(t->src[0]->type) : "-",
+                t->src[0] ? (long long) t->src[0]->ne[0] : 0, t->src[0] ? (long long) t->src[0]->ne[1] : 0, t->src[0] ? (long long) t->src[0]->ne[2] : 0);
+        }
+        ggml_backend_sched_free(sched);
+        if (cpu) ggml_backend_free(cpu);
+    } else
     if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "dac: compute failed\n"); ggml_gallocr_free(galloc); ggml_free(ctx); return false;
     }
