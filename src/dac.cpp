@@ -87,12 +87,11 @@ bool dac_load(dac_model & m, const char * path, bool use_gpu) {
     return dac_prepare(m);
 }
 
-// Derive the per-call-invariant weight forms once, instead of rebuilding them inside every
-// decode graph (which, in streaming, is every ~40-frame block):
-//  - conv1d's im2col needs an F16 src0 on the CPU backend but reads only its [K, IC] shape, so a
-//    tiny F16 shape carrier replaces the ggml_cast that re-converted the whole weight per graph.
-//  - convt1d's GEMM operand is w[K,OC,IC] permuted to [IC, K*OC]; that permute+cont was also
-//    re-run per graph. Build it host-side here and keep it on the backend.
+// Build the derived weight forms once at load instead of inside every decode graph (which, in
+// streaming, is every ~40-frame block):
+//  - "<name>.k16": im2col's CPU kernel asserts an F16 src0 but reads only its [K, IC] shape, so
+//    a tiny F16 carrier stands in for casting the whole conv weight.
+//  - "<name>.wp": the convt weight w[K,OC,IC] permuted host-side to [IC, K*OC] for the GEMM.
 static bool dac_prepare(dac_model & m) {
     std::vector<std::pair<std::string, ggml_tensor *>> convs, convts;
     for (const auto & kv : m.t) {
@@ -160,8 +159,7 @@ static ggml_tensor * conv1d(ggml_context * ctx, const dac_model & m, ggml_tensor
     // patch-buffer materialization, but it was slower on CPU (7 small matmuls + a channel-major
     // transpose lost to im2col's single large matmul — the F16 patch buffer is already cheap) and
     // unsupported on Metal (needs the PAD op). im2col stays.
-    // src0 of im2col is only a [K, IC] shape carrier (the CPU kernel asserts F16 but never reads
-    // the data); use the load-time one from dac_prepare rather than casting the weight per graph.
+    // src0 only supplies the [K, IC] shape (see dac_prepare).
     ggml_tensor * k16 = m.get(std::string(ggml_get_name(w)) + ".k16");
     ggml_tensor * ic = ggml_im2col(ctx, k16, x, s, 0, p, 0, d, 0, false, GGML_TYPE_F16);  // [K*IC, OL, 1]
     ggml_tensor * r = ggml_mul_mat(ctx,
@@ -191,14 +189,12 @@ static ggml_tensor * convt1d(ggml_context * ctx, const dac_model & m, ggml_tenso
         return v;
     }
     GGML_ASSERT(K == 2 * s);
-    // w[K,OC,IC] -> [IC, K*OC] so mul_mat sums over IC; pair with xT[IC,L]. Pre-permuted once at
-    // load (dac_prepare) instead of a permute+cont of the full weight inside every graph.
+    // wp is w permuted to [IC, K*OC] (see dac_prepare) so mul_mat sums over IC against xT[IC,L].
     ggml_tensor * wp = m.get(std::string(ggml_get_name(w)) + ".wp");      // [IC, K*OC] (ko = k + K*oc)
     ggml_tensor * xT = ggml_cont(ctx, ggml_transpose(ctx, x));            // [IC, L]
     ggml_tensor * yk = ggml_mul_mat(ctx, wp, xT);                          // [K*OC, L]  yk[k+K*oc, i]
-    // reshape to [K, OC, L]; the lower (k<s) / upper (k>=s) halves are strided views of it. Each
-    // goes straight to time-major [L*s, OC] with one permute+cont (index t = b*s + p): lower
-    // contributes to block b, upper(b) to block b+1.
+    // Split taps into lower (k<s) / upper (k>=s) halves as strided views of [K, OC, L]; each becomes
+    // time-major [L*s, OC] with one permute+cont. Lower lands on block b, upper on block b+1.
     yk = ggml_reshape_3d(ctx, yk, K, OC, L);                              // [K, OC, L]
     auto half_time_major = [&](size_t off) {                              // [s, OC, L] view -> [L*s, OC]
         ggml_tensor * h = ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], off);
@@ -207,9 +203,9 @@ static ggml_tensor * convt1d(ggml_context * ctx, const dac_model & m, ggml_tenso
     };
     ggml_tensor * lo = half_time_major(0);                                // aligned at block b
     ggml_tensor * up = half_time_major((size_t) s * yk->nb[0]);           // belongs at block b+1 (shift +s)
-    // O (length (L+1)*s) = lo placed at [0, L*s) + up placed at [s, (L+1)*s), cropped to [s/2, s/2+L*s):
-    //   final[t'] = lo[t'+h] (t'+h < L*s)  +  up[t'-h] (t' >= h),  h = s/2.
-    // Assembled from row-contiguous views (no pad/scale/zero-fill passes over the full tensor):
+    // Overlap-add lo at [0, L*s) with up at [s, (L+1)*s), cropped to [h, h+L*s), h = s/2:
+    //   final[t'] = lo[t'+h] (t'+h < L*s)  +  up[t'-h] (t' >= h)
+    // as three row-contiguous pieces, so no pad or zero-fill pass over the full tensor:
     //   head [0,h)      = lo[h, 2h)
     //   mid  [h, T-h)   = lo[2h, T) + up[0, T-2h)
     //   tail [T-h, T)   = up[T-2h, T-h)

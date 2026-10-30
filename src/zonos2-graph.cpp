@@ -130,10 +130,9 @@ static ggml_tensor * build_attention(gctx & g, ggml_tensor * cur, const zonos2_l
         // columns writes a unique absolute row (slot*slot_cap + logical pos).
         ggml_tensor * kc = (*g.kc)[il];   // [hd, n_slots*slot_cap, nkv] F16
         ggml_tensor * vc = (*g.vc)[il];
-        // set_rows takes an F32 source and converts into the F16 cache in place. It only needs
-        // contiguous rows (ne0 dense), which a permute of dims 1/2 preserves, and every backend's
-        // set_rows walks the source by nb[] strides — so the permuted views go in directly. A
-        // ggml_cont here was 2 copy kernels per layer (56 per decode step) for nothing.
+        // No ggml_cont needed: set_rows only requires contiguous rows (ne0 dense), which permuting
+        // dims 1/2 preserves, and every backend's set_rows walks src by nb[] strides (F32 -> F16
+        // conversion happens in the same pass).
         ggml_tensor * kb = ggml_permute(ctx, k, 0, 2, 1, 3); // [hd, n, nkv] F32 (strided view)
         ggml_tensor * vb = ggml_permute(ctx, v, 0, 2, 1, 3);
         ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, kc, kb, g.pos_cache));
