@@ -17,6 +17,11 @@ struct dac_model {
     ggml_backend_buffer_t buf_w = nullptr;
     bool is_gpu = false;
     std::map<std::string, ggml_tensor *> t;
+    // load-time derived weights (see dac_prepare): per conv weight an F16 [K, IC] shape carrier
+    // for im2col ("<name>.k16"), per convt weight the pre-permuted [IC, K*OC] GEMM operand
+    // ("<name>.wp"). Stored in `t` under those names; this ctx/buffer own them.
+    ggml_context * ctx_p = nullptr;
+    ggml_backend_buffer_t buf_p = nullptr;
     // hparams
     int n_codebooks = 9, codebook_size = 1024, latent_dim = 1024, decoder_dim = 1536;
     int sample_rate = 44100, hop_length = 512, audio_pad_id = 1025;

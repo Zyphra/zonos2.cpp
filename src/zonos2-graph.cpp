@@ -130,9 +130,12 @@ static ggml_tensor * build_attention(gctx & g, ggml_tensor * cur, const zonos2_l
         // columns writes a unique absolute row (slot*slot_cap + logical pos).
         ggml_tensor * kc = (*g.kc)[il];   // [hd, n_slots*slot_cap, nkv] F16
         ggml_tensor * vc = (*g.vc)[il];
-        // set_rows takes an F32 source and converts into the F16 cache in place.
-        ggml_tensor * kb = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, n, nkv] F32
-        ggml_tensor * vb = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+        // set_rows takes an F32 source and converts into the F16 cache in place. It only needs
+        // contiguous rows (ne0 dense), which a permute of dims 1/2 preserves, and every backend's
+        // set_rows walks the source by nb[] strides — so the permuted views go in directly. A
+        // ggml_cont here was 2 copy kernels per layer (56 per decode step) for nothing.
+        ggml_tensor * kb = ggml_permute(ctx, k, 0, 2, 1, 3); // [hd, n, nkv] F32 (strided view)
+        ggml_tensor * vb = ggml_permute(ctx, v, 0, 2, 1, 3);
         ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, kc, kb, g.pos_cache));
         ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, vc, vb, g.pos_cache));
 
@@ -235,7 +238,9 @@ static ggml_tensor * build_moe(gctx & g, ggml_tensor * cur, const zonos2_layer &
     for (int j = 1; j < k; ++j) {
         moe = ggml_add(ctx, moe, ggml_view_2d(ctx, exps, n_embd, n, exps->nb[2], (size_t) j * exps->nb[1]));
     }
-    return ggml_cont(ctx, moe);
+    // top-1 layers: the single k-slice view is already contiguous (nb[2]==nb[1] when k==1), and
+    // ggml_cont never short-circuits, so only copy when the view really is strided.
+    return ggml_is_contiguous(moe) ? moe : ggml_cont(ctx, moe);
 }
 
 // Build the prefill graph. Returns the final node. n_layer_limit < 0 => all layers.
