@@ -122,10 +122,21 @@ static bool dac_prepare(dac_model & m) {
     for (auto & kv : convts) {
         ggml_tensor * w = kv.second;
         const int64_t K = w->ne[0], OC = w->ne[1], IC = w->ne[2];
-        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w));
+        const auto * tt = ggml_get_type_traits(w->type);
+        if (!ggml_is_contiguous(w) || (w->type != GGML_TYPE_F32 && !tt->to_float)) {
+            fprintf(stderr, "dac: %s: unsupported convt weight (%s, %s)\n", kv.first.c_str(),
+                    ggml_type_name(w->type), ggml_is_contiguous(w) ? "contiguous" : "strided");
+            return false;
+        }
         src.resize((size_t) K * OC * IC);
         dst.resize(src.size());
-        ggml_backend_tensor_get(w, src.data(), 0, src.size() * sizeof(float));
+        if (w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(w, src.data(), 0, src.size() * sizeof(float));
+        } else {
+            std::vector<uint8_t> raw(ggml_nbytes(w));
+            ggml_backend_tensor_get(w, raw.data(), 0, raw.size());
+            tt->to_float(raw.data(), src.data(), (int64_t) src.size());
+        }
         // wp[ic + IC*(k + K*oc)] = w[k + K*(oc + OC*ic)]
         for (int64_t ic = 0; ic < IC; ++ic)
             for (int64_t oc = 0; oc < OC; ++oc)
@@ -319,7 +330,7 @@ static bool dac_run_decoder(const dac_model & m, const std::vector<std::vector<i
         // callback (which syncs after every node), then prints time aggregated by op and the top
         // nodes. Slower than the real run because of the syncs; use it for proportions only.
         struct prof_ud { std::chrono::steady_clock::time_point t; std::vector<std::pair<double, const ggml_tensor *>> rows; };
-        prof_ud ud; ud.t = std::chrono::steady_clock::now();
+        prof_ud ud;
         auto cb = [](struct ggml_tensor * t, bool ask, void * user) -> bool {
             prof_ud * u = (prof_ud *) user;
             if (ask) return true;
@@ -334,7 +345,12 @@ static bool dac_run_decoder(const dac_model & m, const std::vector<std::vector<i
         ggml_backend_t bes[2] = { m.backend, cpu };
         ggml_backend_sched_t sched = ggml_backend_sched_new(bes, nullptr, cpu ? 2 : 1, 16384, false, true);
         ggml_backend_sched_set_eval_callback(sched, cb, &ud);
-        ggml_backend_sched_graph_compute(sched, gf);
+        ud.t = std::chrono::steady_clock::now();
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "dac: compute failed\n");
+            ggml_backend_sched_free(sched); if (cpu) ggml_backend_free(cpu);
+            ggml_gallocr_free(galloc); ggml_free(ctx); return false;
+        }
         std::map<std::string, std::pair<double, int>> by_op;
         double tot = 0;
         for (auto & r : ud.rows) {

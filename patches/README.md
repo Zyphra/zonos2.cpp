@@ -32,6 +32,10 @@ in sorted filename order.
   of KW, 65% of GPU vocoder time. The new kernel runs one thread per output position
   over (OW blocks, IC, N) and writes all KW taps; 2.5 s → 0.28 s across the 26 im2cols
   of a 7 s clip on M2 (as of 2026-10-30), bit-identical output. 2D im2col is untouched.
+  The patch also adds 1D cases to ggml's `test-backend-ops` (widths around the 256-thread
+  group boundary, batched, strided/dilated, and a vocoder-sized launch); run them with
+  `cmake -S ggml -B /tmp/ggml-test -DGGML_METAL=ON -DGGML_BUILD_TESTS=ON && cmake --build
+  /tmp/ggml-test --target test-backend-ops && /tmp/ggml-test/bin/test-backend-ops test -b MTL0 -o IM2COL`.
   Worth upstreaming.
 
 ## Caveats

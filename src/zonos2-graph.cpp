@@ -45,7 +45,9 @@ struct gctx {
 
     // force a read-back output regardless of `capture` (used for imatrix moe inputs).
     ggml_tensor * out_named(const std::string & name, ggml_tensor * t) {
-        if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
+        // GGML_TENSOR_FLAG_OUTPUT pins the flagged node only; ggml-alloc still frees a view's
+        // source once the view's consumers run, so a captured view must own its storage.
+        if (!ggml_is_contiguous(t) || t->view_src) t = ggml_cont(ctx, t);
         ggml_set_output(t);
         ggml_set_name(t, name.c_str());
         caps.push_back({name, t});
@@ -67,7 +69,9 @@ struct gctx {
     // mark a tensor as a captured (read-back) graph output
     ggml_tensor * cap(const std::string & name, ggml_tensor * t) {
         if (!capture) return t;
-        if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
+        // GGML_TENSOR_FLAG_OUTPUT pins the flagged node only; ggml-alloc still frees a view's
+        // source once the view's consumers run, so a captured view must own its storage.
+        if (!ggml_is_contiguous(t) || t->view_src) t = ggml_cont(ctx, t);
         ggml_set_output(t);
         ggml_set_name(t, name.c_str());
         caps.push_back({name, t});
