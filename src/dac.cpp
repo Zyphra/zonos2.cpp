@@ -190,7 +190,7 @@ static ggml_tensor * convt1d(ggml_context * ctx, const dac_model & m, ggml_tenso
     // kernel response is a single mul_mat (efficient mul_mm on GPU), then folded:
     //   yk[i,k,oc] = sum_ic x[i,ic]*w[k,oc,ic];  K=2s, output block b = lower(yk[b]) + upper(yk[b-1]).
     // x:[L,IC] -> [L*stride, OC], matching the old crop (drop stride/2 each side of the (L+1)*s field).
-    const int s = stride, K = (int) w->ne[0], OC = (int) w->ne[1], IC = (int) w->ne[2], L = (int) x->ne[0];
+    const int s = stride, K = (int) w->ne[0], OC = (int) w->ne[1], L = (int) x->ne[0];
     if (getenv("DAC_OLD_CONVT") || K != 2 * s) {                          // reference path for A/B
         ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
         const int crop = stride / 2;
