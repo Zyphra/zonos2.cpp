@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
 
 ggml_tensor * dac_model::get(const std::string & n) const {
@@ -22,6 +24,8 @@ ggml_tensor * dac_model::get(const std::string & n) const {
     if (it == t.end()) { fprintf(stderr, "dac: missing tensor '%s'\n", n.c_str()); return nullptr; }
     return it->second;
 }
+
+static bool dac_prepare(dac_model & m);
 
 bool dac_load(dac_model & m, const char * path, bool use_gpu) {
     ggml_context * ctx_meta = nullptr;
@@ -80,13 +84,76 @@ bool dac_load(dac_model & m, const char * path, bool use_gpu) {
     fprintf(stderr, "dac: loaded %zu tensors on %s (latent=%d dec_dim=%d hop=%d sr=%d)\n",
             m.t.size(), m.is_gpu ? "GPU" : "CPU", m.latent_dim, m.decoder_dim, m.hop_length, m.sample_rate);
     gguf_free(gguf);
+    return dac_prepare(m);
+}
+
+// Build the derived weight forms once at load instead of inside every decode graph (which, in
+// streaming, is every ~40-frame block):
+//  - "<name>.k16": im2col's CPU kernel asserts an F16 src0 but reads only its [K, IC] shape, so
+//    a tiny F16 carrier stands in for casting the whole conv weight.
+//  - "<name>.wp": the convt weight w[K,OC,IC] permuted host-side to [IC, K*OC] for the GEMM.
+static bool dac_prepare(dac_model & m) {
+    std::vector<std::pair<std::string, ggml_tensor *>> convs, convts;
+    for (const auto & kv : m.t) {
+        const std::string & n = kv.first;
+        if (n.size() < 7 || n.compare(n.size() - 7, 7, ".weight") != 0) continue;
+        if (n.find(".convt.") != std::string::npos)      convts.push_back(kv);
+        else if (n.find("conv") != std::string::npos)    convs.push_back(kv);
+    }
+    ggml_init_params ip = { ggml_tensor_overhead() * (convs.size() + convts.size() + 1), nullptr, /*no_alloc=*/ true };
+    m.ctx_p = ggml_init(ip);
+    if (!m.ctx_p) { fprintf(stderr, "dac: prepare ctx alloc failed\n"); return false; }
+    for (auto & kv : convs) {
+        ggml_tensor * w = kv.second;                                    // [K, IC, OC]
+        ggml_tensor * k16 = ggml_new_tensor_2d(m.ctx_p, GGML_TYPE_F16, w->ne[0], w->ne[1]);
+        ggml_set_name(k16, (kv.first + ".k16").c_str());
+        m.t[kv.first + ".k16"] = k16;
+    }
+    for (auto & kv : convts) {
+        ggml_tensor * w = kv.second;                                    // [K, OC, IC]
+        ggml_tensor * wp = ggml_new_tensor_2d(m.ctx_p, GGML_TYPE_F32, w->ne[2], w->ne[0] * w->ne[1]);
+        ggml_set_name(wp, (kv.first + ".wp").c_str());
+        m.t[kv.first + ".wp"] = wp;
+    }
+    m.buf_p = ggml_backend_alloc_ctx_tensors(m.ctx_p, m.backend);
+    if (!m.buf_p) { fprintf(stderr, "dac: prepare buffer alloc failed\n"); return false; }
+    ggml_backend_buffer_clear(m.buf_p, 0);   // k16 carriers are never read; keep them defined anyway
+    std::vector<float> src, dst;
+    for (auto & kv : convts) {
+        ggml_tensor * w = kv.second;
+        const int64_t K = w->ne[0], OC = w->ne[1], IC = w->ne[2];
+        const auto * tt = ggml_get_type_traits(w->type);
+        if (!ggml_is_contiguous(w) || (w->type != GGML_TYPE_F32 && !tt->to_float)) {
+            fprintf(stderr, "dac: %s: unsupported convt weight (%s, %s)\n", kv.first.c_str(),
+                    ggml_type_name(w->type), ggml_is_contiguous(w) ? "contiguous" : "strided");
+            return false;
+        }
+        src.resize((size_t) K * OC * IC);
+        dst.resize(src.size());
+        if (w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(w, src.data(), 0, src.size() * sizeof(float));
+        } else {
+            std::vector<uint8_t> raw(ggml_nbytes(w));
+            ggml_backend_tensor_get(w, raw.data(), 0, raw.size());
+            tt->to_float(raw.data(), src.data(), (int64_t) src.size());
+        }
+        // wp[ic + IC*(k + K*oc)] = w[k + K*(oc + OC*ic)]
+        for (int64_t ic = 0; ic < IC; ++ic)
+            for (int64_t oc = 0; oc < OC; ++oc)
+                for (int64_t k = 0; k < K; ++k)
+                    dst[(size_t) ic + IC * (k + K * oc)] = src[(size_t) k + K * (oc + OC * ic)];
+        ggml_backend_tensor_set(m.t[kv.first + ".wp"], dst.data(), 0, dst.size() * sizeof(float));
+    }
     return true;
 }
 
 void dac_free(dac_model & m) {
+    if (m.buf_p)   ggml_backend_buffer_free(m.buf_p);
+    if (m.ctx_p)   ggml_free(m.ctx_p);
     if (m.buf_w)   ggml_backend_buffer_free(m.buf_w);
     if (m.ctx_w)   ggml_free(m.ctx_w);
     if (m.backend) ggml_backend_free(m.backend);
+    m.buf_p = nullptr; m.ctx_p = nullptr;
     m.buf_w = nullptr; m.ctx_w = nullptr; m.backend = nullptr; m.t.clear();
 }
 
@@ -97,14 +164,15 @@ void dac_free(dac_model & m) {
 // final upsampled resolution) and the convs are bandwidth-bound on it, so it is materialized as
 // F16: that halves the dominant memory traffic and routes mul_mat through the F16 path (src0=F16
 // patches, src1=F32 weights). Output is F32; audio is bit-close to the all-F32 path.
-static ggml_tensor * conv1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * bias,
+static ggml_tensor * conv1d(ggml_context * ctx, const dac_model & m, ggml_tensor * w, ggml_tensor * bias,
                             ggml_tensor * x, int s, int p, int d) {
     // im2col (F16 patches, F32 weights). A direct shifted-matmul conv1d was tried to avoid the
     // patch-buffer materialization, but it was slower on CPU (7 small matmuls + a channel-major
     // transpose lost to im2col's single large matmul — the F16 patch buffer is already cheap) and
     // unsupported on Metal (needs the PAD op). im2col stays.
-    ggml_tensor * w16 = ggml_cast(ctx, w, GGML_TYPE_F16);
-    ggml_tensor * ic = ggml_im2col(ctx, w16, x, s, 0, p, 0, d, 0, false, GGML_TYPE_F16);  // [K*IC, OL, 1]
+    // src0 only supplies the [K, IC] shape (see dac_prepare).
+    ggml_tensor * k16 = m.get(std::string(ggml_get_name(w)) + ".k16");
+    ggml_tensor * ic = ggml_im2col(ctx, k16, x, s, 0, p, 0, d, 0, false, GGML_TYPE_F16);  // [K*IC, OL, 1]
     ggml_tensor * r = ggml_mul_mat(ctx,
         ggml_reshape_2d(ctx, ic, ic->ne[0], ic->ne[1] * ic->ne[2]),   // src0 = im2col [K*IC, OL]
         ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));      // src1 = w      [K*IC, OC]
@@ -114,7 +182,7 @@ static ggml_tensor * conv1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b
 
 // ConvTranspose1d upsample by `stride` (kernel K=2*stride), then crop stride/2 each side to
 // match PyTorch padding=ceil(stride/2) (exact for even strides). w ne=[K,OC,IC], bias [1,OC].
-static ggml_tensor * convt1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * bias,
+static ggml_tensor * convt1d(ggml_context * ctx, const dac_model & m, ggml_tensor * w, ggml_tensor * bias,
                              ggml_tensor * x, int stride) {
     // ConvTranspose1d (kernel K = 2*stride) reimplemented as GEMM + overlap-add fold instead of
     // ggml_conv_transpose_1d. The stock Metal conv_transpose kernel is one thread per output sample
@@ -122,7 +190,7 @@ static ggml_tensor * convt1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * 
     // kernel response is a single mul_mat (efficient mul_mm on GPU), then folded:
     //   yk[i,k,oc] = sum_ic x[i,ic]*w[k,oc,ic];  K=2s, output block b = lower(yk[b]) + upper(yk[b-1]).
     // x:[L,IC] -> [L*stride, OC], matching the old crop (drop stride/2 each side of the (L+1)*s field).
-    const int s = stride, K = (int) w->ne[0], OC = (int) w->ne[1], IC = (int) w->ne[2], L = (int) x->ne[0];
+    const int s = stride, K = (int) w->ne[0], OC = (int) w->ne[1], L = (int) x->ne[0];
     if (getenv("DAC_OLD_CONVT") || K != 2 * s) {                          // reference path for A/B
         ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
         const int crop = stride / 2;
@@ -132,34 +200,34 @@ static ggml_tensor * convt1d(ggml_context * ctx, ggml_tensor * w, ggml_tensor * 
         return v;
     }
     GGML_ASSERT(K == 2 * s);
-    // w[K,OC,IC] -> [IC, K*OC] so mul_mat sums over IC; pair with xT[IC,L].
-    ggml_tensor * wp = ggml_cont(ctx, ggml_permute(ctx, w, 1, 2, 0, 3));   // [IC, K, OC]
-    wp = ggml_reshape_2d(ctx, wp, IC, (int64_t) K * OC);                   // [IC, K*OC] (ko = k + K*oc)
+    // wp is w permuted to [IC, K*OC] (see dac_prepare) so mul_mat sums over IC against xT[IC,L].
+    ggml_tensor * wp = m.get(std::string(ggml_get_name(w)) + ".wp");      // [IC, K*OC] (ko = k + K*oc)
     ggml_tensor * xT = ggml_cont(ctx, ggml_transpose(ctx, x));            // [IC, L]
     ggml_tensor * yk = ggml_mul_mat(ctx, wp, xT);                          // [K*OC, L]  yk[k+K*oc, i]
-    // reshape to [K, OC, L] then split lower (k<s) / upper (k>=s) halves -> each [s, OC, L]
+    // Split taps into lower (k<s) / upper (k>=s) halves as strided views of [K, OC, L]; each becomes
+    // time-major [L*s, OC] with one permute+cont. Lower lands on block b, upper on block b+1.
     yk = ggml_reshape_3d(ctx, yk, K, OC, L);                              // [K, OC, L]
-    ggml_tensor * lower = ggml_cont(ctx, ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], 0));
-    ggml_tensor * upper = ggml_cont(ctx, ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], (size_t) s * yk->nb[0]));
-    // time-major [L*s, OC]: index t = b*s + p. lower contributes to block b, upper(b) to block b+1.
-    // lower -> [s,OC,L] -> permute to [s,L,OC] -> reshape [L*s, OC]; same for upper.
-    auto to_time_major = [&](ggml_tensor * h) {                           // [s,OC,L] -> [L*s, OC]
+    auto half_time_major = [&](size_t off) {                              // [s, OC, L] view -> [L*s, OC]
+        ggml_tensor * h = ggml_view_3d(ctx, yk, s, OC, L, yk->nb[1], yk->nb[2], off);
         h = ggml_cont(ctx, ggml_permute(ctx, h, 0, 2, 1, 3));            // [s, L, OC]
         return ggml_reshape_2d(ctx, h, (int64_t) s * L, OC);              // [L*s, OC]
     };
-    ggml_tensor * lo = to_time_major(lower);                              // aligned at block b
-    ggml_tensor * up = to_time_major(upper);                             // belongs at block b+1 (shift +s)
-    // O (length (L+1)*s) = lo placed at [0, L*s) + up placed at [s, (L+1)*s). Final crop [s/2, s/2+L*s).
-    // final[t'] = lo[t'+s/2]  (t'+s/2 < L*s)  +  up[t'-s/2]  (t' >= s/2).
-    const int h = s / 2;
-    // term A: lo[h : L*s], length L*s-h, then pad h zeros at end -> [L*s, OC]
-    ggml_tensor * A = ggml_cont(ctx, ggml_view_2d(ctx, lo, (int64_t) s * L - h, OC, lo->nb[1], (size_t) h * lo->nb[0]));
-    A = ggml_pad(ctx, A, h, 0, 0, 0);                                    // [L*s, OC]
-    // term B: up[0 : L*s-h], shifted right by h -> prepend h zeros. Build via pad at front using concat.
-    ggml_tensor * Bhead = ggml_cont(ctx, ggml_view_2d(ctx, up, (int64_t) s * L - h, OC, up->nb[1], 0)); // [L*s-h, OC]
-    ggml_tensor * zeros = ggml_scale(ctx, ggml_cont(ctx, ggml_view_2d(ctx, up, h, OC, up->nb[1], 0)), 0.0f); // [h,OC]
-    ggml_tensor * B = ggml_concat(ctx, zeros, Bhead, 0); // [L*s, OC]
-    ggml_tensor * v = ggml_add(ctx, A, B);                               // [L*s, OC]
+    ggml_tensor * lo = half_time_major(0);                                // aligned at block b
+    ggml_tensor * up = half_time_major((size_t) s * yk->nb[0]);           // belongs at block b+1 (shift +s)
+    // Overlap-add lo at [0, L*s) with up at [s, (L+1)*s), cropped to [h, h+L*s), h = s/2:
+    //   final[t'] = lo[t'+h] (t'+h < L*s)  +  up[t'-h] (t' >= h)
+    // as three row-contiguous pieces, so no pad or zero-fill pass over the full tensor:
+    //   head [0,h)      = lo[h, 2h)
+    //   mid  [h, T-h)   = lo[2h, T) + up[0, T-2h)
+    //   tail [T-h, T)   = up[T-2h, T-h)
+    const int64_t T = (int64_t) s * L, h = s / 2;
+    auto rows = [&](ggml_tensor * t, int64_t n, int64_t off) {
+        return ggml_view_2d(ctx, t, n, OC, t->nb[1], (size_t) off * t->nb[0]);
+    };
+    ggml_tensor * head = rows(lo, h, h);
+    ggml_tensor * mid  = ggml_add(ctx, rows(lo, T - 2 * h, 2 * h), rows(up, T - 2 * h, 0));
+    ggml_tensor * tail = rows(up, h, T - 2 * h);
+    ggml_tensor * v = ggml_concat(ctx, ggml_concat(ctx, head, mid, 0), tail, 0);   // [L*s, OC]
     if (bias) v = ggml_add(ctx, v, bias);
     return v;
 }
@@ -179,16 +247,16 @@ static ggml_tensor * snake_named(ggml_context * ctx, const dac_model & m, ggml_t
 static ggml_tensor * res_unit(ggml_context * ctx, const dac_model & m, ggml_tensor * x,
                               const std::string & p, int dil) {
     ggml_tensor * y = snake_named(ctx, m, x, p + ".snake1");
-    y = conv1d(ctx, m.get(p + ".conv1.weight"), m.get(p + ".conv1.bias"), y, 1, 3 * dil, dil);
+    y = conv1d(ctx, m, m.get(p + ".conv1.weight"), m.get(p + ".conv1.bias"), y, 1, 3 * dil, dil);
     y = snake_named(ctx, m, y, p + ".snake2");
-    y = conv1d(ctx, m.get(p + ".conv2.weight"), m.get(p + ".conv2.bias"), y, 1, 0, 1);
+    y = conv1d(ctx, m, m.get(p + ".conv2.weight"), m.get(p + ".conv2.bias"), y, 1, 0, 1);
     return ggml_add(ctx, x, y);
 }
 
 static ggml_tensor * dec_block(ggml_context * ctx, const dac_model & m, ggml_tensor * x, int b, int stride) {
     const std::string p = "dec.b" + std::to_string(b);
     ggml_tensor * y = snake_named(ctx, m, x, p + ".snake");
-    y = convt1d(ctx, m.get(p + ".convt.weight"), m.get(p + ".convt.bias"), y, stride);
+    y = convt1d(ctx, m, m.get(p + ".convt.weight"), m.get(p + ".convt.bias"), y, stride);
     y = res_unit(ctx, m, y, p + ".res0", 1);
     y = res_unit(ctx, m, y, p + ".res1", 3);
     y = res_unit(ctx, m, y, p + ".res2", 9);
@@ -239,11 +307,11 @@ static bool dac_run_decoder(const dac_model & m, const std::vector<std::vector<i
     z = ggml_cont(ctx, ggml_transpose(ctx, z));              // [L, latent]
 
     // decoder
-    ggml_tensor * h = conv1d(ctx, m.get("dec.conv_in.weight"), m.get("dec.conv_in.bias"), z, 1, 3, 1);  // [L,1536]
+    ggml_tensor * h = conv1d(ctx, m, m.get("dec.conv_in.weight"), m.get("dec.conv_in.bias"), z, 1, 3, 1);  // [L,1536]
     for (int b = 0; b < (int) m.decoder_rates.size(); ++b)
         h = dec_block(ctx, m, h, b, m.decoder_rates[b]);
     h = snake_named(ctx, m, h, "dec.snake_out");
-    h = conv1d(ctx, m.get("dec.conv_out.weight"), m.get("dec.conv_out.bias"), h, 1, 3, 1);  // [samples, 1]
+    h = conv1d(ctx, m, m.get("dec.conv_out.weight"), m.get("dec.conv_out.bias"), h, 1, 3, 1);  // [samples, 1]
     h = ggml_tanh(ctx, h);
     ggml_tensor * out = ggml_reshape_1d(ctx, h, h->ne[0]);   // [samples]
     ggml_set_output(out);
@@ -254,8 +322,66 @@ static bool dac_run_decoder(const dac_model & m, const std::vector<std::vector<i
     for (int i = 0; i < m.n_codebooks; ++i)
         ggml_backend_tensor_set(code_in[i], idx[i].data(), 0, (size_t) L * sizeof(int32_t));
 
-    const bool dac_prof = getenv("DAC_PROFILE") != nullptr;
+    const char * prof_env = getenv("DAC_PROFILE");
+    const bool dac_prof = prof_env != nullptr;
     auto t_c0 = std::chrono::steady_clock::now();
+    if (prof_env && atoi(prof_env) >= 2) {
+        // DAC_PROFILE=2: per-node timing. Replays the graph node by node through a scheduler eval
+        // callback (which syncs after every node), then prints time aggregated by op and the top
+        // nodes. Slower than the real run because of the syncs; use it for proportions only.
+        struct prof_ud { std::chrono::steady_clock::time_point t; std::vector<std::pair<double, const ggml_tensor *>> rows; };
+        prof_ud ud;
+        auto cb = [](struct ggml_tensor * t, bool ask, void * user) -> bool {
+            prof_ud * u = (prof_ud *) user;
+            if (ask) return true;
+            auto now = std::chrono::steady_clock::now();
+            u->rows.push_back({ std::chrono::duration<double, std::milli>(now - u->t).count(), t });
+            u->t = std::chrono::steady_clock::now();
+            return true;
+        };
+        // the scheduler requires a CPU backend last; everything still lands on m.backend since
+        // the weights live in its buffers.
+        ggml_backend_t cpu = m.is_gpu ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) : nullptr;
+        ggml_backend_t bes[2] = { m.backend, cpu };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(bes, nullptr, cpu ? 2 : 1, 16384, false, true);
+        ggml_backend_sched_set_eval_callback(sched, cb, &ud);
+        ud.t = std::chrono::steady_clock::now();
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "dac: compute failed\n");
+            ggml_backend_sched_free(sched); if (cpu) ggml_backend_free(cpu);
+            ggml_gallocr_free(galloc); ggml_free(ctx); return false;
+        }
+        std::map<std::string, std::pair<double, int>> by_op;
+        double tot = 0;
+        for (auto & r : ud.rows) {
+            std::string k = ggml_op_name(r.second->op);
+            if (r.second->op == GGML_OP_UNARY) k += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(r.second));
+            if (r.second->op == GGML_OP_MUL_MAT) {
+                char b[96]; snprintf(b, sizeof b, ":%s[%lld,%lld]x[%lld,%lld]", ggml_type_name(r.second->src[0]->type),
+                    (long long) r.second->src[0]->ne[0], (long long) r.second->src[0]->ne[1],
+                    (long long) r.second->src[1]->ne[0], (long long) r.second->src[1]->ne[1]);
+                k += b;
+            }
+            by_op[k].first += r.first; by_op[k].second += 1; tot += r.first;
+        }
+        std::vector<std::pair<double, std::string>> v;
+        for (auto & kv : by_op) v.push_back({ kv.second.first, kv.first + " x" + std::to_string(kv.second.second) });
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "dac[prof2]: %zu nodes, %.1f ms total (with per-node sync)\n", ud.rows.size(), tot);
+        for (size_t i = 0; i < v.size() && i < 25; ++i)
+            fprintf(stderr, "dac[prof2]:  %7.1f ms %5.1f%%  %s\n", v[i].first, 100.0 * v[i].first / tot, v[i].second.c_str());
+        std::vector<std::pair<double, const ggml_tensor *>> top = ud.rows;
+        std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        for (size_t i = 0; i < top.size() && i < 20; ++i) {
+            const ggml_tensor * t = top[i].second;
+            fprintf(stderr, "dac[prof2]:  node %7.1f ms  %-8s %-6s [%lld,%lld,%lld]  <- %s [%lld,%lld,%lld]\n", top[i].first,
+                ggml_op_name(t->op), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                t->src[0] ? ggml_type_name(t->src[0]->type) : "-",
+                t->src[0] ? (long long) t->src[0]->ne[0] : 0, t->src[0] ? (long long) t->src[0]->ne[1] : 0, t->src[0] ? (long long) t->src[0]->ne[2] : 0);
+        }
+        ggml_backend_sched_free(sched);
+        if (cpu) ggml_backend_free(cpu);
+    } else
     if (ggml_backend_graph_compute(m.backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "dac: compute failed\n"); ggml_gallocr_free(galloc); ggml_free(ctx); return false;
     }

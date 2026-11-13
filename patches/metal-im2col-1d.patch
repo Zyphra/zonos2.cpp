@@ -1,0 +1,167 @@
+diff --git a/src/ggml-cuda/conv-transpose-1d.cu b/src/ggml-cuda/conv-transpose-1d.cu
+index 8418ba6..eea1a5c 100644
+--- a/src/ggml-cuda/conv-transpose-1d.cu
++++ b/src/ggml-cuda/conv-transpose-1d.cu
+@@ -12,19 +12,22 @@ static  __global__ void conv_transpose_1d_kernel(
+     }
+ 
+     int out_index = global_index / dst_ne0;
++    int idx = global_index % dst_ne0;
++
++    // Only taps i with i*s0 <= idx < i*s0 + K contribute; compute that range directly
++    // instead of scanning all of src1_ne0 (avoids O(L^2) work for long inputs).
++    int i_min = (idx - src0_ne0 + s0) / s0;   // ceil((idx-K+1)/s0); valid floor when numerator >= 0
++    if (i_min < 0) i_min = 0;
++    int i_max = idx / s0;
++    if (i_max > src1_ne0 - 1) i_max = src1_ne0 - 1;
+ 
+     float accumulator = 0;
+ 
+     for (int c = 0; c < src0_ne2; c++) {
+-        int idx = global_index % dst_ne0;
+-
+         int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+         int input_offset = src1_ne0 * c;
+ 
+-        for (int i = 0; i < src1_ne0; i++) {
+-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
+-                continue;
+-            }
++        for (int i = i_min; i <= i_max; i++) {
+             int weight_idx = idx - i*s0;
+ 
+             float kernel_weight = src0[kernel_offset + weight_idx];
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 4f4f073..e1e80d2 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -1745,7 +1745,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
+     char base[256];
+     char name[256];
+ 
+-    if (KH*KW <= 1024) {
++    if (!is_2D) {
++        snprintf(base, 256, "kernel_im2col_1d_%s", ggml_type_name(op->type));
++    } else if (KH*KW <= 1024) {
+         snprintf(base, 256, "kernel_im2col_%s", ggml_type_name(op->type));
+     } else {
+         snprintf(base, 256, "kernel_im2col_ext_%s", ggml_type_name(op->type));
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index ff74caf..58ab2bd 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -662,6 +662,7 @@ typedef struct {
+     int32_t  KH;
+     int32_t  KW;
+     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
++    int32_t  OW;
+ } ggml_metal_kargs_im2col;
+ 
+ typedef struct {
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index e2ce56e..3ba3691 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3631,11 +3631,22 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
+         /*.KH   =*/ KH,
+         /*.KW   =*/ KW,
+         /*.KHW  =*/ KH * KW,
++        /*.OW   =*/ OW,
+     };
+ 
+     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
+ 
+-    if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
++    if (!is_2D) {
++        // kernel_im2col_1d: threads along OW, threadgroups over (OW blocks, IC, N)
++        const int ntptg0 = std::min<int>(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++
++        ggml_metal_encoder_set_pipeline(enc, pipeline);
++        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (OW + ntptg0 - 1)/ntptg0, IC, N, ntptg0, 1, 1);
++    } else if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+         const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
+ 
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+diff --git a/src/ggml-metal/ggml-metal.cpp b/src/ggml-metal/ggml-metal.cpp
+index a1003b3..3c0f367 100644
+--- a/src/ggml-metal/ggml-metal.cpp
++++ b/src/ggml-metal/ggml-metal.cpp
+@@ -702,7 +702,10 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t
+         /* .context   = */ ctx,
+     };
+ 
+-    ggml_backend_metal_set_n_cb(backend, 1);
++    {
++        const char * ncb_env = getenv("GGML_METAL_NCB");
++        ggml_backend_metal_set_n_cb(backend, ncb_env ? atoi(ncb_env) : 1);
++    }
+ 
+     return backend;
+ 
+diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
+index 0aea684..98add9e 100644
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -4731,6 +4731,40 @@ kernel void kernel_im2col(
+ template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
+ template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
+ 
++// 1D im2col: one thread per (output position, input channel, batch), writing all KW taps.
++// The generic kernel maps (IC, OH, OW) to threadgroups and (N, KH, KW) to threads, so a 1D conv
++// (KH=1, N=1) launches IC*OW threadgroups of KW threads each — launch-bound and under-filling
++// every SIMD group (observed: ~150 ms per im2col at IC*OW ~ 3e7 on M2, independent of KW).
++template <typename T>
++kernel void kernel_im2col_1d(
++        constant ggml_metal_kargs_im2col & args,
++        device const float * x,
++        device        char * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    const int64_t iow = (int64_t) tgpig[0]*ntg[0] + tpitg[0];
++    const int64_t iic = tgpig[1];
++    const int64_t in  = tgpig[2];
++
++    if (iow >= args.OW) {
++        return;
++    }
++
++    device T * pdst = (device T *) dst + (in*args.OW + iow)*args.CHW + iic*args.KW;
++    device const float * px = x + in*args.ofs0 + iic*args.ofs1;
++
++    for (int32_t ikw = 0; ikw < args.KW; ++ikw) {
++        const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
++        pdst[ikw] = (iiw < 0 || iiw >= args.IW) ? T(0.0f) : T(px[iiw]);
++    }
++}
++
++typedef decltype(kernel_im2col_1d<float>) im2col_1d_t;
++
++template [[host_name("kernel_im2col_1d_f32")]] kernel im2col_1d_t kernel_im2col_1d<float>;
++template [[host_name("kernel_im2col_1d_f16")]] kernel im2col_1d_t kernel_im2col_1d<half>;
++
+ // TODO: optimize
+ typedef void (im2col_ext_t)(
+         constant ggml_metal_kargs_im2col & args,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 00d90fc..4991363 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7814,6 +7814,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    // output widths around a 256-wide threadgroup boundary (k=7, p=3, s=1 => OW == IW), batched
++    for (int iw : {255, 256, 257, 511, 513}) {
++        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {iw, 4, 3, 1}, {7, 4, 8, 1}, 1, 0, 3, 0, 1, 0, false));
++        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {iw, 4, 3, 1}, {7, 4, 8, 1}, 2, 0, 1, 0, 2, 0, false));
++    }
++    // vocoder-sized 1D im2col (IC*OW ~ 2e7): the launch geometry that was the Metal bottleneck
++    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {80000, 256, 1, 1}, {7, 256, 1, 1}, 1, 0, 3, 0, 1, 0, false));
+ 
+     // im2col 2D
+     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));

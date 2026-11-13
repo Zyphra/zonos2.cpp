@@ -45,7 +45,9 @@ struct gctx {
 
     // force a read-back output regardless of `capture` (used for imatrix moe inputs).
     ggml_tensor * out_named(const std::string & name, ggml_tensor * t) {
-        if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
+        // GGML_TENSOR_FLAG_OUTPUT pins the flagged node only; ggml-alloc still frees a view's
+        // source once the view's consumers run, so a captured view must own its storage.
+        if (!ggml_is_contiguous(t) || t->view_src) t = ggml_cont(ctx, t);
         ggml_set_output(t);
         ggml_set_name(t, name.c_str());
         caps.push_back({name, t});
@@ -67,7 +69,9 @@ struct gctx {
     // mark a tensor as a captured (read-back) graph output
     ggml_tensor * cap(const std::string & name, ggml_tensor * t) {
         if (!capture) return t;
-        if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
+        // GGML_TENSOR_FLAG_OUTPUT pins the flagged node only; ggml-alloc still frees a view's
+        // source once the view's consumers run, so a captured view must own its storage.
+        if (!ggml_is_contiguous(t) || t->view_src) t = ggml_cont(ctx, t);
         ggml_set_output(t);
         ggml_set_name(t, name.c_str());
         caps.push_back({name, t});
@@ -130,9 +134,11 @@ static ggml_tensor * build_attention(gctx & g, ggml_tensor * cur, const zonos2_l
         // columns writes a unique absolute row (slot*slot_cap + logical pos).
         ggml_tensor * kc = (*g.kc)[il];   // [hd, n_slots*slot_cap, nkv] F16
         ggml_tensor * vc = (*g.vc)[il];
-        // set_rows takes an F32 source and converts into the F16 cache in place.
-        ggml_tensor * kb = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, n, nkv] F32
-        ggml_tensor * vb = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+        // No ggml_cont needed: set_rows only requires contiguous rows (ne0 dense), which permuting
+        // dims 1/2 preserves, and every backend's set_rows walks src by nb[] strides (F32 -> F16
+        // conversion happens in the same pass).
+        ggml_tensor * kb = ggml_permute(ctx, k, 0, 2, 1, 3); // [hd, n, nkv] F32 (strided view)
+        ggml_tensor * vb = ggml_permute(ctx, v, 0, 2, 1, 3);
         ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, kc, kb, g.pos_cache));
         ggml_build_forward_expand(g.gf, ggml_set_rows(ctx, vc, vb, g.pos_cache));
 
@@ -235,7 +241,9 @@ static ggml_tensor * build_moe(gctx & g, ggml_tensor * cur, const zonos2_layer &
     for (int j = 1; j < k; ++j) {
         moe = ggml_add(ctx, moe, ggml_view_2d(ctx, exps, n_embd, n, exps->nb[2], (size_t) j * exps->nb[1]));
     }
-    return ggml_cont(ctx, moe);
+    // top-1 layers: the single k-slice view is already contiguous (nb[2]==nb[1] when k==1), and
+    // ggml_cont never short-circuits, so only copy when the view really is strided.
+    return ggml_is_contiguous(moe) ? moe : ggml_cont(ctx, moe);
 }
 
 // Build the prefill graph. Returns the final node. n_layer_limit < 0 => all layers.

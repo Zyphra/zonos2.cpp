@@ -17,6 +17,9 @@ struct dac_model {
     ggml_backend_buffer_t buf_w = nullptr;
     bool is_gpu = false;
     std::map<std::string, ggml_tensor *> t;
+    // derived weights built by dac_prepare ("<name>.k16", "<name>.wp"); registered in `t`, owned here
+    ggml_context * ctx_p = nullptr;
+    ggml_backend_buffer_t buf_p = nullptr;
     // hparams
     int n_codebooks = 9, codebook_size = 1024, latent_dim = 1024, decoder_dim = 1536;
     int sample_rate = 44100, hop_length = 512, audio_pad_id = 1025;

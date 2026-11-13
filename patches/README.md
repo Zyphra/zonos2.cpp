@@ -25,6 +25,18 @@ in sorted filename order.
   them as they enqueue — ~10% faster decode at no quality cost. `zonos2_model_load`
   defaults it to 4 for the GPU backbone (overridable); prefill's big GEMMs are
   unaffected. Behavior is identical to upstream when the env var is unset.
+- `metal-im2col-1d.patch` — a 1D-specific `im2col` kernel for Metal. Upstream's kernel
+  maps (IC, OH, OW) to threadgroups and (N, KH, KW) to threads, so a 1D conv with N=1
+  launches IC*OW threadgroups of KW threads each: launch-bound and under-filling every
+  SIMD group. In the DAC decoder that was ~150 ms per im2col at IC*OW ≈ 3e7 regardless
+  of KW, 65% of GPU vocoder time. The new kernel runs one thread per output position
+  over (OW blocks, IC, N) and writes all KW taps; 2.5 s → 0.28 s across the 26 im2cols
+  of a 7 s clip on M2 (as of 2026-10-30), bit-identical output. 2D im2col is untouched.
+  The patch also adds 1D cases to ggml's `test-backend-ops` (widths around the 256-thread
+  group boundary, batched, strided/dilated, and a vocoder-sized launch); run them with
+  `cmake -S ggml -B /tmp/ggml-test -DGGML_METAL=ON -DGGML_BUILD_TESTS=ON && cmake --build
+  /tmp/ggml-test --target test-backend-ops && /tmp/ggml-test/bin/test-backend-ops test -b MTL0 -o IM2COL`.
+  Worth upstreaming.
 
 ## Caveats
 
