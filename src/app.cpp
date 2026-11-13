@@ -26,10 +26,12 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -155,6 +157,22 @@ static void set_env(const char * k, const std::string & v) {
 #else
     setenv(k, v.c_str(), 1);
 #endif
+}
+
+static std::string b64_encode(const std::string & in) {
+    static const char * A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        uint32_t v = (uint8_t) in[i] << 16;
+        if (i + 1 < in.size()) v |= (uint8_t) in[i + 1] << 8;
+        if (i + 2 < in.size()) v |= (uint8_t) in[i + 2];
+        out.push_back(A[(v >> 18) & 63]);
+        out.push_back(A[(v >> 12) & 63]);
+        out.push_back(i + 1 < in.size() ? A[(v >> 6) & 63] : '=');
+        out.push_back(i + 2 < in.size() ? A[v & 63] : '=');
+    }
+    return out;
 }
 
 static std::string shq(const std::string & s) {   // quote a path for the system() shell
@@ -610,6 +628,9 @@ coco::stray start(saucer::application * app) {
 
     window->set_title("Zonos2");
     window->set_size({.w = 1100, .h = 800});
+
+    // File-input shim on every page load (setup page and the served web UI alike).
+    webview->inject({.code = ZONOS2_APP_FILE_PICKER_JS, .run_at = saucer::script::time::creation});
     {
         // Window icon where the platform supports it (no-op on WebKitGTK; the
         // Windows taskbar/exe icon comes from the .rc resource, macOS from the bundle).
@@ -624,6 +645,30 @@ coco::stray start(saucer::application * app) {
     webview->expose("pick_file", [&desktop](const std::string & /*kind*/) -> std::string {
         auto r = desktop.pick<saucer::modules::picker::type::file>({.filters = {"*.gguf"}});
         return r ? file_uri_to_path(r->string()) : std::string{};
+    });
+
+    // Backs the injected file-input shim (ZONOS2_APP_FILE_PICKER_JS): saucer's webviews
+    // implement no open-panel delegate, so the served UI's <input type="file"> (speaker
+    // audio/embedding uploads) would silently do nothing. Pick natively, read the bytes,
+    // and hand them to the page as [{name, b64}].
+    webview->expose("pick_upload_files", [&desktop](bool multiple) -> std::string {
+        std::vector<fs::path> paths;
+        if (multiple) {
+            auto r = desktop.pick<saucer::modules::picker::type::files>({});
+            if (r) paths.assign(r->begin(), r->end());
+        } else {
+            auto r = desktop.pick<saucer::modules::picker::type::file>({});
+            if (r) paths.push_back(*r);
+        }
+        json arr = json::array();
+        for (const auto & p : paths) {
+            const std::string path = file_uri_to_path(p.string());
+            std::ifstream f(path, std::ios::binary);
+            if (!f) continue;
+            std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            arr.push_back({{"name", fs::path(path).filename().string()}, {"b64", b64_encode(bytes)}});
+        }
+        return arr.dump();
     });
 
     webview->expose("get_config", []() -> std::string { return load_config().dump(); });

@@ -201,3 +201,40 @@ static const char * ZONOS2_APP_ERROR_PAGE = R"html(
   <button class="primary" onclick="saucer.exposed.show_setup()">Back to setup</button>
 </div>
 )html";
+
+// ---------------------------------------------------------------- native file-input shim
+// saucer's webviews implement no open-panel delegate, so HTML <input type="file"> does
+// nothing in the app (the served web UI uses it for speaker audio/embedding uploads).
+// Injected into every page: intercept clicks on file inputs, run the native picker via
+// the exposed pick_upload_files(), and materialize the picked files back into the input
+// through a DataTransfer so the page's existing change/read logic sees a normal selection.
+
+static const char * ZONOS2_APP_FILE_PICKER_JS = R"js(
+(function () {
+  if (window.__zonos2NativePicker) return;
+  window.__zonos2NativePicker = true;
+  document.addEventListener('click', function (ev) {
+    const el = ev.target;
+    if (!el || !(el instanceof HTMLInputElement) || el.type !== 'file') return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    (async () => {
+      try {
+        const res = JSON.parse(await saucer.exposed.pick_upload_files(!!el.multiple));
+        if (!res.length) return;   // cancelled
+        const dt = new DataTransfer();
+        for (const f of res) {
+          const bin = atob(f.b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          dt.items.add(new File([bytes], f.name));
+        }
+        el.files = dt.files;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch (e) {
+        console.error('native file picker failed:', e);
+      }
+    })();
+  }, true);
+})();
+)js";
